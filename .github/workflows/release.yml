@@ -8,21 +8,44 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, windows]
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
 
-      - name: Build
+      - name: Build all cmds
         run: |
           mkdir -p dist
-          GOOS=linux GOARCH=amd64 go build -o dist/localdns-linux-amd64 ./cmd/localdns
-          GOOS=windows GOARCH=amd64 go build -o dist/localdns-windows-amd64.exe ./cmd/localdns
+          for cmd in cmd/*/; do
+            name=$(basename "$cmd")
+            ext=""
+            [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
+              go build -o "dist/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
+          done
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/*
-          generate_release_notes: true
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*"
