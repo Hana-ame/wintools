@@ -10,37 +10,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
 // Run starts the local DNS server that forwards queries via DoH.
-// If dohEndpoint is empty, it defaults to Cloudflare's DNS-over-HTTPS.
-func Run(dohEndpoint string) error {
-	// 1. Load .env file
-	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	// 2. Read DoH endpoint from parameter or environment
-	if dohEndpoint == "" {
-		dohEndpoint = os.Getenv("DOH_ENDPOINT")
-	}
-	if dohEndpoint == "" {
-		dohEndpoint = "https://moonchan.xyz/doh"
-		log.Printf("DOH_ENDPOINT not set, using default: %s", dohEndpoint)
-	}
-
-	// 3. Start UDP listener — port from env DNS_PORT, default 5353
-	port := 5353
-	if p := os.Getenv("DNS_PORT"); p != "" {
-		if n, err := strconv.Atoi(p); err == nil {
-			port = n
-		}
+func Run(dohEndpoint string, port int) error {
+	if port == 0 {
+		port = 5353
 	}
 	addr := &net.UDPAddr{Port: port}
 	conn, err := net.ListenUDP("udp", addr)
