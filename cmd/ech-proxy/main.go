@@ -1,112 +1,118 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
+	"time"
 
+	"github.com/Hana-ame/wintools/cloudflare_ech"
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	listenAddr    = "0.0.0.0:8443"
-	domain        = "l.moonchan.xyz"
-	sshScript     = "/home/lumin/script/ssh/vps.sh"
-	remoteCertDir = "~/.acme.sh/*.moonchan.xyz_ecc"
-)
-
-func fetchFile(remotePath string) ([]byte, error) {
-	cmd := exec.Command("bash", "-c", sshScript+" 'cat "+remotePath+"'")
-	out, err := cmd.Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("ssh cat failed: %w\nstderr: %s", err, string(ee.Stderr))
-		}
-		return nil, fmt.Errorf("ssh cat failed: %w", err)
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("empty file: %s", remotePath)
-	}
-	return out, nil
-}
-
 func main() {
-	log.Printf("正在从 VPS 获取 TLS 证书...")
+	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
+	domain := flag.String("domain", "l.moonchan.xyz", "TLS domain (for log only)")
+	cert := flag.String("cert", "certs/l.moonchan.xyz/fullchain.cer", "TLS cert file")
+	key := flag.String("key", "certs/l.moonchan.xyz/privkey.pem", "TLS key file")
+	upstream := flag.String("upstream", "video-cf.twimg.com", "default upstream target")
+	flag.Parse()
 
-	certPEM, err := fetchFile(remoteCertDir + "/fullchain.cer")
-	if err != nil {
-		log.Fatalf("获取证书失败: %v", err)
+	if v := os.Getenv("UPSTREAM"); v != "" {
+		*upstream = v
 	}
-	log.Printf("证书: %d bytes", len(certPEM))
 
-	keyPEM, err := fetchFile(remoteCertDir + "/*.moonchan.xyz.key")
-	if err != nil {
-		log.Fatalf("获取密钥失败: %v", err)
+	log.Printf("正在初始化 ECH 客户端...")
+	if err := cloudflare_ech.InitDefault(); err != nil {
+		log.Fatalf("ECH 客户端初始化失败: %v", err)
 	}
-	log.Printf("密钥: %d bytes", len(keyPEM))
+	log.Printf("ECH 客户端就绪")
 
-	tmpDir, err := os.MkdirTemp("", "ech-proxy-")
-	if err != nil {
-		log.Fatalf("创建临时目录失败: %v", err)
+	if _, err := os.Stat(*cert); err != nil {
+		log.Fatalf("证书文件不存在: %s (%v)", *cert, err)
 	}
-	defer os.RemoveAll(tmpDir)
+	if _, err := os.Stat(*key); err != nil {
+		log.Fatalf("密钥文件不存在: %s (%v)", *key, err)
+	}
 
-	certFile := filepath.Join(tmpDir, "cert.pem")
-	keyFile := filepath.Join(tmpDir, "key.pem")
-	if err := os.WriteFile(certFile, certPEM, 0644); err != nil {
-		log.Fatalf("写入证书失败: %v", err)
-	}
-	if err := os.WriteFile(keyFile, keyPEM, 0644); err != nil {
-		log.Fatalf("写入密钥失败: %v", err)
-	}
+	certFile, _ := filepath.Abs(*cert)
+	keyFile, _ := filepath.Abs(*key)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	// 健康检查
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// 通用反向代理：将请求代理到目标 upstream
 	r.NoRoute(func(c *gin.Context) {
-		target := c.Query("upstream")
-		if target == "" {
-			target = os.Getenv("UPSTREAM")
+		start := time.Now()
+		clientIP := c.ClientIP()
+		method := c.Request.Method
+		rawPath := c.Request.URL.Path
+		rawQuery := c.Request.URL.RawQuery
+
+		targetURL := &url.URL{
+			Scheme:   "https",
+			Host:     *upstream,
+			Path:     rawPath,
+			RawQuery: rawQuery,
 		}
-		if target == "" {
-			// 默认回显，方便测试
-			c.JSON(http.StatusOK, gin.H{
-				"host":   c.Request.Host,
-				"path":   c.Request.URL.Path,
-				"domain": domain,
-				"tls":    true,
-			})
-			return
-		}
-		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-			target = "https://" + target
-		}
-		targetURL, err := url.Parse(target)
+		urlStr := targetURL.String()
+
+		log.Printf("[%s] %s %s -> %s", clientIP, method, rawPath, urlStr)
+
+		outReq, err := http.NewRequest(method, urlStr, c.Request.Body)
 		if err != nil {
-			c.String(http.StatusBadRequest, "bad upstream: %v", err)
+			log.Printf("[%s] 创建请求失败: %v", clientIP, err)
+			c.String(http.StatusInternalServerError, "create request: %v", err)
 			return
 		}
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-		proxy.ServeHTTP(c.Writer, c.Request)
+
+		for k, vs := range c.Request.Header {
+			for _, v := range vs {
+				outReq.Header.Add(k, v)
+			}
+		}
+		outReq.Header.Set("Referer", "https://x.com")
+		outReq.Host = *upstream
+
+		log.Printf("[%s] -> ECH Do: %s %s (Host: %s)", clientIP, method, urlStr, outReq.Host)
+
+		resp, err := cloudflare_ech.Do(outReq)
+		if err != nil {
+			log.Printf("[%s] ECH Do 失败: %v (耗时: %v)", clientIP, err, time.Since(start))
+			c.String(http.StatusBadGateway, "upstream: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		log.Printf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
+
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				c.Header(k, v)
+			}
+		}
+		c.Status(resp.StatusCode)
+		io.Copy(c.Writer, resp.Body)
 	})
 
-	log.Printf("ECH Proxy 启动: https://%s:%s", domain, "8443")
-	log.Printf("测试: curl -x '' 'https://%s:%s/healthz'", domain, "8443")
+	fmt.Printf("=== ECH Proxy ===\n")
+	fmt.Printf("  监听: %s\n", *addr)
+	fmt.Printf("  域名: %s\n", *domain)
+	fmt.Printf("  上游: %s\n", *upstream)
+	fmt.Printf("  证书: %s\n", certFile)
+	fmt.Printf("  密钥: %s\n", keyFile)
+	fmt.Printf("=================\n")
 
-	if err := r.RunTLS(listenAddr, certFile, keyFile); err != nil {
+	if err := r.RunTLS(*addr, certFile, keyFile); err != nil {
 		log.Fatalf("启动失败: %v", err)
 	}
 }
