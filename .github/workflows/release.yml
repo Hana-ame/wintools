@@ -12,6 +12,9 @@ jobs:
       matrix:
         os: [linux, windows]
         arch: [amd64, arm64]
+        exclude:
+          - os: windows
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -49,8 +52,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find . -type f | while read f; do
+          find linux windows -type f | while read f; do
             rel="${f#./}"
             echo "Uploading: $rel"
-            gh release upload "${{ github.ref_name }}" "$rel" --clobber
+            gh release upload "${{ github.ref_name }}" "$rel" --clobber --repo "${{ github.repository }}"
           done
