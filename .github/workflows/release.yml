@@ -60,5 +60,5 @@ jobs:
           find linux windows -type f | while read f; do
             rel="${f#./}"
             echo "Uploading: $rel"
-            gh release upload "${{ github.ref_name }}" "$rel" --clobber --repo "${{ github.repository }}"
+            gh release upload "${{ github.ref_name }}" "${rel}#${rel}" --clobber --repo "${{ github.repository }}"
           done
