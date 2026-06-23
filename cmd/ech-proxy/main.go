@@ -33,6 +33,11 @@ func main() {
 	}
 	log.Printf("ECH 客户端就绪")
 
+	certDir := filepath.Dir(*cert)
+	if err := os.MkdirAll(certDir, 0755); err != nil {
+		log.Fatalf("创建证书目录失败: %s (%v)", certDir, err)
+	}
+
 	if _, err := os.Stat(*cert); err != nil {
 		log.Fatalf("证书文件不存在: %s (%v)", *cert, err)
 	}

@@ -35,8 +35,8 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os }}
-          path: dist/${{ matrix.os }}/*
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/${{ matrix.os }}/${{ matrix.arch }}/
 
   release:
     needs: build
@@ -47,6 +47,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: "*"
+          path: dist
 
       - name: Create release
         env:
@@ -57,8 +58,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find linux windows -type f | while read f; do
-            rel="${f#./}"
-            echo "Uploading: $rel"
-            gh release upload "${{ github.ref_name }}" "${rel}#${rel}" --clobber --repo "${{ github.repository }}"
+          find dist -type f | while read f; do
+            rel="${f#dist/}"
+            label=$(echo "$rel" | sed 's|^\(linux\|windows\)-\(amd64\|arm64\)/|\1/\2/|')
+            echo "Uploading: $label"
+            gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
           done
