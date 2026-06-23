@@ -15,6 +15,27 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func downloadFile(path, url string) error {
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
 	domain := flag.String("domain", "l.moonchan.xyz", "TLS domain (for log only)")
@@ -38,11 +59,20 @@ func main() {
 		log.Fatalf("创建证书目录失败: %s (%v)", certDir, err)
 	}
 
+	certURL := fmt.Sprintf("https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com", *cert)
+	keyURL := fmt.Sprintf("https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com", *key)
+
 	if _, err := os.Stat(*cert); err != nil {
-		log.Fatalf("证书文件不存在: %s (%v)", *cert, err)
+		log.Printf("证书文件不存在，正在下载: %s", certURL)
+		if err := downloadFile(*cert, certURL); err != nil {
+			log.Fatalf("下载证书失败: %v", err)
+		}
 	}
 	if _, err := os.Stat(*key); err != nil {
-		log.Fatalf("密钥文件不存在: %s (%v)", *key, err)
+		log.Printf("密钥文件不存在，正在下载: %s", keyURL)
+		if err := downloadFile(*key, keyURL); err != nil {
+			log.Fatalf("下载密钥失败: %v", err)
+		}
 	}
 
 	certFile, _ := filepath.Abs(*cert)
