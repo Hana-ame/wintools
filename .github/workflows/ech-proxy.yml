@@ -1,0 +1,29 @@
+name: ech-proxy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cmd/ech-proxy/**"
+      - "cloudflare_ech/**"
+      - "certs/**"
+      - "go.mod"
+      - "go.sum"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build ech-proxy (Windows amd64)
+        run: GOOS=windows GOARCH=amd64 go build -o ech-proxy.exe ./cmd/ech-proxy/
+
+      - name: Upload ech-proxy.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ech-proxy-windows-amd64
+          path: ech-proxy.exe
