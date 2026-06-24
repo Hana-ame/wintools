@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Hana-ame/wintools/cloudflare_ech"
+	"github.com/Hana-ame/wintools/test/ech/lib"
 	"github.com/gin-gonic/gin"
 )
 
@@ -62,17 +62,13 @@ func main() {
 	certURL := fmt.Sprintf("https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com", *cert)
 	keyURL := fmt.Sprintf("https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com", *key)
 
-	if _, err := os.Stat(*cert); err != nil {
-		log.Printf("证书文件不存在，正在下载: %s", certURL)
-		if err := downloadFile(*cert, certURL); err != nil {
-			log.Fatalf("下载证书失败: %v", err)
-		}
+	log.Printf("正在下载证书: %s", certURL)
+	if err := downloadFile(*cert, certURL); err != nil {
+		log.Fatalf("下载证书失败: %v", err)
 	}
-	if _, err := os.Stat(*key); err != nil {
-		log.Printf("密钥文件不存在，正在下载: %s", keyURL)
-		if err := downloadFile(*key, keyURL); err != nil {
-			log.Fatalf("下载密钥失败: %v", err)
-		}
+	log.Printf("正在下载密钥: %s", keyURL)
+	if err := downloadFile(*key, keyURL); err != nil {
+		log.Fatalf("下载密钥失败: %v", err)
 	}
 
 	certFile, _ := filepath.Abs(*cert)
