@@ -1,7 +1,7 @@
-
 *.exe
 # build artifacts
 ech-proxy
 localdns
 signaling-server
 wintools
+peer-client
