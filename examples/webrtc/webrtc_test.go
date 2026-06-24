@@ -80,7 +80,7 @@ func TestListenerAccept(t *testing.T) {
 	got := make(chan []byte, 1)
 	dc.OnData(func(data []byte) { got <- data })
 
-	if err := peer.Send([]byte("ping")); err != nil {
+	if err := peer.SendDefault([]byte("ping")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -93,7 +93,7 @@ func TestListenerAccept(t *testing.T) {
 	}
 
 	got2 := make(chan []byte, 1)
-	peer.OnData(func(data []byte) { got2 <- data })
+	peer.OnData(func(label string, data []byte) { got2 <- data })
 
 	if err := dc.Send([]byte("pong")); err != nil {
 		t.Fatal(err)

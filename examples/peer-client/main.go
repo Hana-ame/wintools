@@ -167,13 +167,13 @@ func main() {
 			return nil, nil, fmt.Errorf("new peer: %v", err)
 		}
 
-		peer.OnData(func(data []byte) {
+		peer.OnData(func(label string, data []byte) {
 			fmt.Printf("[recv] %s\n", string(data))
 		})
 
 		dcReady := make(chan *pionwebrtc.DataChannel, 1)
 		if *mode == "p1" {
-			dc := peer.DataChannel()
+			dc := peer.DataChannel("chat")
 			if dc != nil {
 				dc.OnOpen(func() { dcReady <- dc })
 			}
@@ -216,7 +216,11 @@ func main() {
 				}
 			} else {
 				<-peer.GatheringComplete()
-				finalOffer := peer.LocalDescriptionSDP()
+				finalOffer, err := peer.LocalDescriptionSDP()
+			if err != nil {
+				peer.Close()
+				return nil, nil, fmt.Errorf("get offer sdp: %v", err)
+			}
 				if err := sig.sendSDP("offer", finalOffer); err != nil {
 					peer.Close()
 					return nil, nil, fmt.Errorf("send offer: %v", err)
@@ -258,7 +262,11 @@ func main() {
 				fmt.Println("sent answer (trickle)")
 			} else {
 				<-peer.GatheringComplete()
-				finalAnswer := peer.LocalDescriptionSDP()
+				finalAnswer, err := peer.LocalDescriptionSDP()
+				if err != nil {
+					peer.Close()
+					return nil, nil, fmt.Errorf("get answer sdp: %v", err)
+				}
 				if err := sig.sendSDP("answer", finalAnswer); err != nil {
 					peer.Close()
 					return nil, nil, fmt.Errorf("send answer: %v", err)

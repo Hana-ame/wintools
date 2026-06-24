@@ -18,6 +18,12 @@ import (
 
 const sigServer = "http://bwh.moonchan.xyz:8080"
 
+var sigClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: nil,
+	},
+}
+
 type SigClient struct {
 	Server string
 	RoomID string
@@ -25,7 +31,7 @@ type SigClient struct {
 }
 
 func (s *SigClient) post(path, body string) ([]byte, error) {
-	r, err := http.Post(s.Server+path, "application/json", strings.NewReader(body))
+	r, err := sigClient.Post(s.Server+path, "application/json", strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +40,7 @@ func (s *SigClient) post(path, body string) ([]byte, error) {
 }
 
 func (s *SigClient) get(path string) ([]byte, error) {
-	r, err := http.Get(s.Server + path)
+	r, err := sigClient.Get(s.Server + path)
 	if err != nil {
 		return nil, err
 	}
@@ -96,6 +102,9 @@ func (s *SigClient) RecvSDP(wait int) (string, error) {
 }
 
 func TestRealSignaledP2P(t *testing.T) {
+	if _, err := sigClient.Get(sigServer + "/"); err != nil {
+		t.Skipf("signaling server unreachable: %v", err)
+	}
 	sigP1 := &SigClient{Server: sigServer}
 	sigP2 := &SigClient{Server: sigServer}
 
@@ -147,7 +156,10 @@ func TestRealSignaledP2P(t *testing.T) {
 
 	// 等 p1 ICE 候选收集完成
 	<-p1.GatheringComplete()
-	finalOffer := p1.LocalDescriptionSDP()
+	finalOffer, err := p1.LocalDescriptionSDP()
+	if err != nil {
+		t.Fatalf("get final offer sdp: %v", err)
+	}
 	if err := sigP1.SendSDP("offer", finalOffer); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +183,10 @@ func TestRealSignaledP2P(t *testing.T) {
 
 	// 等 p2 ICE 候选收集完成
 	<-p2.GatheringComplete()
-	finalAnswer := p2.LocalDescriptionSDP()
+	finalAnswer, err := p2.LocalDescriptionSDP()
+		if err != nil {
+			t.Fatalf("get final answer sdp: %v", err)
+		}
 	if err := sigP2.SendSDP("answer", finalAnswer); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +203,7 @@ func TestRealSignaledP2P(t *testing.T) {
 
 	// 5. 等 DataChannel 就绪
 	p1dc := make(chan *webrtc.DataChannel, 1)
-	dc1raw := p1.DataChannel()
+	dc1raw := p1.DataChannel("chat")
 	if dc1raw != nil {
 		dc1raw.OnOpen(func() { p1dc <- dc1raw })
 	}
@@ -245,11 +260,12 @@ func TestRealSignaledP2P(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
-	resp, err := http.Get(sigServer + "/")
+	resp, err := sigClient.Get(sigServer + "/")
 	if err != nil {
-		fmt.Printf("signaling server unreachable: %v\n", err)
-		return
+		fmt.Printf("signaling server unreachable: %v (test will skip)\n", err)
 	}
-	resp.Body.Close()
+	if resp != nil {
+		resp.Body.Close()
+	}
 	m.Run()
 }
