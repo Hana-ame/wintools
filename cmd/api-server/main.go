@@ -5,38 +5,23 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/Hana-ame/wintools/pkg/api"
+	"github.com/Hana-ame/wintools/pkg/kv"
 )
-
-type Store struct {
-	mu sync.RWMutex
-	m  map[string]interface{}
-}
-
-func NewStore() *Store {
-	return &Store{m: make(map[string]interface{})}
-}
-
-func (s *Store) Put(id string, v interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.m[id] = v
-}
-
-func (s *Store) Get(id string) (interface{}, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v, ok := s.m[id]
-	return v, ok
-}
 
 func main() {
 	port := flag.Int("port", 8080, "listen port")
+	ttl := flag.Duration("ttl", 0, "key TTL (0=no eviction)")
+	tick := flag.Duration("tick", 30*time.Second, "eviction check interval")
 	flag.Parse()
 
-	store := NewStore()
+	store := kv.NewStore(*ttl, *tick)
+	defer store.Stop()
+
+	h := api.NewHandler(store)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -46,26 +31,8 @@ func main() {
 		c.String(http.StatusOK, "ok")
 	})
 
-	r.POST("/kv/:id", func(c *gin.Context) {
-		id := c.Param("id")
-		var body interface{}
-		if err := c.ShouldBindJSON(&body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "err": "bad json"})
-			return
-		}
-		store.Put(id, body)
-		c.JSON(http.StatusOK, gin.H{"ok": true})
-	})
-
-	r.GET("/kv/:id", func(c *gin.Context) {
-		id := c.Param("id")
-		v, ok := store.Get(id)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"ok": false, "err": "not found"})
-			return
-		}
-		c.JSON(http.StatusOK, v)
-	})
+	grp := r.Group("/kv")
+	h.RegisterRoutes(grp)
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("API server listening on %s", addr)
