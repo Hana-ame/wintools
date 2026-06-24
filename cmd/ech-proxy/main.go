@@ -1,19 +1,29 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"sort"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/Hana-ame/wintools/test/ech/lib"
+	cloudflare_ech "github.com/Hana-ame/wintools/test/ech/lib"
 	"github.com/gin-gonic/gin"
 )
+
+type UpstreamConfig struct {
+	Host    string `json:"host"`
+	Referer string `json:"referer,omitempty"`
+}
+
+type UpstreamMap map[string]UpstreamConfig
 
 func downloadFile(path, url string) error {
 	out, err := os.Create(path)
@@ -36,17 +46,27 @@ func downloadFile(path, url string) error {
 	return err
 }
 
+func loadUpstreamConfig(rawURL string) (UpstreamMap, error) {
+	resp, err := http.Get(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch upstream config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+	var cfg UpstreamMap
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode upstream config: %w", err)
+	}
+	return cfg, nil
+}
+
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
-	domain := flag.String("domain", "l.moonchan.xyz", "TLS domain (for log only)")
 	cert := flag.String("cert", "certs/l.moonchan.xyz/fullchain.cer", "TLS cert file")
 	key := flag.String("key", "certs/l.moonchan.xyz/privkey.pem", "TLS key file")
-	upstream := flag.String("upstream", "video-cf.twimg.com", "default upstream target")
 	flag.Parse()
-
-	if v := os.Getenv("UPSTREAM"); v != "" {
-		*upstream = v
-	}
 
 	log.Printf("正在初始化 ECH 客户端...")
 	if err := cloudflare_ech.InitDefault(); err != nil {
@@ -59,8 +79,10 @@ func main() {
 		log.Fatalf("创建证书目录失败: %s (%v)", certDir, err)
 	}
 
-	certURL := fmt.Sprintf("https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com", *cert)
-	keyURL := fmt.Sprintf("https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com", *key)
+	proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
+	certURL := fmt.Sprintf(proxyBase, *cert)
+	keyURL := fmt.Sprintf(proxyBase, *key)
+	upstreamConfigURL := fmt.Sprintf(proxyBase, filepath.Join(certDir, "upstream.json"))
 
 	log.Printf("正在下载证书: %s", certURL)
 	if err := downloadFile(*cert, certURL); err != nil {
@@ -73,6 +95,13 @@ func main() {
 
 	certFile, _ := filepath.Abs(*cert)
 	keyFile, _ := filepath.Abs(*key)
+
+	log.Printf("正在加载上游配置: %s", upstreamConfigURL)
+	upstreamCfg, err := loadUpstreamConfig(upstreamConfigURL)
+	if err != nil {
+		log.Fatalf("加载上游配置失败: %v", err)
+	}
+	log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -89,9 +118,21 @@ func main() {
 		rawPath := c.Request.URL.Path
 		rawQuery := c.Request.URL.RawQuery
 
+		host := c.Request.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+
+		cfg, ok := upstreamCfg[host]
+		if !ok {
+			log.Printf("[%s] 未找到上游配置: %s", clientIP, host)
+			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
+			return
+		}
+
 		targetURL := &url.URL{
 			Scheme:   "https",
-			Host:     *upstream,
+			Host:     cfg.Host,
 			Path:     rawPath,
 			RawQuery: rawQuery,
 		}
@@ -111,8 +152,10 @@ func main() {
 				outReq.Header.Add(k, v)
 			}
 		}
-		outReq.Header.Set("Referer", "https://x.com")
-		outReq.Host = *upstream
+		if cfg.Referer != "" {
+			outReq.Header.Set("Referer", cfg.Referer)
+		}
+		outReq.Host = cfg.Host
 
 		log.Printf("[%s] -> ECH Do: %s %s (Host: %s)", clientIP, method, urlStr, outReq.Host)
 
@@ -137,8 +180,20 @@ func main() {
 
 	fmt.Printf("=== ECH Proxy ===\n")
 	fmt.Printf("  监听: %s\n", *addr)
-	fmt.Printf("  域名: %s\n", *domain)
-	fmt.Printf("  上游: %s\n", *upstream)
+	var domains []string
+	for host := range upstreamCfg {
+		domains = append(domains, host)
+	}
+	sort.Strings(domains)
+	for _, d := range domains {
+		cfg := upstreamCfg[d]
+		fmt.Printf("  域名: %s -> %s", d, cfg.Host)
+		if cfg.Referer != "" {
+			fmt.Printf(" (referer: %s)", cfg.Referer)
+		}
+		fmt.Println()
+	}
+	fmt.Printf("  上游配置: %s\n", upstreamConfigURL)
 	fmt.Printf("  证书: %s\n", certFile)
 	fmt.Printf("  密钥: %s\n", keyFile)
 	fmt.Printf("=================\n")
