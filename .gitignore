@@ -4,4 +4,4 @@ ech-proxy
 localdns
 signaling-server
 wintools
-peer-client
+peer-clientapi-server
