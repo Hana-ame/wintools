@@ -1,0 +1,13 @@
+{
+    "l.moonchan.xyz": {
+        "host": "video-cf.twimg.com",
+        "referer": "https://x.com"
+    },
+    "twimg.l.moonchan.xyz": {
+        "host": "video-cf.twimg.com",
+        "referer": "https://x.com"
+    },
+    "ex.l.moonchan.xyz": {
+        "host": "exhentai.org"
+    }
+}

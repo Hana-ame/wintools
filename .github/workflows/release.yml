@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, windows]
+        arch: [amd64, arm64]
+        exclude:
+          - os: windows
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build all cmds
+        run: |
+          for cmd in cmd/*/; do
+            name=$(basename "$cmd")
+            ext=""
+            [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+            mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
+            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
+              go build -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}${ext}" "./${cmd}"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/${{ matrix.os }}/${{ matrix.arch }}/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --generate-notes
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find dist -type f | while read f; do
+            rel="${f#dist/}"
+            label=$(echo "$rel" | sed 's|^\(linux\|windows\)-\(amd64\|arm64\)/|\1/\2/|')
+            echo "Uploading: $label"
+            gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
+          done
