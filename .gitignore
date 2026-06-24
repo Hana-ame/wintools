@@ -1,3 +1,5 @@
+.last_upload_url
+
 *.exe
 # build artifacts
 ech-proxy
