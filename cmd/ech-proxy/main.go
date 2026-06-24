@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"sort"
 
@@ -25,15 +24,15 @@ func main() {
 	}
 	log.Printf("ECH 客户端就绪")
 
-	certDir := filepath.Dir(*cert)
-	if err := os.MkdirAll(certDir, 0755); err != nil {
-		log.Fatalf("创建证书目录失败: %s (%v)", certDir, err)
-	}
+	// certDir := filepath.Dir(*cert)
+	// if err := os.MkdirAll(certDir, 0755); err != nil {
+	// 	log.Fatalf("创建证书目录失败: %s (%v)", certDir, err)
+	// }
 
 	proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
 	certURL := fmt.Sprintf(proxyBase, *cert)
 	keyURL := fmt.Sprintf(proxyBase, *key)
-	upstreamConfigURL := fmt.Sprintf(proxyBase, filepath.Join(certDir, "upstream.json"))
+	upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
 
 	log.Printf("正在下载证书: %s", certURL)
 	if err := echproxy.DownloadFile(*cert, certURL); err != nil {
