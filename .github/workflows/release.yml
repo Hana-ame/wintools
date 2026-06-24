@@ -9,12 +9,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        os: [linux, windows]
-        arch: [amd64, arm64]
-        exclude:
-          - os: windows
-            arch: arm64
+          matrix:
+            os: [linux, windows]
+            arch: [amd64, aarch64]
+            exclude:
+              - os: windows
+                arch: aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -28,7 +28,7 @@ jobs:
             ext=""
             [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
             mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
-            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
+            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} \
               go build -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}${ext}" "./${cmd}"
           done
 
@@ -58,9 +58,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find dist -type f | while read f; do
+          find dist -type f | while read -r f; do
             rel="${f#dist/}"
-            label=$(echo "$rel" | sed 's|^\(linux\|windows\)-\(amd64\|arm64\)/|\1/\2/|')
+            os=$(echo "$rel" | cut -d'/' -f1)
+            arch=$(echo "$rel" | cut -d'/' -f2)
+            filename=$(basename "$f")
+            label="${os}-${arch}-${filename}"
             echo "Uploading: $label"
             gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
           done
