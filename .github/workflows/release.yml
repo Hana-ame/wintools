@@ -9,12 +9,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
-          matrix:
-            os: [linux, windows]
-            arch: [amd64, aarch64]
-            exclude:
-              - os: windows
-                arch: aarch64
+      matrix:
+        os: [linux, windows]
+        arch: [amd64, aarch64]
+        exclude:
+          - os: windows
+            arch: aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -29,7 +29,7 @@ jobs:
             [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
             mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
             GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} \
-              go build -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}${ext}" "./${cmd}"
+               go build -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
           done
 
       - name: Upload artifacts
@@ -59,11 +59,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           find dist -type f | while read -r f; do
-            rel="${f#dist/}"
-            os=$(echo "$rel" | cut -d'/' -f1)
-            arch=$(echo "$rel" | cut -d'/' -f2)
             filename=$(basename "$f")
-            label="${os}-${arch}-${filename}"
+            label="${filename}"
             echo "Uploading: $label"
             gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
           done
