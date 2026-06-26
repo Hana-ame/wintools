@@ -1,9 +1,11 @@
 .last_upload_url
 
 *.exe
-# build artifacts
-ech-proxy
-localdns
-signaling-server
-wintools
-peer-clientapi-server
+# build artifacts (at repo root)
+/ech-proxy
+/localdns
+/signaling-server
+/wintools
+/peer-client
+/api-server
+/message-signal
