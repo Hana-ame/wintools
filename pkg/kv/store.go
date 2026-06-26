@@ -236,7 +236,11 @@ func (s *Store) Delete(key string) {
 
 // evictLoop 是后台 goroutine，按 tick 间隔定期清理过期条目。
 // 使用双重检查锁定：先读锁扫描，再写锁二次确认后删除。
+// ttl=0 表示永不过期，跳过清理。
 func (s *Store) evictLoop(tick time.Duration) {
+	if s.ttl == 0 {
+		return
+	}
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {

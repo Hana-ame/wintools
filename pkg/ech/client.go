@@ -109,7 +109,7 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		return cached, nil
 	}
 
-	u := fmt.Sprintf("https://moonchan.xyz/doh?name=%s&type=65", url.QueryEscape(domain))
+	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -170,9 +170,12 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 // ---- public API ----
 
 const (
-	shellDomain = "cloudflare-ech.com"
-	dialTimeout = 10 * time.Second
+	shellDomain    = "cloudflare-ech.com"
+	defaultDohURL = "https://1.1.1.1/dns-query"
+	dialTimeout    = 10 * time.Second
 )
+
+var dohURL = defaultDohURL
 
 // New 初始化一个 ECH 域前置 HTTP 客户端。
 // 首次调用时会通过 DoH 获取 cloudflare-ech.com 的 ECH 密钥并缓存。
@@ -268,6 +271,10 @@ func Do(req *http.Request) (*http.Response, error) {
 }
 
 // InitDefault 显式初始化全局默认客户端（可在程序启动时调用）。
+func SetDohURL(url string) {
+	dohURL = url
+}
+
 func InitDefault() error {
 	c, err := New()
 	if err != nil {
