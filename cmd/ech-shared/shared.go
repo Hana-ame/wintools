@@ -21,11 +21,6 @@ var (
 	initErr  atomic.Value
 )
 
-//export ECHSetDohURL
-func ECHSetDohURL(url *C.char) {
-	cloudflare_ech.SetDohURL(C.GoString(url))
-}
-
 //export ECHInit
 func ECHInit() {
 	initOnce.Do(func() {

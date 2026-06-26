@@ -10,7 +10,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/Hana-ame/wintools/pkg/api"
 	"github.com/Hana-ame/wintools/pkg/kv"
-	"github.com/Hana-ame/wintools/pkg/relay"
 )
 
 func main() {
@@ -34,13 +33,6 @@ func main() {
 
 	grp := r.Group("/kv")
 	h.RegisterRoutes(grp)
-
-	relayStore := relay.NewRelay(0)
-	defer relayStore.Stop()
-
-	mh := api.NewMessageHandler(relayStore)
-	grpMsg := r.Group("/message")
-	mh.RegisterRoutes(grpMsg)
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("API server listening on %s", addr)
