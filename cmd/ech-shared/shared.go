@@ -7,7 +7,6 @@ import "C"
 import (
 	"context"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"sync"
@@ -20,6 +19,7 @@ import (
 var (
 	srv     atomic.Pointer[http.Server]
 	startMu sync.Mutex
+	errMsg  atomic.Value
 )
 
 //export ECHProxyStart
@@ -37,7 +37,7 @@ func ECHProxyStart(addr, upstreamHost, upstreamReferer *C.char) *C.char {
 
 	go func() {
 		if err := cloudflare_ech.InitDefault(); err != nil {
-			log.Printf("ECH init error: %v", err)
+			errMsg.Store(err.Error())
 			return
 		}
 
@@ -50,7 +50,7 @@ func ECHProxyStart(addr, upstreamHost, upstreamReferer *C.char) *C.char {
 		srv.Store(s)
 
 		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("ECH proxy server error: %v", err)
+			errMsg.Store(err.Error())
 		}
 	}()
 
@@ -62,7 +62,18 @@ func ECHProxyReady() C.int {
 	if srv.Load() != nil {
 		return 1
 	}
+	if errMsg.Load() != nil {
+		return -1
+	}
 	return 0
+}
+
+//export ECHProxyLastError
+func ECHProxyLastError() *C.char {
+	if v := errMsg.Load(); v != nil {
+		return C.CString(v.(string))
+	}
+	return nil
 }
 
 //export ECHProxyStop
