@@ -120,6 +120,8 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 		logMsg("ECHFetch request error: " + err.Error())
 		return C.CString("ERR: " + err.Error())
 	}
+	outReq.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36")
+	outReq.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
 	if goRef != "" {
 		outReq.Header.Set("Referer", goRef)
 	}
