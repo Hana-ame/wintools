@@ -5,10 +5,8 @@ package main
 */
 import "C"
 import (
-	"context"
-	"io"
+	"encoding/base64"
 	"net/http"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -17,119 +15,82 @@ import (
 )
 
 var (
-	srv     atomic.Pointer[http.Server]
-	startMu sync.Mutex
-	errMsg  atomic.Value
+	initOnce sync.Once
+	initDone atomic.Bool
+	initErr  atomic.Value
 )
 
-//export ECHProxyStart
-func ECHProxyStart(addr, upstreamHost, upstreamReferer *C.char) *C.char {
-	startMu.Lock()
-	defer startMu.Unlock()
-
-	if srv.Load() != nil {
-		return nil
-	}
-
-	goAddr := C.GoString(addr)
-	goHost := C.GoString(upstreamHost)
-	goRef := C.GoString(upstreamReferer)
-
-	go func() {
-		if err := cloudflare_ech.InitDefault(); err != nil {
-			errMsg.Store(err.Error())
-			return
-		}
-
-		mux := http.NewServeMux()
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			proxyRequest(w, r, goHost, goRef)
-		})
-
-		s := &http.Server{Addr: goAddr, Handler: mux}
-		srv.Store(s)
-
-		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errMsg.Store(err.Error())
-		}
-	}()
-
-	return nil
+//export ECHInit
+func ECHInit() {
+	initOnce.Do(func() {
+		go func() {
+			if err := cloudflare_ech.InitDefault(); err != nil {
+				initErr.Store(err.Error())
+				return
+			}
+			initDone.Store(true)
+		}()
+	})
 }
 
-//export ECHProxyReady
-func ECHProxyReady() C.int {
-	if srv.Load() != nil {
+//export ECHInitReady
+func ECHInitReady() C.int {
+	if initDone.Load() {
 		return 1
 	}
-	if errMsg.Load() != nil {
+	if v := initErr.Load(); v != nil {
 		return -1
 	}
 	return 0
 }
 
-//export ECHProxyLastError
-func ECHProxyLastError() *C.char {
-	if v := errMsg.Load(); v != nil {
+//export ECHInitLastError
+func ECHInitLastError() *C.char {
+	if v := initErr.Load(); v != nil {
 		return C.CString(v.(string))
 	}
 	return nil
 }
 
-//export ECHProxyStop
-func ECHProxyStop() {
-	if s := srv.Load(); s != nil {
-		s.Shutdown(context.Background())
-		srv.Store(nil)
+//export ECHFetch
+func ECHFetch(urlStr, host, referer *C.char) *C.char {
+	goURL := C.GoString(urlStr)
+	goHost := C.GoString(host)
+	goRef := C.GoString(referer)
+
+	outReq, err := http.NewRequest("GET", goURL, nil)
+	if err != nil {
+		return C.CString("ERR: " + err.Error())
 	}
+	if goRef != "" {
+		outReq.Header.Set("Referer", goRef)
+	}
+	outReq.Host = goHost
+
+	resp, err := cloudflare_ech.Do(outReq)
+	if err != nil {
+		return C.CString("ERR: " + err.Error())
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return C.CString("ERR: HTTP " + http.StatusText(resp.StatusCode))
+	}
+
+	buf := make([]byte, 4*1024*1024)
+	n, err := resp.Body.Read(buf)
+	if err != nil && err.Error() != "EOF" {
+		return C.CString("ERR: read body: " + err.Error())
+	}
+	buf = buf[:n]
+
+	encoded := base64.StdEncoding.EncodeToString(buf)
+	return C.CString(encoded)
 }
 
 //export FreeCString
 func FreeCString(s *C.char) {
 	C.free(unsafe.Pointer(s))
-}
-
-func proxyRequest(w http.ResponseWriter, r *http.Request, host, referer string) {
-	upstreamURL := (&url.URL{
-		Scheme:   "https",
-		Host:     host,
-		Path:     r.URL.Path,
-		RawQuery: r.URL.RawQuery,
-	}).String()
-
-	outReq, err := http.NewRequest(r.Method, upstreamURL, r.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	if r.Body != nil {
-		defer r.Body.Close()
-	}
-
-	for k, vs := range r.Header {
-		for _, v := range vs {
-			outReq.Header.Add(k, v)
-		}
-	}
-	if referer != "" {
-		outReq.Header.Set("Referer", referer)
-	}
-	outReq.Host = host
-
-	resp, err := cloudflare_ech.Do(outReq)
-	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 }
 
 func main() {}
