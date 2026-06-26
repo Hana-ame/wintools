@@ -16,22 +16,35 @@ import (
 )
 
 var (
-	initOnce sync.Once
+	initMu   sync.Mutex
+	initing  bool
 	initDone atomic.Bool
 	initErr  atomic.Value
 )
 
 //export ECHInit
 func ECHInit() {
-	initOnce.Do(func() {
-		go func() {
-			if err := cloudflare_ech.InitDefault(); err != nil {
-				initErr.Store(err.Error())
-				return
-			}
-			initDone.Store(true)
-		}()
-	})
+	if initDone.Load() {
+		return
+	}
+	initMu.Lock()
+	if initDone.Load() || initing {
+		initMu.Unlock()
+		return
+	}
+	initing = true
+	initMu.Unlock()
+
+	go func() {
+		if err := cloudflare_ech.InitDefault(); err != nil {
+			initErr.Store(err.Error())
+			initMu.Lock()
+			initing = false
+			initMu.Unlock()
+			return
+		}
+		initDone.Store(true)
+	}()
 }
 
 //export ECHInitWithBootstrap
