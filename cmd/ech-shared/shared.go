@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -110,12 +111,22 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 	goHost := C.GoString(host)
 	goRef := C.GoString(referer)
 
-	logMsg("ECHFetch: " + goURL)
+	logMsg("ECHFetch: " + goURL + " -> host " + goHost)
+
+	parsed, err := url.Parse(goURL)
+	if err != nil {
+		logMsg("ECHFetch bad URL: " + err.Error())
+		return C.CString("ERR: " + err.Error())
+	}
+	parsed.Host = goHost
+	parsed.Scheme = "https"
+	rewritten := parsed.String()
+	logMsg("ECHFetch rewritten: " + rewritten)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	outReq, err := http.NewRequestWithContext(ctx, "GET", goURL, nil)
+	outReq, err := http.NewRequestWithContext(ctx, "GET", rewritten, nil)
 	if err != nil {
 		logMsg("ECHFetch request error: " + err.Error())
 		return C.CString("ERR: " + err.Error())
