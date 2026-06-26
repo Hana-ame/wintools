@@ -136,68 +136,56 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		return cached, nil
 	}
 
-	urls := []string{dohURL}
-	if backupDohURL != "" && backupDohURL != dohURL {
-		urls = append(urls, backupDohURL)
+	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))
+	resp, err := doDohRequest(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("DoH %s: %w", dohURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("DoH %s failed: %d", dohURL, resp.StatusCode)
 	}
 
-	var lastErr error
-	for _, base := range urls {
-		u := fmt.Sprintf("%s?name=%s&type=65", base, url.QueryEscape(domain))
-		resp, err := doDohRequest(ctx, u)
+	var d dohResponse
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return nil, fmt.Errorf("DoH %s decode: %w", dohURL, err)
+	}
+
+	echRe := regexp.MustCompile(`ech="?([A-Za-z0-9+/=]+)"?`)
+	wireRe := regexp.MustCompile(`\\#\s+(\d+)\s+([0-9a-fA-F\s]+)`)
+
+	for _, ans := range d.Answer {
+		if ans.Type != 65 {
+			continue
+		}
+		ttl := ans.TTL
+		if ttl <= 0 {
+			ttl = 300
+		}
+
+		var cfg []byte
+		if m := echRe.FindStringSubmatch(ans.Data); len(m) > 1 {
+			cfg, err = base64.StdEncoding.DecodeString(m[1])
+		} else if m := wireRe.FindStringSubmatch(ans.Data); len(m) > 1 {
+			nonHex := regexp.MustCompile(`[^0-9a-fA-F]`)
+			hexData := nonHex.ReplaceAllString(m[2], "")
+			var wire []byte
+			wire, err = hex.DecodeString(hexData)
+			if err == nil {
+				cfg, err = parseSVCBWire(wire)
+			}
+		}
 		if err != nil {
-			lastErr = fmt.Errorf("DoH %s: %w", base, err)
-			continue
+			return nil, fmt.Errorf("ECH parse error: %w", err)
 		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("DoH %s failed: %d", base, resp.StatusCode)
-			continue
+		if len(cfg) > 0 {
+			setCachedECH(domain, cfg, ttl)
+			return cfg, nil
 		}
-
-		var d dohResponse
-		if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-			lastErr = fmt.Errorf("DoH %s decode: %w", base, err)
-			continue
-		}
-
-		echRe := regexp.MustCompile(`ech="?([A-Za-z0-9+/=]+)"?`)
-		wireRe := regexp.MustCompile(`\\#\s+(\d+)\s+([0-9a-fA-F\s]+)`)
-
-		for _, ans := range d.Answer {
-			if ans.Type != 65 {
-				continue
-			}
-			ttl := ans.TTL
-			if ttl <= 0 {
-				ttl = 300
-			}
-
-			var cfg []byte
-			if m := echRe.FindStringSubmatch(ans.Data); len(m) > 1 {
-				cfg, err = base64.StdEncoding.DecodeString(m[1])
-			} else if m := wireRe.FindStringSubmatch(ans.Data); len(m) > 1 {
-				nonHex := regexp.MustCompile(`[^0-9a-fA-F]`)
-				hexData := nonHex.ReplaceAllString(m[2], "")
-				var wire []byte
-				wire, err = hex.DecodeString(hexData)
-				if err == nil {
-					cfg, err = parseSVCBWire(wire)
-				}
-			}
-			if err != nil {
-				return nil, fmt.Errorf("ECH parse error: %w", err)
-			}
-			if len(cfg) > 0 {
-				setCachedECH(domain, cfg, ttl)
-				return cfg, nil
-			}
-		}
-		lastErr = fmt.Errorf("no ECH config found for %s from %s", domain, base)
 	}
-	return nil, lastErr
+	return nil, fmt.Errorf("no ECH config found for %s from %s", domain, dohURL)
 }
 
 // ---- public API ----
@@ -209,10 +197,9 @@ const (
 
 // DoH bootstrap config.
 var (
-	dohURL          = "https://moonchan.xyz/doh" // primary DoH
-	backupDohURL    = "https://1.1.1.1/dns-query" // backup DoH
+	dohURL          = "https://moonchan.xyz/doh"
 	dohBootstrapIP  = ""
-	dohDialIP       = "" // IP to dial (from bootstrap or direct)
+	dohDialIP       = ""
 )
 
 // SetDohURL overrides the DoH URL entirely.
@@ -222,15 +209,9 @@ func SetDohURL(url string) {
 	dohDialIP = ""
 }
 
-// SetBackupDohURL sets the backup DoH URL for fallback.
-func SetBackupDohURL(url string) {
-	backupDohURL = url
-}
-
 // SetDoHConfig sets DoH via host + bootstrap IP for direct-IP dialing.
 func SetDoHConfig(host, bootstrapIP string) {
 	dohURL = fmt.Sprintf("https://%s/doh", host)
-	backupDohURL = "https://1.1.1.1/dns-query"
 	dohBootstrapIP = bootstrapIP
 	dohDialIP = bootstrapIP
 }
