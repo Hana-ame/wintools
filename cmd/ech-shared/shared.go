@@ -43,6 +43,11 @@ func ECHSetDohURL(url *C.char) {
 	cloudflare_ech.SetDohURL(C.GoString(url))
 }
 
+//export ECHSetBackupDohURL
+func ECHSetBackupDohURL(url *C.char) {
+	cloudflare_ech.SetBackupDohURL(C.GoString(url))
+}
+
 //export ECHInit
 func ECHInit() {
 	if initDone.Load() {
