@@ -135,8 +135,16 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		logMsg("ECHFetch HTTP " + http.StatusText(resp.StatusCode))
-		return C.CString("ERR: HTTP " + http.StatusText(resp.StatusCode))
+		bodyPreview, _ := io.ReadAll(resp.Body)
+		bodyStr := ""
+		if len(bodyPreview) > 200 {
+			bodyStr = string(bodyPreview[:200])
+		} else {
+			bodyStr = string(bodyPreview)
+		}
+		detail := fmt.Sprintf("HTTP %d %s | URL=%s | body=%.200s", resp.StatusCode, http.StatusText(resp.StatusCode), goURL, bodyStr)
+		logMsg("ECHFetch failed: " + detail)
+		return C.CString("ERR: " + detail)
 	}
 
 	buf, err := io.ReadAll(resp.Body)
