@@ -5,11 +5,14 @@ package main
 */
 import "C"
 import (
+	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
@@ -20,7 +23,24 @@ var (
 	initing  bool
 	initDone atomic.Bool
 	initErr  atomic.Value
+
+	logMu  sync.Mutex
+	logBuf []string
 )
+
+func logMsg(fmt string, args ...interface{}) {
+	logMu.Lock()
+	logBuf = append(logBuf, fmt)
+	if len(logBuf) > 200 {
+		logBuf = logBuf[len(logBuf)-200:]
+	}
+	logMu.Unlock()
+}
+
+//export ECHSetDohURL
+func ECHSetDohURL(url *C.char) {
+	cloudflare_ech.SetDohURL(C.GoString(url))
+}
 
 //export ECHInit
 func ECHInit() {
@@ -35,15 +55,19 @@ func ECHInit() {
 	initing = true
 	initMu.Unlock()
 
+	logMsg("ECHInit: starting goroutine")
 	go func() {
 		if err := cloudflare_ech.InitDefault(); err != nil {
+			logMsg("ECHInit error: " + err.Error())
 			initErr.Store(err.Error())
 			initMu.Lock()
 			initing = false
 			initMu.Unlock()
 			return
 		}
+		initErr.Store("")
 		initDone.Store(true)
+		logMsg("ECHInit: success")
 	}()
 }
 
@@ -62,7 +86,7 @@ func ECHInitReady() C.int {
 	if initDone.Load() {
 		return 1
 	}
-	if v := initErr.Load(); v != nil {
+	if v := initErr.Load(); v != nil && v.(string) != "" {
 		return -1
 	}
 	return 0
@@ -71,7 +95,11 @@ func ECHInitReady() C.int {
 //export ECHInitLastError
 func ECHInitLastError() *C.char {
 	if v := initErr.Load(); v != nil {
-		return C.CString(v.(string))
+		s := v.(string)
+		if s == "" {
+			return nil
+		}
+		return C.CString(s)
 	}
 	return nil
 }
@@ -82,8 +110,14 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 	goHost := C.GoString(host)
 	goRef := C.GoString(referer)
 
-	outReq, err := http.NewRequest("GET", goURL, nil)
+	logMsg("ECHFetch: " + goURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	outReq, err := http.NewRequestWithContext(ctx, "GET", goURL, nil)
 	if err != nil {
+		logMsg("ECHFetch request error: " + err.Error())
 		return C.CString("ERR: " + err.Error())
 	}
 	if goRef != "" {
@@ -93,21 +127,44 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 
 	resp, err := cloudflare_ech.Do(outReq)
 	if err != nil {
+		logMsg("ECHFetch Do error: " + err.Error())
 		return C.CString("ERR: " + err.Error())
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		logMsg("ECHFetch HTTP " + http.StatusText(resp.StatusCode))
 		return C.CString("ERR: HTTP " + http.StatusText(resp.StatusCode))
 	}
 
 	buf, err := io.ReadAll(resp.Body)
 	if err != nil {
+		logMsg("ECHFetch read error: " + err.Error())
 		return C.CString("ERR: read body: " + err.Error())
 	}
 
 	encoded := base64.StdEncoding.EncodeToString(buf)
+	logMsg("ECHFetch success: " + fmt.Sprintf("%d bytes -> %d base64", len(buf), len(encoded)))
 	return C.CString(encoded)
+}
+
+//export ECHGetLogCount
+func ECHGetLogCount() C.int {
+	logMu.Lock()
+	n := len(logBuf)
+	logMu.Unlock()
+	return C.int(n)
+}
+
+//export ECHGetLog
+func ECHGetLog(i C.int) *C.char {
+	logMu.Lock()
+	defer logMu.Unlock()
+	n := int(i)
+	if n < 0 || n >= len(logBuf) {
+		return nil
+	}
+	return C.CString(logBuf[n])
 }
 
 //export FreeCString

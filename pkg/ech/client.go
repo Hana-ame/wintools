@@ -109,7 +109,7 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		return cached, nil
 	}
 
-	u := fmt.Sprintf("https://%s/doh?name=%s&type=65", dohHost, url.QueryEscape(domain))
+	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -126,7 +126,11 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 			dialer := &net.Dialer{Timeout: 5 * time.Second}
 			return dialer.DialContext(ctx, network, net.JoinHostPort(dohBootstrapIP, port))
 		}
-		tr.TLSClientConfig = &tls.Config{ServerName: dohHost}
+		// SNI from the URL hostname for TLS cert validation
+		uParsed, _ := url.Parse(dohURL)
+		if uParsed != nil {
+			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
+		}
 	}
 	dohClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 	resp, err := dohClient.Do(req)
@@ -186,17 +190,21 @@ const (
 	dialTimeout = 10 * time.Second
 )
 
-// DoH bootstrap config — set via SetDoHConfig before InitDefault.
+// DoH bootstrap config.
 var (
-	dohHost       = "moonchan.xyz"
+	dohURL        = "https://1.1.1.1/dns-query" // default: Cloudflare DNS by IP, no DNS needed
 	dohBootstrapIP = ""
 )
 
-// SetDoHConfig sets the DoH server domain and an optional bootstrap IP.
-// When bootstrapIP is non-empty, Go skips DNS and dials that IP directly,
-// while keeping SNI and Host header as host.
+// SetDohURL overrides the DoH URL entirely (e.g. "https://1.1.1.1/dns-query").
+func SetDohURL(url string) {
+	dohURL = url
+	dohBootstrapIP = ""
+}
+
+// SetDoHConfig sets DoH via host + bootstrap IP for direct-IP dialing.
 func SetDoHConfig(host, bootstrapIP string) {
-	dohHost = host
+	dohURL = fmt.Sprintf("https://%s/doh", host)
 	dohBootstrapIP = bootstrapIP
 }
 
