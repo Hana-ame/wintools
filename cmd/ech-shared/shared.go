@@ -34,6 +34,16 @@ func ECHInit() {
 	})
 }
 
+//export ECHInitWithBootstrap
+func ECHInitWithBootstrap(cHost, cIP *C.char) {
+	host := C.GoString(cHost)
+	ip := C.GoString(cIP)
+	if host != "" {
+		cloudflare_ech.SetDoHConfig(host, ip)
+	}
+	ECHInit()
+}
+
 //export ECHInitReady
 func ECHInitReady() C.int {
 	if initDone.Load() {

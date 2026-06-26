@@ -109,14 +109,26 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		return cached, nil
 	}
 
-	u := fmt.Sprintf("https://moonchan.xyz/doh?name=%s&type=65", url.QueryEscape(domain))
+	u := fmt.Sprintf("https://%s/doh?name=%s&type=65", dohHost, url.QueryEscape(domain))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
 
-	dohClient := &http.Client{Timeout: 5 * time.Second}
+	tr := &http.Transport{}
+	if dohBootstrapIP != "" {
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			dialer := &net.Dialer{Timeout: 5 * time.Second}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(dohBootstrapIP, port))
+		}
+		tr.TLSClientConfig = &tls.Config{ServerName: dohHost}
+	}
+	dohClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 	resp, err := dohClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -173,6 +185,20 @@ const (
 	shellDomain = "cloudflare-ech.com"
 	dialTimeout = 10 * time.Second
 )
+
+// DoH bootstrap config — set via SetDoHConfig before InitDefault.
+var (
+	dohHost       = "moonchan.xyz"
+	dohBootstrapIP = ""
+)
+
+// SetDoHConfig sets the DoH server domain and an optional bootstrap IP.
+// When bootstrapIP is non-empty, Go skips DNS and dials that IP directly,
+// while keeping SNI and Host header as host.
+func SetDoHConfig(host, bootstrapIP string) {
+	dohHost = host
+	dohBootstrapIP = bootstrapIP
+}
 
 // New 初始化一个 ECH 域前置 HTTP 客户端。
 // 首次调用时会通过 DoH 获取 cloudflare-ech.com 的 ECH 密钥并缓存。
