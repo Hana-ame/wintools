@@ -6,6 +6,7 @@ package main
 import "C"
 import (
 	"encoding/base64"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -77,12 +78,10 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 		return C.CString("ERR: HTTP " + http.StatusText(resp.StatusCode))
 	}
 
-	buf := make([]byte, 4*1024*1024)
-	n, err := resp.Body.Read(buf)
-	if err != nil && err.Error() != "EOF" {
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return C.CString("ERR: read body: " + err.Error())
 	}
-	buf = buf[:n]
 
 	encoded := base64.StdEncoding.EncodeToString(buf)
 	return C.CString(encoded)
