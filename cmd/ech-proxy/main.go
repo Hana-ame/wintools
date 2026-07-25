@@ -77,11 +77,14 @@ func main() {
 		c.String(200, "ok")
 	})
 
+	zenAPIKey := os.Getenv("ZEN_API_KEY")
+	if zenAPIKey == "" {
+		zenAPIKey = "public"
+	}
 	zenOpt := apifwd.Option{
-		Dest:    "https://opencode.ai/zen/v1",
-		Local:   true,
-		Headers: map[string]string{"Authorization": "Bearer public"},
-		Modify:  cleanZenPayload,
+		Dest:   "https://opencode.ai/zen/v1",
+		Local:  true,
+		Modify: cleanZenPayload,
 	}
 	r.Use(func(c *gin.Context) {
 		host := c.Request.Host
@@ -89,6 +92,9 @@ func main() {
 			host = h
 		}
 		if host == "zen.l.moonchan.xyz" {
+			if c.GetHeader("Authorization") == "" {
+				c.Request.Header.Set("Authorization", "Bearer "+zenAPIKey)
+			}
 			apifwd.Handler(zenOpt)(c)
 			c.Abort()
 			return
