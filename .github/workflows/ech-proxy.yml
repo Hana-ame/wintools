@@ -5,7 +5,9 @@ on:
     branches: [main]
     paths:
       - "cmd/ech-proxy/**"
-      - "cloudflare_ech/**"
+      - "pkg/ech/**"
+      - "pkg/echproxy/**"
+      - "pkg/apifwd/**"
       - "certs/**"
       - "go.mod"
       - "go.sum"

@@ -9,5 +9,8 @@
     },
     "ex.l.moonchan.xyz": {
         "host": "exhentai.org"
+    },
+    "zen.l.moonchan.xyz": {
+        "host": "opencode.ai"
     }
 }

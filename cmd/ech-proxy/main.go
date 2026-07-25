@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"sort"
 
+	"github.com/gin-gonic/gin"
+
+	"github.com/Hana-ame/wintools/pkg/apifwd"
 	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
 	"github.com/Hana-ame/wintools/pkg/echproxy"
-	"github.com/gin-gonic/gin"
 )
 
 const embeddedConfig = `{
@@ -25,8 +29,25 @@ const embeddedConfig = `{
     },
     "ex.l.moonchan.xyz": {
         "host": "exhentai.org"
+    },
+    "zen.l.moonchan.xyz": {
+        "host": "opencode.ai"
     }
 }`
+
+func cleanZenPayload(body []byte) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	if _, ok := payload["model"]; !ok {
+		payload["model"] = "deepseek-v4-flash-free"
+	}
+	if mt, ok := payload["max_tokens"].(float64); !ok || mt > 65536 {
+		payload["max_tokens"] = 65536
+	}
+	return json.Marshal(payload)
+}
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
@@ -34,6 +55,12 @@ func main() {
 	key := flag.String("key", "certs/l.moonchan.xyz/privkey.pem", "TLS key file")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
 	flag.Parse()
+
+	localIP := os.Getenv("LOCALIP")
+	if localIP != "" {
+		log.Printf("使用自定义 DoH 接入 IP: %s", localIP)
+		cloudflare_ech.SetDoHConfig("moonchan.xyz", localIP)
+	}
 
 	log.Printf("正在初始化 ECH 客户端...")
 	if err := cloudflare_ech.InitDefault(); err != nil {
@@ -44,9 +71,29 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(apifwd.CORSMiddleware())
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(200, "ok")
+	})
+
+	zenOpt := apifwd.Option{
+		Dest:    "https://opencode.ai/zen/v1",
+		Local:   true,
+		Headers: map[string]string{"Authorization": "Bearer public"},
+		Modify:  cleanZenPayload,
+	}
+	r.Use(func(c *gin.Context) {
+		host := c.Request.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if host == "zen.l.moonchan.xyz" {
+			apifwd.Handler(zenOpt)(c)
+			c.Abort()
+			return
+		}
+		c.Next()
 	})
 
 	var upstreamCfg echproxy.UpstreamMap
@@ -92,18 +139,25 @@ func main() {
 	fmt.Printf("=== ECH Proxy ===\n")
 	fmt.Printf("  模式: %s\n", map[bool]string{true: "HTTP (本地代理)", false: "TLS (远程)"}[*httpMode])
 	fmt.Printf("  监听: %s\n", *addr)
+	if localIP != "" {
+		fmt.Printf("  DoH IP: %s\n", localIP)
+	}
 	var domains []string
 	for host := range upstreamCfg {
 		domains = append(domains, host)
 	}
 	sort.Strings(domains)
 	for _, d := range domains {
-		uc := upstreamCfg[d]
-		fmt.Printf("  域名: %s -> %s", d, uc.Host)
-		if uc.Referer != "" {
-			fmt.Printf(" (referer: %s)", uc.Referer)
+		if d == "zen.l.moonchan.xyz" {
+			fmt.Printf("  域名: %s -> opencode.ai (Zen API 直连)\n", d)
+		} else {
+			uc := upstreamCfg[d]
+			fmt.Printf("  域名: %s -> %s", d, uc.Host)
+			if uc.Referer != "" {
+				fmt.Printf(" (referer: %s)", uc.Referer)
+			}
+			fmt.Println()
 		}
-		fmt.Println()
 	}
 	fmt.Printf("=================\n")
 
@@ -112,9 +166,7 @@ func main() {
 			log.Fatalf("启动失败: %v", err)
 		}
 	} else {
-		if err := r.RunTLS(*addr, *cert, *key); err != nil {
-			log.Fatalf("启动失败: %v", err)
-		}
+		r.RunTLS(*addr, *cert, *key)
 	}
 }
 
