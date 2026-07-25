@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -60,6 +61,21 @@ func main() {
 	if localIP != "" {
 		log.Printf("使用自定义 DoH 接入 IP: %s", localIP)
 		cloudflare_ech.SetDoHConfig("moonchan.xyz", localIP)
+	}
+
+	ipMode := os.Getenv("IP_MODE")
+	if ipMode != "" {
+		cloudflare_ech.SetIPMode(ipMode)
+	}
+	v4ok, v6ok := cloudflare_ech.CheckDualStack(context.Background())
+	if v4ok || v6ok {
+		suffix := ""
+		if ipMode != "" {
+			suffix = " (强制 " + ipMode + ")"
+		}
+		log.Printf("IP 栈检测: IPv4=%v IPv6=%v%s", v4ok, v6ok, suffix)
+	} else {
+		log.Printf("IP 栈检测失败（DNS 不可达）")
 	}
 
 	log.Printf("正在初始化 ECH 客户端...")

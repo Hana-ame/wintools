@@ -126,6 +126,14 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 		if uParsed != nil {
 			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
 		}
+	} else if ipMode != "" {
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return dialTCP(ctx, host, port, 5*time.Second)
+		}
 	}
 	dohClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 	return dohClient.Do(req)
@@ -200,7 +208,65 @@ var (
 	dohURL          = "https://moonchan.xyz/doh"
 	dohBootstrapIP  = ""
 	dohDialIP       = ""
+	ipMode          string // "v4", "v6", or "" (auto)
 )
+
+// SetIPMode 设置 IP 协议偏好。mode 为 "v4"、"v6" 或 ""（自动）。
+func SetIPMode(mode string) {
+	switch mode {
+	case "v4", "v6":
+		ipMode = mode
+	default:
+		ipMode = ""
+	}
+}
+
+func resolvePreferredIP(ctx context.Context, host string) (string, error) {
+	if ipMode == "" {
+		return "", nil
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", host, err)
+	}
+	for _, addr := range ips {
+		if ipMode == "v4" && addr.IP.To4() != nil {
+			return addr.IP.String(), nil
+		}
+		if ipMode == "v6" && addr.IP.To4() == nil && addr.IP.To16() != nil {
+			return addr.IP.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no %s address for %s", ipMode, host)
+}
+
+func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	if ipMode == "" {
+		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	}
+	ip, err := resolvePreferredIP(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+}
+
+// CheckDualStack 检测本地 IPv4/IPv6 连通性。
+func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, "moonchan.xyz")
+	if err != nil {
+		return false, false
+	}
+	for _, addr := range ips {
+		if addr.IP.To4() != nil {
+			hasV4 = true
+		} else if addr.IP.To16() != nil {
+			hasV6 = true
+		}
+	}
+	return
+}
 
 // SetDohURL overrides the DoH URL entirely.
 func SetDohURL(url string) {
@@ -227,11 +293,6 @@ func New() (*Client, error) {
 		return nil, fmt.Errorf("fetch ECH config: %w", err)
 	}
 
-	dialer := &net.Dialer{
-		Timeout:   dialTimeout,
-		KeepAlive: 30 * time.Second,
-	}
-
 	transport := &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
@@ -239,7 +300,7 @@ func New() (*Client, error) {
 				return nil, err
 			}
 
-			rawConn, err := dialer.DialContext(ctx, network, net.JoinHostPort(shellDomain, "443"))
+			rawConn, err := dialTCP(ctx, shellDomain, "443", dialTimeout)
 			if err != nil {
 				return nil, fmt.Errorf("dial shell: %w", err)
 			}
@@ -349,11 +410,6 @@ func refreshLoop() {
 }
 
 func rebuildClient(echConfig []byte) (*Client, error) {
-	dialer := &net.Dialer{
-		Timeout:   dialTimeout,
-		KeepAlive: 30 * time.Second,
-	}
-
 	transport := &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
@@ -361,7 +417,7 @@ func rebuildClient(echConfig []byte) (*Client, error) {
 				return nil, err
 			}
 
-			rawConn, err := dialer.DialContext(ctx, network, net.JoinHostPort(shellDomain, "443"))
+			rawConn, err := dialTCP(ctx, shellDomain, "443", dialTimeout)
 			if err != nil {
 				return nil, fmt.Errorf("dial shell: %w", err)
 			}
