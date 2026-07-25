@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +19,9 @@ import (
 	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
 	"github.com/Hana-ame/wintools/pkg/echproxy"
 )
+
+//go:embed static/index.html
+var chatHTML string
 
 const embeddedConfig = `{
     "l.moonchan.xyz": {
@@ -91,6 +95,11 @@ func main() {
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(200, "ok")
+	})
+
+	r.GET("/", func(c *gin.Context) {
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(200, chatHTML)
 	})
 
 	zenAPIKey := os.Getenv("ZEN_API_KEY")
