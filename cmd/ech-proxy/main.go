@@ -97,11 +97,19 @@ func main() {
 	if zenAPIKey == "" {
 		zenAPIKey = "public"
 	}
-	zenHandler := apifwd.Handler(apifwd.Option{
-		Dest:   "https://opencode.ai/zen/v1",
-		Local:  true,
-		Modify: cleanZenPayload,
-	})
+	log.Printf("正在解析 opencode.ai  IP...")
+	v4ep, err4 := apifwd.ResolveIP("opencode.ai", "/zen/v1", 4)
+	v6ep, err6 := apifwd.ResolveIP("opencode.ai", "/zen/v1", 6)
+	if v4ep != nil {
+		log.Printf("  IPv4: %s", v4ep.URL)
+	}
+	if v6ep != nil {
+		log.Printf("  IPv6: %s", v6ep.URL)
+	}
+	if err4 != nil && err6 != nil {
+		log.Fatalf("解析 opencode.ai 失败: v4=%v v6=%v", err4, err6)
+	}
+	zenHandler := apifwd.Zen(v4ep, v6ep, zenAPIKey, cleanZenPayload)
 
 	var upstreamCfg echproxy.UpstreamMap
 	var upstreamHandler gin.HandlerFunc
