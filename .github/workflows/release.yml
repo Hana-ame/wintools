@@ -26,6 +26,8 @@ jobs:
         run: |
           for cmd in cmd/*/; do
             name=$(basename "$cmd")
+            # skip CGo shared library (needs C cross-compiler)
+            [ "$name" = "ech-shared" ] && continue
             ext=""
             [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
             mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
