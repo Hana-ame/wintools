@@ -81,28 +81,14 @@ func main() {
 	if zenAPIKey == "" {
 		zenAPIKey = "public"
 	}
-	zenOpt := apifwd.Option{
+	zenHandler := apifwd.Handler(apifwd.Option{
 		Dest:   "https://opencode.ai/zen/v1",
 		Local:  true,
 		Modify: cleanZenPayload,
-	}
-	r.Use(func(c *gin.Context) {
-		host := c.Request.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		if host == "zen.l.moonchan.xyz" {
-			if c.GetHeader("Authorization") == "" {
-				c.Request.Header.Set("Authorization", "Bearer "+zenAPIKey)
-			}
-			apifwd.Handler(zenOpt)(c)
-			c.Abort()
-			return
-		}
-		c.Next()
 	})
 
 	var upstreamCfg echproxy.UpstreamMap
+	var upstreamHandler gin.HandlerFunc
 
 	if *httpMode {
 		if err := json.Unmarshal([]byte(embeddedConfig), &upstreamCfg); err != nil {
@@ -112,7 +98,7 @@ func main() {
 
 		for domain, uc := range upstreamCfg {
 			if uc.Host == "video-cf.twimg.com" {
-				r.NoRoute(localProxyHandler(upstreamCfg, domain))
+				upstreamHandler = localProxyHandler(upstreamCfg, domain)
 				break
 			}
 		}
@@ -139,8 +125,23 @@ func main() {
 		}
 		log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
 
-		r.NoRoute(echproxy.ProxyHandler(upstreamCfg))
+		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
 	}
+
+	r.NoRoute(func(c *gin.Context) {
+		host := c.Request.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if host == "zen.l.moonchan.xyz" {
+			if c.GetHeader("Authorization") == "" {
+				c.Request.Header.Set("Authorization", "Bearer "+zenAPIKey)
+			}
+			zenHandler(c)
+		} else {
+			upstreamHandler(c)
+		}
+	})
 
 	fmt.Printf("=== ECH Proxy ===\n")
 	fmt.Printf("  模式: %s\n", map[bool]string{true: "HTTP (本地代理)", false: "TLS (远程)"}[*httpMode])
