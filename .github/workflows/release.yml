@@ -22,7 +22,7 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Build all cmds
+      - name: Build all cmds (static, CGO off for old-glibc/Termux)
         run: |
           for cmd in cmd/*/; do
             name=$(basename "$cmd")
@@ -31,8 +31,9 @@ jobs:
             ext=""
             [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
             mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
-            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} \
-               go build -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
+            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} CGO_ENABLED=0 \
+               go build -trimpath -ldflags="-s -w" \
+               -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
           done
 
       - name: Upload artifacts
