@@ -12,9 +12,6 @@ jobs:
       matrix:
         os: [linux, windows]
         arch: [amd64, aarch64]
-        exclude:
-          - os: windows
-            arch: aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
