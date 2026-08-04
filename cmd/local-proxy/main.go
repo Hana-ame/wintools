@@ -87,7 +87,7 @@ type chunkMsg struct {
 	err  error
 }
 
-func startReader(body io.Reader) chan chunkMsg {
+func startReader(body io.Reader, done <-chan struct{}) chan chunkMsg {
 	ch := make(chan chunkMsg, 32)
 	go func() {
 		buf := make([]byte, 16384)
@@ -96,13 +96,25 @@ func startReader(body io.Reader) chan chunkMsg {
 			if n > 0 {
 				cp := make([]byte, n)
 				copy(cp, buf[:n])
-				ch <- chunkMsg{data: cp}
+				select {
+				case ch <- chunkMsg{data: cp}:
+				case <-done:
+					return
+				}
 			}
 			if err != nil {
 				if err == io.EOF {
-					ch <- chunkMsg{eof: true}
+					select {
+					case ch <- chunkMsg{eof: true}:
+					case <-done:
+						return
+					}
 				} else {
-					ch <- chunkMsg{err: err}
+					select {
+					case ch <- chunkMsg{err: err}:
+					case <-done:
+						return
+					}
 				}
 				close(ch)
 				return
@@ -310,7 +322,9 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 // forwardStream relays the SSE stream with keep-alive filtering and stall
 // detection (30s; 180s during a tool call). Returns true on success.
 func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam string) bool {
-	ch := startReader(resp.Body)
+	done := make(chan struct{})
+	defer close(done)
+	ch := startReader(resp.Body, done)
 	t0 := time.Now()
 
 	deadline := time.Now().Add(stallTimeout)

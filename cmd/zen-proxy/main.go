@@ -138,7 +138,7 @@ func stallFor(sawTool bool) time.Duration {
 // startReader drains resp.Body in a single goroutine, sending chunks on ch.
 // It is closed (EOF) or an error sentinel is emitted; the goroutine always
 // terminates once resp.Body is closed (which unblocks Read).
-func startReader(body io.Reader) chan chunkMsg {
+func startReader(body io.Reader, done <-chan struct{}) chan chunkMsg {
 	ch := make(chan chunkMsg, 32)
 	go func() {
 		buf := make([]byte, 16384)
@@ -147,13 +147,25 @@ func startReader(body io.Reader) chan chunkMsg {
 			if n > 0 {
 				cp := make([]byte, n)
 				copy(cp, buf[:n])
-				ch <- chunkMsg{data: cp}
+				select {
+				case ch <- chunkMsg{data: cp}:
+				case <-done:
+					return
+				}
 			}
 			if err != nil {
 				if err == io.EOF {
-					ch <- chunkMsg{eof: true}
+					select {
+					case ch <- chunkMsg{eof: true}:
+					case <-done:
+						return
+					}
 				} else {
-					ch <- chunkMsg{err: err}
+					select {
+					case ch <- chunkMsg{err: err}:
+					case <-done:
+						return
+					}
 				}
 				close(ch)
 				return
@@ -167,7 +179,9 @@ func startReader(body io.Reader) chan chunkMsg {
 // keep-alive filtering, stall detection and tool-call protection.
 // Returns true on success.
 func (s *server) forwardStream(w http.ResponseWriter, resp *http.Response, fam string) bool {
-	ch := startReader(resp.Body)
+	done := make(chan struct{})
+	defer close(done)
+	ch := startReader(resp.Body, done)
 	t0 := time.Now()
 
 	// Pre-read: wait up to stallTimeout for real SSE data; else give up.
@@ -591,7 +605,7 @@ func (s *server) handler() http.Handler {
 			"banned_ips":        s.ban.count(),
 			"active_goroutines": runtime.NumGoroutine(),
 		})
-		})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			h := w.Header()

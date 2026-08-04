@@ -192,7 +192,7 @@ type chunkMsg struct {
 	err  error
 }
 
-func startReader(body io.Reader) chan chunkMsg {
+func startReader(body io.Reader, done <-chan struct{}) chan chunkMsg {
 	ch := make(chan chunkMsg, 32)
 	go func() {
 		buf := make([]byte, 16384)
@@ -201,13 +201,25 @@ func startReader(body io.Reader) chan chunkMsg {
 			if n > 0 {
 				cp := make([]byte, n)
 				copy(cp, buf[:n])
-				ch <- chunkMsg{data: cp}
+				select {
+				case ch <- chunkMsg{data: cp}:
+				case <-done:
+					return
+				}
 			}
 			if err != nil {
 				if err == io.EOF {
-					ch <- chunkMsg{eof: true}
+					select {
+					case ch <- chunkMsg{eof: true}:
+					case <-done:
+						return
+					}
 				} else {
-					ch <- chunkMsg{err: err}
+					select {
+					case ch <- chunkMsg{err: err}:
+					case <-done:
+						return
+					}
 				}
 				close(ch)
 				return
@@ -421,7 +433,9 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 // detection, tool-call protection and inf-loop injection.
 func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Response, canInject bool) bool {
 	name := u.name
-	ch := startReader(resp.Body)
+	done := make(chan struct{})
+	defer close(done)
+	ch := startReader(resp.Body, done)
 	t0 := time.Now()
 
 	// Pre-read.
@@ -528,7 +542,7 @@ loop:
 
 			if canInject && !sawTool && !injected {
 				if fr := eventFinishReason(ev); fr != nil && *fr != "tool_calls" {
-					if err := write(append([]byte("data: "), neutralizeFinish(ev)...)); err != nil {
+					if err := write(neutralizeFinish(ev)); err != nil {
 						log.Printf("client disconnected")
 						break loop
 					}
