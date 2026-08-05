@@ -224,6 +224,45 @@ func TestShallowMergeOnNilEntry(t *testing.T) {
 	}
 }
 
+func TestTTLZeroNoEviction(t *testing.T) {
+	s := NewStore(0, 10*time.Millisecond)
+	defer s.Stop()
+
+	s.Set("k", map[string]any{"x": 1})
+	time.Sleep(50 * time.Millisecond)
+
+	_, ok := s.Peek("k")
+	if !ok {
+		t.Fatal("key should never expire when ttl=0")
+	}
+}
+
+func TestMergeNotRaceWithRead(t *testing.T) {
+	s := NewStore(0, time.Hour)
+	defer s.Stop()
+
+	s.Set("k", map[string]any{"nested": map[string]any{"a": 1}})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				s.ShallowMerge("k", map[string]any{"j": j})
+				s.DeepMerge("k", map[string]any{"nested": map[string]any{"b": j}})
+				data, ok := s.Peek("k")
+				if !ok {
+					t.Error("key should exist")
+					return
+				}
+				_ = data["nested"].(map[string]any)["a"]
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func TestConcurrentSetAndGet(t *testing.T) {
 	s := NewStore(0, time.Hour)
 	defer s.Stop()

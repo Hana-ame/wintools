@@ -81,11 +81,35 @@ systemd `zen-multi.service`：`ExecStart=/usr/local/bin/zen_multi_go 127.0.0.1 8
 | 路径 | 方法 | 说明 |
 |------|------|------|
 | zen-proxy `/chat/completions`、`/v1/chat/completions` | POST | 转发到 opencode.ai |
-| zen-proxy `/status` | GET | cooldown / banned / goroutines |
+| zen-proxy `/status` | GET | cooldown / banned / goroutines / 分 v4/v6 用量统计 |
 | zen-multi `/v1/chat/completions` | POST | 多源 failover + inf 注入 |
 | zen-multi `/v1/models` | GET | 模型列表 |
 | zen-multi `/status` | GET | 各源 cooldown / reqs |
 | local-proxy `/v1/chat/completions`、`/v1/models` | POST/GET | 简单多源转发 |
+
+### 用量统计（zen-proxy `/status`）
+
+`stats` 字段按协议栈分组，进程存活期间累计：
+
+```json
+"stats": {
+  "since": "2026-08-05T00:00:00Z",
+  "total": { "reqs": 12, "ok": 10, "streams": 9, "bytes": 40960,
+             "tool_calls": 3, "stalls": 1, "errs": 2, "free_limit": 0 },
+  "per": { "v6": { "...": 0 }, "v4": { "...": 0 } }
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `reqs` | 尝试连接上游的次数 |
+| `ok` | 上游返回 200 的次数 |
+| `streams` | 已提交（commit）的流式响应次数 |
+| `bytes` | 转发给客户端的 SSE 字节数 |
+| `tool_calls` | 转发的 tool_call delta 次数 |
+| `stalls` | stall 超时中断次数（工具流/普通流同计） |
+| `errs` | 传输错误 / 非 200 / 预读无数据（上游 200 但流空） |
+| `free_limit` | `FreeUsageLimitError` 命中次数（触发午夜 cooldown） |
 
 ## 与 Python 版的差异
 
@@ -102,6 +126,49 @@ Go 版消除了 Python 栈的三个核心问题：
 
 语义保持：keep-alive 注释不转发、工具调用流（`saw_tool`）不误判死、
 FreeUsageLimitError 冷却到 UTC 午夜、长工具参数完整转发不截断。
+
+## inf 注入的 SSE 协议（zen-multi）
+
+`deepseek-v4-flash-inf` 模型在流式中途/结尾/断流/idle 时若一直没产出 tool_call，
+zen-multi 会注入一条假的 `bash` tool_call，驱动 opencode 自动继续。
+
+注入的完整序列（三条事件，逐条 `\n\n` 分隔）必须是 OpenAI 兼容的合法 tool_call 收尾：
+
+```
+data: {"id":"inf",...,"choices":[{"index":0,"delta":{"tool_calls":[
+      {"index":0,"id":"call_inf_N","type":"function",
+       "function":{"name":"bash","arguments":"{\"command\":\"echo 请继续完善当前项目...\"}"}}]},
+      "finish_reason":null}]}
+
+data: {"id":"inf",...,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+```
+
+- `idleInject()`（idle 超时路径）自带 `data: [DONE]`。
+- `infInject()`（finish 改写 / 上游 `[DONE]` / EOF 断流三条路径）**不带** `[DONE]`：
+  finish 改写与上游 `[DONE]` 路径的上游本来就会转发自己的 `[DONE]`，再加会双 DONE；
+  EOF 断流路径会在 `infInject()` 之后**单独补发** `data: [DONE]`，否则客户端认为流被截断。
+- 收敛规则：四条注入路径最终都保证终端为 `finish_reason:"tool_calls"` 事件 + `[DONE]`，
+  改动这里时保持此收尾不变。
+- 已注入 tool_call 但上游 `[DONE]` 未到就 stall 的角落：只补一个裸 `data: [DONE]`，
+  不再重复收尾事件。
+
+## 实现约束
+
+三个 Go 代理共享以下实现约束（改动时需保持一致）：
+
+- **SSE 提交后禁止 failover**：`forwardStream` 一旦 `WriteHeader(200)` + flush 首包，
+  后续任何失败（stall / mid-stream 错误 / 客户端断开）都不允许再切换到下一个源，
+  否则会对已提交的响应双写。实现上用 `(ok, committed)` 返回值约定：只有
+  `committed=false`（预读阶段失败）时才可 failover。
+- **请求体上限**：`io.ReadAll` 一律经 `io.LimitReader`，超过 10MB 返回 413。
+- **工具流 stall 收尾**：工具调用流（`saw_tool`）超过 180s 无真实数据时，三个代理
+  都补发 `finish_reason:"length"` 终止事件 + `data: [DONE]` 再断开，客户端能区分
+  「完成」与「截断」；非工具流行为不变（zen-proxy / local-proxy 写 `UpstreamStall`
+  错误，zen-multi 静默断开）。`lengthChunk(model)` 为共用格式。
+- **reader goroutine**：`startReader` 用 done channel 中止，退出循环后必须能立即
+  终止阻塞中的 send/read，不能依赖 `resp.Body.Close()` 兜底。
 
 ## 关联代码
 

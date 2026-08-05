@@ -34,6 +34,9 @@ const (
 	cooldownShort    = 60 * time.Second
 	maxRetries       = 3
 	idleConnTimeout  = 90 * time.Second
+
+	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
+	maxRequestBody = 10 << 20
 )
 
 type upstream struct {
@@ -64,6 +67,19 @@ func (u *upstream) setCooldownUntil(t time.Time) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.cooldownUntil = t
+}
+
+// setErr 记录最近一次错误。所有读写都持 u.mu，避免与 /status 的读取竞争。
+func (u *upstream) setErr(e string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.lastErr = e
+}
+
+func (u *upstream) incrReqs() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.reqs++
 }
 
 // ---- SSE helpers (shared with zen_proxy.go) --------------------------------
@@ -256,12 +272,21 @@ func idleInject() []byte {
 	inject := fmt.Sprintf(
 		`{"id":"inf","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_inf_idle","type":"function","function":{"name":"%s","arguments":%s}}]},"finish_reason":null}]}`,
 		baseModel, infTool, jsonString(infIdleArg))
-	return []byte("data: " + inject + "\n\ndata: [DONE]\n\n")
+	finishEvt := fmt.Sprintf(
+		`{"id":"inf","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		baseModel)
+	return []byte("data: " + inject + "\n\ndata: " + finishEvt + "\n\ndata: [DONE]\n\n")
 }
 
 func jsonString(s string) string {
 	re, _ := json.Marshal(s)
 	return string(re)
+}
+
+// lengthChunk 工具流 stall 截断时补发的终止事件：finish_reason=length + [DONE]。
+// 与注入事件一致使用 baseModel。
+func lengthChunk() []byte {
+	return []byte(fmt.Sprintf("data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", baseModel))
 }
 
 // ---- model resolution ------------------------------------------------------
@@ -305,9 +330,13 @@ type server struct{}
 
 func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	log.Printf("-> %s %s", r.Method, r.URL.Path)
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"error": "Bad Request"})
+		return
+	}
+	if len(body) > maxRequestBody {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "Request body too large"})
 		return
 	}
 
@@ -381,7 +410,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 	if err != nil {
 		log.Printf("%s: %T", u.name, err)
 		u.setCooldown(cooldownShort)
-		u.lastErr = err.Error()
+		u.setErr(err.Error())
 		*lastStatus = 502
 		*lastErrBody = map[string]any{"error": map[string]any{"message": err.Error(), "type": "UpstreamError"}}
 		return false
@@ -396,12 +425,12 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		if e, ok := obj["error"].(map[string]any); ok && e["type"] == freeLimitErr {
 			log.Printf("%s: FreeUsageLimitError (cooldown to midnight)", u.name)
 			u.setCooldownUntil(nextUTCMidnight())
-			u.lastErr = freeLimitErr
+			u.setErr(freeLimitErr)
 			*limitErr = obj
 			return false
 		}
 		log.Printf("%s: HTTP %d -> try next source", u.name, resp.StatusCode)
-		u.lastErr = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		u.setErr(fmt.Sprintf("HTTP %d", resp.StatusCode))
 		*lastStatus = resp.StatusCode
 		if len(obj) > 0 {
 			*lastErrBody = obj
@@ -411,8 +440,8 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		return false
 	}
 
-	u.reqs++
-	u.lastErr = ""
+	u.incrReqs()
+	u.setErr("")
 
 	if !isStream {
 		data, _ := io.ReadAll(resp.Body)
@@ -426,12 +455,16 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		return true
 	}
 
-	return s.forwardStream(w, u, resp, canInject)
+	ok, committed := s.forwardStream(w, u, resp, canInject)
+	// committed=true 表示响应头已提交，此时不能再 failover（会双写响应）。
+	return ok || committed
 }
 
 // forwardStream relays the SSE stream with keep-alive filtering, stall
 // detection, tool-call protection and inf-loop injection.
-func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Response, canInject bool) bool {
+// 返回 (ok, committed)：committed 表示响应头已提交给客户端。
+// 一旦 committed，调用方禁止再 failover 到其他源（否则会双写响应）。
+func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Response, canInject bool) (bool, bool) {
 	name := u.name
 	done := make(chan struct{})
 	defer close(done)
@@ -453,9 +486,9 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 					log.Printf("%s: pre-read error: %v", name, m.err)
 				}
 				u.setCooldown(cooldownShort)
-				u.lastErr = "pre-read error"
+				u.setErr("pre-read error")
 				resp.Body.Close()
-				return false
+				return false, false
 			}
 			pre = append(pre, m.data...)
 			hasReal = hasRealSSE(pre)
@@ -465,9 +498,9 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 	if !hasReal {
 		log.Printf("%s: no real data in %.0fs, try next source", name, stallTimeout.Seconds())
 		u.setCooldown(cooldownShort)
-		u.lastErr = "first token stall"
+		u.setErr("first token stall")
 		resp.Body.Close()
-		return false
+		return false, false
 	}
 	log.Printf("%s: first token t=%.2fs", name, time.Since(t0).Seconds())
 
@@ -483,9 +516,9 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 			if eventHasError(ev) {
 				log.Printf("%s: SSE error event, try next source", name)
 				u.setCooldown(cooldownShort)
-				u.lastErr = "SSE error"
+				u.setErr("SSE error")
 				resp.Body.Close()
-				return false
+				return false, false
 			}
 		}
 	}
@@ -573,9 +606,14 @@ loop:
 		case m, ok := <-ch:
 			if !ok || m.eof {
 				// EOF: inject if the stream ended without any tool call.
+				// 上游断流时没有自己的 [DONE] 可兜底，必须补发终止哨兵，
+				// 否则客户端会认为流被截断。
 				if canInject && !sawTool && !injected {
 					log.Printf("%s: stream ended without tool_call, injecting at EOF", name)
 					if err := write(infInject()); err != nil {
+						break loop
+					}
+					if err := write([]byte("data: [DONE]\n\n")); err != nil {
 						break loop
 					}
 					injected = true
@@ -585,7 +623,7 @@ loop:
 			if m.err != nil {
 				log.Printf("%s: unexpected %v", name, m.err)
 				u.setCooldown(cooldownShort)
-				u.lastErr = "stream error"
+				u.setErr("stream error")
 				break loop
 			}
 			buf = append(buf, m.data...)
@@ -599,11 +637,19 @@ loop:
 					injected = true
 					log.Printf("SUCCESS (idle-timeout inject)")
 					resp.Body.Close()
-					return true
+					return true, true
+				}
+				if sawTool {
+					// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
+					write(lengthChunk())
+				} else if injected {
+					// 已注入 tool_call（finish_reason=tool_calls），上游 [DONE] 未到就 stall，
+					// 只补 [DONE]，避免客户端认为流被截断
+					write([]byte("data: [DONE]\n\n"))
 				}
 				log.Printf("FAIL")
 				resp.Body.Close()
-				return false
+				return false, true
 			}
 			timer.Reset(stall - time.Since(lastReal))
 		}
@@ -612,7 +658,7 @@ loop:
 	resp.Body.Close()
 	log.Printf("%s: done (source=%s) fwd=%dB", name, name, total)
 	log.Printf("SUCCESS")
-	return true
+	return true, true
 }
 
 // order returns the source list, shuffled with `forced` first.
@@ -666,6 +712,10 @@ func (s *server) handlerMulti() http.Handler {
 		s.handleProxy(w, r)
 	})
 	mux.HandleFunc("/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			writeJSON(w, 204, map[string]any{})
+			return
+		}
 		s.handleProxy(w, r)
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
@@ -681,11 +731,13 @@ func (s *server) handlerMulti() http.Handler {
 		for _, u := range upList {
 			u.mu.Lock()
 			cd := u.cooldownUntil.Sub(now).Seconds()
+			reqs := u.reqs
+			lastErr := u.lastErr
 			u.mu.Unlock()
 			if cd < 0 {
 				cd = 0
 			}
-			srcs[u.name] = map[string]any{"cooldown_sec": int(cd), "reqs": u.reqs, "last_err": u.lastErr}
+			srcs[u.name] = map[string]any{"cooldown_sec": int(cd), "reqs": reqs, "last_err": lastErr}
 		}
 		writeJSON(w, 200, map[string]any{"status": "ok", "sources": srcs})
 	})

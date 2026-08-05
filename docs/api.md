@@ -98,3 +98,7 @@ curl -X DELETE http://localhost:8080/kv/example
 ---
 
 > **注意**：所有接口均返回 JSON，错误信息统一为 `{ "error": "message" }` 的结构，便于前端统一错误处理。
+
+---
+
+> 与 KV API 无关的研究笔记（FreeGPT 中转站调查）已移至 `docs/research/freegpt.md`。

@@ -9,3 +9,11 @@
 /peer-client
 /api-server
 /message-signal
+/local-proxy
+/zen-multi
+/webrtc-demo
+# leftover foreign js chunks at repo root (origin unknown, untracked)
+/[0-9a-f]*.js
+/layout.js
+/main-app.js
+/page.js

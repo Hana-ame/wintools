@@ -80,37 +80,36 @@ WebRTC 使用 DTLS 对数据通道进行加密，确保通信安全。所有数�
 4. **连接检查** — ICE 协议进行连通性检查，选择最佳路径
 5. **媒体/数据流** — 连接建立后，开始传输音视频或数据
 
-## API 设计
+## 本项目中的实现
 
-本项目的 `webrtc` 包提供了以下核心接口：
+本项目的 WebRTC 演示位于 `examples/webrtc-demo`，基于 [pion/webrtc](https://github.com/pion/webrtc)，
+信令通过本项目自己的 KV 存储 API（`cmd/api-server` + `pkg/kv`）完成，无需额外信令服务。
 
 ```go
-// 创建 Peer
-peer, err := webrtc.NewPeer(webrtc.Config{
-    ICEServers:       []string{"stun:stun.l.google.com:19302"},
-    DataChannelLabel: "chat",
+// 创建 PeerConnection + DataChannel
+pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+    ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 })
+dc, err := pc.CreateDataChannel("chat", &webrtc.DataChannelInit{Ordered: &ordered})
 
 // 发起方 — 创建 Offer
-offerSDP, err := peer.CreateOffer()
+offer, err := pc.CreateOffer(nil)
+pc.SetLocalDescription(offer)
+
+// 通过 KV API 交换 SDP（POST 到 /kv/room/:id/offer，GET ?wait=30 阻塞等待）
+postJSON(offerPath, sigMessage{Type: "offer", SDP: local})
 
 // 接收方 — 设置远程 Offer，创建 Answer
-peer.SetRemoteDescription(offerSDP)
-answerSDP, err := peer.CreateAnswer()
-
-// 交换 ICE 候选
-peer.OnICECandidate(func(candidate string) {
-    // 发送给远端
-})
-peer.AddICECandidate(candidate) // 从远端接收
+pc.SetRemoteDescription(...)
+answer, err := pc.CreateAnswer(nil)
+pc.SetLocalDescription(answer)
 
 // 数据收发
-peer.OnData(func(data []byte) { ... })
-peer.Send([]byte("hello"))
-
-// 状态监听
-peer.OnState(func(state webrtc.ConnectionState) { ... })
+dc.OnMessage(func(msg webrtc.DataChannelMessage) { ... })
+dc.Send([]byte("ping from p1"))
 ```
+
+运行：`p1` 创建房间并等待 `p2` 加入（`examples/webrtc-demo/main.go`，`-mode p1|p2`）。
 
 ## 使用场景
 

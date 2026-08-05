@@ -5,7 +5,6 @@ go 1.26.4
 require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
-	github.com/gorilla/websocket v1.5.3
 	github.com/pion/webrtc/v4 v4.2.15
 	golang.org/x/net v0.56.0
 )

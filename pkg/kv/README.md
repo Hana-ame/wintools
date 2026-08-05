@@ -43,14 +43,14 @@ store.Delete("user:1")
 func NewStore(ttl, tick time.Duration) *Store
 ```
 
-创建一个新的 Store 并启动后台过期清理 goroutine。
+创建一个新的 Store。仅当 `ttl > 0` 时才启动后台过期清理 goroutine。
 
 | 参数 | 说明 |
 |------|------|
-| `ttl` | 条目过期时间。`0` 表示永不过期。 |
+| `ttl` | 条目过期时间。`0` 表示永不过期（不启动清理 goroutine）。 |
 | `tick` | 过期清理循环的执行间隔。 |
 
-不再使用时必须调用 `Stop()` 停止后台 goroutine。
+当 `ttl > 0` 时，不再使用必须调用 `Stop()` 停止后台 goroutine；`ttl == 0` 时 `Stop()` 为安全的空操作。
 
 ---
 

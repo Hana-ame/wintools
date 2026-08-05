@@ -112,7 +112,8 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 	req.Header.Set("Accept", "application/dns-json")
 
 	tr := &http.Transport{}
-	dialIP := dohDialIP
+	cfg := currentConfig()
+	dialIP := cfg.dialIP
 	if dialIP != "" {
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, err := net.SplitHostPort(addr)
@@ -126,7 +127,7 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 		if uParsed != nil {
 			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
 		}
-	} else if ipMode != "" {
+	} else if cfg.ipMode != "" {
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -144,6 +145,7 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		return cached, nil
 	}
 
+	dohURL := currentConfig().dohURL
 	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))
 	resp, err := doDohRequest(ctx, u)
 	if err != nil {
@@ -203,25 +205,43 @@ const (
 	dialTimeout = 10 * time.Second
 )
 
-// DoH bootstrap config.
-var (
-	dohURL          = "https://moonchan.xyz/doh"
-	dohBootstrapIP  = ""
-	dohDialIP       = ""
-	ipMode          string // "v4", "v6", or "" (auto)
-)
+// config 保存 DoH 端点与 IP 偏好等可变全局配置。
+// 通过 atomic.Pointer 无锁安全读写，避免 SetXxx 与请求 goroutine 之间的 data race。
+type config struct {
+	dohURL string
+	// dialIP 非空时 DoH 直接使用该 IP 拨号（绕过本地 DNS）。
+	dialIP string
+	// ipMode 为 "v4"、"v6" 或 ""（自动）。
+	ipMode string
+}
+
+const defaultDohURL = "https://moonchan.xyz/doh"
+
+var cfgPtr atomic.Pointer[config]
+
+func currentConfig() *config {
+	if c := cfgPtr.Load(); c != nil {
+		return c
+	}
+	c := &config{dohURL: defaultDohURL}
+	cfgPtr.Store(c)
+	return c
+}
 
 // SetIPMode 设置 IP 协议偏好。mode 为 "v4"、"v6" 或 ""（自动）。
 func SetIPMode(mode string) {
+	nc := *currentConfig()
 	switch mode {
 	case "v4", "v6":
-		ipMode = mode
+		nc.ipMode = mode
 	default:
-		ipMode = ""
+		nc.ipMode = ""
 	}
+	cfgPtr.Store(&nc)
 }
 
 func resolvePreferredIP(ctx context.Context, host string) (string, error) {
+	ipMode := currentConfig().ipMode
 	if ipMode == "" {
 		return "", nil
 	}
@@ -242,7 +262,7 @@ func resolvePreferredIP(ctx context.Context, host string) (string, error) {
 
 func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout}
-	if ipMode == "" {
+	if currentConfig().ipMode == "" {
 		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	}
 	ip, err := resolvePreferredIP(ctx, host)
@@ -270,16 +290,18 @@ func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
 
 // SetDohURL overrides the DoH URL entirely.
 func SetDohURL(url string) {
-	dohURL = url
-	dohBootstrapIP = ""
-	dohDialIP = ""
+	nc := *currentConfig()
+	nc.dohURL = url
+	nc.dialIP = ""
+	cfgPtr.Store(&nc)
 }
 
 // SetDoHConfig sets DoH via host + bootstrap IP for direct-IP dialing.
 func SetDoHConfig(host, bootstrapIP string) {
-	dohURL = fmt.Sprintf("https://%s/doh", host)
-	dohBootstrapIP = bootstrapIP
-	dohDialIP = bootstrapIP
+	nc := *currentConfig()
+	nc.dohURL = fmt.Sprintf("https://%s/doh", host)
+	nc.dialIP = bootstrapIP
+	cfgPtr.Store(&nc)
 }
 
 // New 初始化一个 ECH 域前置 HTTP 客户端。

@@ -1,1 +1,3 @@
-~/script/ssh/bwh.sh @*
+#!/usr/bin/env bash
+
+~/script/ssh/bwh.sh "$@"

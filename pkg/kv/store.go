@@ -44,6 +44,21 @@ func deepMerge(dst, src map[string]any) map[string]any {
 	return dst
 }
 
+// cloneMap 深拷贝一个 map。
+// 保证已通过 Get/Peek 返回给调用方的 map 引用不会再被 Store 原地修改，
+// 从而避免调用方并发读取时的 data race。
+func cloneMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		if m, ok := v.(map[string]any); ok {
+			dst[k] = cloneMap(m)
+		} else {
+			dst[k] = v
+		}
+	}
+	return dst
+}
+
 // Store 是内存键值存储的核心结构。
 // 零值不可用，须通过 NewStore 创建。
 type Store struct {
@@ -66,7 +81,10 @@ func NewStore(ttl, tick time.Duration) *Store {
 		ttl:  ttl,
 		done: make(chan struct{}),
 	}
-	go s.evictLoop(tick)
+	// ttl==0 表示永不过期，无需启动清理 goroutine。
+	if ttl > 0 {
+		go s.evictLoop(tick)
+	}
 	return s
 }
 
@@ -107,7 +125,7 @@ func (s *Store) Set(key string, val map[string]any) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	e.data = val
+	e.data = cloneMap(val)
 	e.lastTouch = time.Now()
 
 	// 唤醒等待者：关闭旧 channel，新建一个替换
@@ -126,11 +144,13 @@ func (s *Store) ShallowMerge(key string, val map[string]any) {
 	e.lastTouch = time.Now()
 
 	if e.data == nil {
-		e.data = val
+		e.data = cloneMap(val)
 	} else {
+		merged := cloneMap(e.data)
 		for k, v := range val {
-			e.data[k] = v
+			merged[k] = v
 		}
+		e.data = merged
 	}
 
 	close(e.broadCh)
@@ -148,9 +168,11 @@ func (s *Store) DeepMerge(key string, val map[string]any) {
 	e.lastTouch = time.Now()
 
 	if e.data == nil {
-		e.data = val
+		e.data = cloneMap(val)
 	} else {
-		deepMerge(e.data, val)
+		merged := cloneMap(e.data)
+		deepMerge(merged, val)
+		e.data = merged
 	}
 
 	close(e.broadCh)
@@ -244,6 +266,9 @@ func (s *Store) evictLoop(tick time.Duration) {
 		case <-s.done:
 			return
 		case now := <-ticker.C:
+			if s.ttl <= 0 {
+				continue
+			}
 			var expiredKeys []string
 
 			// 第一阶段：读锁扫描，收集可能过期的 key

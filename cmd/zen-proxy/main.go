@@ -34,6 +34,9 @@ const (
 	banWindow        = 600 * time.Second
 	idleConnTimeout  = 90 * time.Second
 	maxIdleConns     = 64
+
+	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
+	maxRequestBody = 10 << 20
 )
 
 // chunkMsg is one unit produced by the upstream reader goroutine.
@@ -55,7 +58,86 @@ type server struct {
 	cooldownV4 time.Time
 	cooldownV6 time.Time
 
+	statsMu sync.Mutex
+	stats   map[string]*famStats // 按协议栈（v4/v6）的用量统计
+	started time.Time
+
 	ban *banList
+}
+
+// famStats 记录单个协议栈（v4/v6）的用量统计，进程存活期间累计。
+type famStats struct {
+	mu        sync.Mutex
+	Reqs      int64 // 尝试连接上游的次数
+	OK        int64 // 上游返回 200 的次数
+	Streams   int64 // 已提交的流式响应次数
+	Bytes     int64 // 转发给客户端的 SSE 字节数
+	ToolCalls int64 // 转发的 tool_call delta 次数
+	Stalls    int64 // stall 超时中断次数
+	Errs      int64 // 传输错误 / 非 200 / 预读失败次数
+	FreeLimit int64 // FreeUsageLimitError 命中次数
+}
+
+func (a *famStats) add(reqs, ok, streams, bytes, tools, stalls, errs, freeLimit int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Reqs += reqs
+	a.OK += ok
+	a.Streams += streams
+	a.Bytes += bytes
+	a.ToolCalls += tools
+	a.Stalls += stalls
+	a.Errs += errs
+	a.FreeLimit += freeLimit
+}
+
+func (a *famStats) snapshot() map[string]int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return map[string]int64{
+		"reqs":       a.Reqs,
+		"ok":         a.OK,
+		"streams":    a.Streams,
+		"bytes":      a.Bytes,
+		"tool_calls": a.ToolCalls,
+		"stalls":     a.Stalls,
+		"errs":       a.Errs,
+		"free_limit": a.FreeLimit,
+	}
+}
+
+func (s *server) statsFor(fam string) *famStats {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	if st, ok := s.stats[fam]; ok {
+		return st
+	}
+	st := &famStats{}
+	s.stats[fam] = st
+	return st
+}
+
+// statsSnapshot 汇总 v4/v6 及 total，供 /status 输出。
+func (s *server) statsSnapshot() map[string]any {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	per := make(map[string]any, len(s.stats))
+	var tot map[string]int64
+	for fam, st := range s.stats {
+		snap := st.snapshot()
+		per[fam] = snap
+		if tot == nil {
+			tot = make(map[string]int64, len(snap))
+		}
+		for k, v := range snap {
+			tot[k] += v
+		}
+	}
+	return map[string]any{
+		"since": s.started.UTC().Format(time.RFC3339),
+		"total": tot,
+		"per":   per,
+	}
 }
 
 func (s *server) cooldownFam(fam string) time.Time {
@@ -178,11 +260,29 @@ func startReader(body io.Reader, done <-chan struct{}) chan chunkMsg {
 // forwardStream relays an SSE stream from upstream to the client with
 // keep-alive filtering, stall detection and tool-call protection.
 // Returns true on success.
-func (s *server) forwardStream(w http.ResponseWriter, resp *http.Response, fam string) bool {
+func (s *server) forwardStream(w http.ResponseWriter, resp *http.Response, fam, model string, st *famStats) bool {
 	done := make(chan struct{})
 	defer close(done)
 	ch := startReader(resp.Body, done)
 	t0 := time.Now()
+
+	total := 0
+	fwTools := int64(0)
+	stalled := false
+	served := false
+	defer func() {
+		if served {
+			var addStalls int64
+			if stalled {
+				addStalls = 1
+			}
+			// 已提交的流式响应：记 ok/streams/bytes/tools/stalls
+			st.add(0, 1, 1, int64(total), fwTools, addStalls, 0, 0)
+		} else {
+			// 上游 200 但预读失败（无真实数据 / 立即 EOF）：视为上游异常
+			st.add(0, 0, 0, 0, 0, 0, 1, 0)
+		}
+	}()
 
 	// Pre-read: wait up to stallTimeout for real SSE data; else give up.
 	deadline := time.Now().Add(stallTimeout)
@@ -228,13 +328,14 @@ func (s *server) forwardStream(w http.ResponseWriter, resp *http.Response, fam s
 	if flusher != nil {
 		flusher.Flush()
 	}
+	served = true
 
 	buf := pre
 	sawTool := false
 	lastReal := time.Now()
 	timer := time.NewTimer(stallFor(false))
 	defer timer.Stop()
-	total := len(pre)
+	total = len(pre)
 	fail := false
 
 loop:
@@ -252,6 +353,7 @@ loop:
 			}
 			if eventHasToolCall(ev) {
 				sawTool = true
+				fwTools++
 			}
 			lastReal = time.Now()
 			total += len(ev) + 2
@@ -284,12 +386,16 @@ loop:
 		case <-timer.C:
 			if time.Since(lastReal) >= stall {
 				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
+				stalled = true
 				if !sawTool {
 					msg := "data: {\"error\": {\"message\": \"upstream stalled\", \"type\": \"UpstreamStall\"}}\n\ndata: [DONE]\n\n"
 					w.Write([]byte(msg))
-					if flusher != nil {
-						flusher.Flush()
-					}
+				} else {
+					// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
+					w.Write(lengthChunk(model))
+				}
+				if flusher != nil {
+					flusher.Flush()
 				}
 				resp.Body.Close()
 				break loop
@@ -303,6 +409,11 @@ loop:
 	}
 	resp.Body.Close()
 	return !fail
+}
+
+// lengthChunk 工具流 stall 截断时补发的终止事件：finish_reason=length + [DONE]。
+func lengthChunk(model string) []byte {
+	return []byte(fmt.Sprintf("data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", model))
 }
 
 // ---- request handling ------------------------------------------------------
@@ -320,14 +431,19 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 		s.ban.incr(clientIP)
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	if err != nil {
 		log.Printf("read body error: %v", err)
 		writeJSON(w, 400, map[string]any{"error": "Bad Request"})
 		return
 	}
+	if len(body) > maxRequestBody {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "Request body too large"})
+		return
+	}
 
 	isStream := false
+	model := "deepseek-v4-flash-free"
 	bodyStr := string(body)
 	var payload map[string]any
 	if len(body) > 0 {
@@ -336,9 +452,8 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			writeJSON(w, 400, map[string]any{"error": "Invalid JSON"})
 			return
 		}
-		model, _ := payload["model"].(string)
-		if model == "" {
-			model = "deepseek-v4-flash-free"
+		if m, _ := payload["model"].(string); m != "" {
+			model = m
 		}
 		if model == "deepseek-v4-flash" {
 			model = "deepseek-v4-flash-free"
@@ -361,7 +476,6 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			payload["model"], isStream, payload["max_tokens"], len(messagesOf(payload)), len(toolsOf(payload)))
 	}
 
-	limitErr := any(nil)
 	lastStatus := 0
 	var lastErrBody any
 
@@ -387,9 +501,12 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 		req.Header.Set("Authorization", "Bearer "+zenAPIKey)
 
 		t0 := time.Now()
+		st := s.statsFor(fam)
+		st.add(1, 0, 0, 0, 0, 0, 0, 0)
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("%s upstream error: %v", fam, err)
+			st.add(0, 0, 0, 0, 0, 0, 1, 0)
 			lastStatus = 502
 			lastErrBody = map[string]any{"error": map[string]any{"message": err.Error(), "type": "UpstreamError"}}
 			continue
@@ -404,9 +521,11 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			_ = json.Unmarshal(data, &obj)
 			if e, ok := obj["error"].(map[string]any); ok && e["type"] == freeLimitErr {
 				log.Printf("%s FreeUsageLimitError", fam)
+				st.add(0, 0, 0, 0, 0, 0, 1, 1)
 				s.setCooldown(fam, nextUTCMidnight())
 				continue
 			}
+			st.add(0, 0, 0, 0, 0, 0, 1, 0)
 			lastStatus = resp.StatusCode
 			if len(obj) > 0 {
 				lastErrBody = obj
@@ -420,6 +539,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 		if !isStream {
 			data, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			st.add(0, 1, 0, int64(len(data)), 0, 0, 0, 0)
 			h := w.Header()
 			h.Set("Content-Type", "application/json")
 			setCORS(h)
@@ -430,16 +550,12 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 		}
 
 		// Streaming.
-		if s.forwardStream(w, resp, fam) {
+		if s.forwardStream(w, resp, fam, model, st) {
 			return
 		}
 		resp.Body.Close()
 	}
 
-	if limitErr != nil {
-		writeJSON(w, 429, limitErr)
-		return
-	}
 	if s.inCooldown("v4", time.Now()) && s.inCooldown("v6", time.Now()) {
 		writeJSON(w, 429, map[string]any{"error": map[string]any{
 			"message": "All IPs have reached the daily free usage limit", "type": freeLimitErr}})
@@ -596,14 +712,19 @@ func (s *server) handler() http.Handler {
 		if v6 < 0 {
 			v6 = 0
 		}
+		banned := 0
+		if s.ban != nil {
+			banned = s.ban.count()
+		}
 		writeJSON(w, 200, map[string]any{
 			"path":              r.URL.Path,
 			"server":            s.serverID,
 			"status":            "ok",
 			"v4_cooldown_sec":   v4,
 			"v6_cooldown_sec":   v6,
-			"banned_ips":        s.ban.count(),
+			"banned_ips":        banned,
 			"active_goroutines": runtime.NumGoroutine(),
+			"stats":             s.statsSnapshot(),
 		})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -667,6 +788,8 @@ func main() {
 		serverID: serverID,
 		clientV4: makeClient("tcp4"),
 		clientV6: makeClient("tcp6"),
+		stats:    map[string]*famStats{},
+		started:  time.Now(),
 		ban:      newBanList(maxReqsPerClient, banWindow, banWindow),
 	}
 

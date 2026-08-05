@@ -27,14 +27,10 @@ type UpstreamConfig struct {
 type UpstreamMap map[string]UpstreamConfig
 
 // DownloadFile 从 URL 下载文件保存到本地路径。
+// 请求失败或状态非 200 时不会留下空文件。
 func DownloadFile(path, url string) error {
-	out, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	resp, err := http.Get(url)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}
@@ -44,13 +40,20 @@ func DownloadFile(path, url string) error {
 		return fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
 	_, err = io.Copy(out, resp.Body)
 	return err
 }
 
 // LoadConfig 从远程 URL 加载上游配置 JSON。
 func LoadConfig(rawURL string) (UpstreamMap, error) {
-	resp, err := http.Get(rawURL)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch upstream config: %w", err)
 	}
@@ -63,6 +66,40 @@ func LoadConfig(rawURL string) (UpstreamMap, error) {
 		return nil, fmt.Errorf("decode upstream config: %w", err)
 	}
 	return cfg, nil
+}
+
+// hopByHopHeaders 是需要按 RFC 2616 处理的逐跳头，转发时必须剔除。
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// copyHeaders 复制 src 的请求/响应头到 dst，剔除逐跳头。
+func copyHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		if isHopByHop(k) {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func isHopByHop(name string) bool {
+	for _, h := range hopByHopHeaders {
+		if http.CanonicalHeaderKey(name) == h {
+			return true
+		}
+	}
+	return false
 }
 
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并通过 ECH 转发。
@@ -103,15 +140,12 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 			return
 		}
 
-		for k, vs := range c.Request.Header {
-			for _, v := range vs {
-				outReq.Header.Add(k, v)
-			}
-		}
+		copyHeaders(outReq.Header, c.Request.Header)
 		if uc.Referer != "" {
 			outReq.Header.Set("Referer", uc.Referer)
 		}
 		outReq.Host = uc.Host
+		outReq.ContentLength = c.Request.ContentLength
 
 		log.Printf("[%s] -> ECH Do: %s %s (Host: %s)", clientIP, method, urlStr, outReq.Host)
 
@@ -125,12 +159,24 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 
 		log.Printf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
 
-		for k, vs := range resp.Header {
-			for _, v := range vs {
-				c.Header(k, v)
+		copyHeaders(c.Writer.Header(), resp.Header)
+		c.Status(resp.StatusCode)
+
+		// 流式转发（SSE 等）：边读边写并 flush，避免缓冲导致的首字节延迟。
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := c.Writer.Write(buf[:n]); werr != nil {
+					break
+				}
+				if f, ok := c.Writer.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+			if rerr != nil {
+				break
 			}
 		}
-		c.Status(resp.StatusCode)
-		io.Copy(c.Writer, resp.Body)
 	}
 }

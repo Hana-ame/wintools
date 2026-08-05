@@ -25,6 +25,9 @@ const (
 	connectTimeout   = 10 * time.Second
 	stallTimeout     = 30 * time.Second
 	toolStallTimeout = 180 * time.Second
+
+	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
+	maxRequestBody = 10 << 20
 )
 
 func nextUTCMidnight() time.Time {
@@ -195,13 +198,18 @@ func (p *proxy) setCooldownUntil(fam string, t time.Time) {
 
 func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 	log.Printf("-> %s %s", method, r.URL.Path)
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"error": "Bad Request"})
 		return
 	}
+	if len(body) > maxRequestBody {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "Request body too large"})
+		return
+	}
 
 	isStream := false
+	model := "deepseek-v4-flash-free"
 	var payload map[string]any
 	bodyStr := string(body)
 	if len(body) > 0 {
@@ -209,9 +217,8 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 			writeJSON(w, 400, map[string]any{"error": "Invalid JSON"})
 			return
 		}
-		model, _ := payload["model"].(string)
-		if model == "" {
-			model = "deepseek-v4-flash-free"
+		if m, _ := payload["model"].(string); m != "" {
+			model = m
 		}
 		payload["model"] = model
 		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 65536 {
@@ -224,7 +231,6 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 
 	lastStatus := 0
 	var lastErrBody any
-	limitErr := any(nil)
 
 	stacks := []string{"v6", "v4"}
 	switch p.mode {
@@ -298,16 +304,13 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 			return
 		}
 
-		if p.forwardStream(w, resp, fam) {
+		ok, committed := p.forwardStream(w, resp, fam, model)
+		if ok || committed {
 			return
 		}
 		resp.Body.Close()
 	}
 
-	if limitErr != nil {
-		writeJSON(w, 429, limitErr)
-		return
-	}
 	if p.inCooldown("v4", time.Now()) && p.inCooldown("v6", time.Now()) {
 		writeJSON(w, 429, map[string]any{"error": map[string]any{"message": "All IPs reached daily free usage limit", "type": freeLimitErr}})
 		return
@@ -320,8 +323,9 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 }
 
 // forwardStream relays the SSE stream with keep-alive filtering and stall
-// detection (30s; 180s during a tool call). Returns true on success.
-func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam string) bool {
+// detection (30s; 180s during a tool call). Returns (ok, committed) on success;
+// committed 表示响应头已提交，调用方此后不能再 failover（否则会双写响应）。
+func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, model string) (bool, bool) {
 	done := make(chan struct{})
 	defer close(done)
 	ch := startReader(resp.Body, done)
@@ -338,7 +342,7 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam st
 			timer.Stop()
 			if !ok || m.eof || m.err != nil {
 				resp.Body.Close()
-				return false
+				return false, false
 			}
 			pre = append(pre, m.data...)
 			hasReal = hasRealSSE(pre)
@@ -348,7 +352,7 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam st
 	if !hasReal {
 		log.Printf("%s no real data in %.0fs, try other stack", fam, stallTimeout.Seconds())
 		resp.Body.Close()
-		return false
+		return false, false
 	}
 	log.Printf("%s first real data +%.2fs", fam, time.Since(t0).Seconds())
 
@@ -388,7 +392,7 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam st
 			if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
 				log.Printf("client disconnected mid-stream")
 				resp.Body.Close()
-				return false
+				return false, true
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -402,12 +406,12 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam st
 			if !ok || m.eof {
 				resp.Body.Close()
 				log.Printf("%s stream done (%d bytes, %.2fs)", fam, total, time.Since(t0).Seconds())
-				return true
+				return true, true
 			}
 			if m.err != nil {
 				log.Printf("%s mid-stream error: %v", fam, m.err)
 				resp.Body.Close()
-				return false
+				return false, true
 			}
 			buf = append(buf, m.data...)
 		case <-timer.C:
@@ -415,16 +419,24 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam st
 				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
 				if !sawTool {
 					w.Write([]byte("data: {\"error\": {\"message\": \"upstream stalled\", \"type\": \"UpstreamStall\"}}\n\ndata: [DONE]\n\n"))
-					if flusher != nil {
-						flusher.Flush()
-					}
+				} else {
+					// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
+					w.Write(lengthChunk(model))
+				}
+				if flusher != nil {
+					flusher.Flush()
 				}
 				resp.Body.Close()
-				return false
+				return false, true
 			}
 			timer.Reset(stall - time.Since(lastReal))
 		}
 	}
+}
+
+// lengthChunk 工具流 stall 截断时补发的终止事件：finish_reason=length + [DONE]。
+func lengthChunk(model string) []byte {
+	return []byte(fmt.Sprintf("data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", model))
 }
 
 // ---- server wiring ---------------------------------------------------------

@@ -29,6 +29,9 @@ func Run(dohEndpoint string, port int) error {
 	defer conn.Close()
 	log.Printf("Listening on UDP :%d, forwarding to %s", addr.Port, dohEndpoint)
 
+	// DoH 客户端复用，避免每次查询新建连接与 Transport。
+	dohClient := &http.Client{Timeout: 10 * time.Second}
+
 	// 4. Graceful shutdown handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -42,8 +45,11 @@ func Run(dohEndpoint string, port int) error {
 		conn.Close()
 	}()
 
-	// 5. Main loop – handle each packet concurrently
-	buf := make([]byte, 512)
+	// 5. Main loop – handle each packet concurrently.
+	// 512 字节只够经典 DNS；多数查询带 EDNS0 会更大，使用 4096 缓冲。
+	// 超长报文直接丢弃，避免截断污染。
+	const maxPacket = 4096
+	buf := make([]byte, maxPacket)
 	for {
 		select {
 		case <-ctx.Done():
@@ -59,16 +65,20 @@ func Run(dohEndpoint string, port int) error {
 			log.Printf("Read error: %v", err)
 			continue
 		}
+		if n == maxPacket {
+			log.Printf("Dropping oversized DNS packet (%d bytes) from %v", n, clientAddr)
+			continue
+		}
 
 		query := make([]byte, n)
 		copy(query, buf[:n])
 
-		go handleQuery(conn, clientAddr, query, dohEndpoint)
+		go handleQuery(conn, clientAddr, query, dohClient, dohEndpoint)
 	}
 }
 
 // handleQuery processes one DNS query: forward via DoH and send back the answer.
-func handleQuery(conn *net.UDPConn, clientAddr *net.UDPAddr, query []byte, dohEndpoint string) {
+func handleQuery(conn *net.UDPConn, clientAddr *net.UDPAddr, query []byte, dohClient *http.Client, dohEndpoint string) {
 	// 1. Parse the incoming DNS message (optional – we could forward blindly,
 	//    but we need to keep the original ID and flags for the response)
 	var msg dnsmessage.Message
@@ -86,10 +96,7 @@ func handleQuery(conn *net.UDPConn, clientAddr *net.UDPAddr, query []byte, dohEn
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := client.Do(req)
+	resp, err := dohClient.Do(req)
 	if err != nil {
 		log.Printf("DoH request failed for %v: %v", clientAddr, err)
 		return
