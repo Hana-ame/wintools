@@ -10,7 +10,9 @@
 /api-server
 /message-signal
 /local-proxy
+/local-proxy-detected
 /zen-multi
+/zen-proxy
 /webrtc-demo
 # leftover foreign js chunks at repo root (origin unknown, untracked)
 /[0-9a-f]*.js

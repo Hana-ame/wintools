@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Hana-ame/wintools/pkg/proxyheaders"
 )
 
 const (
@@ -28,6 +30,7 @@ const (
 	freeLimitErr     = "FreeUsageLimitError"
 	connectTimeout   = 10 * time.Second
 	stallTimeout     = 30 * time.Second
+	tokenGapTimeout  = 10 * time.Second
 	toolStallTimeout = 180 * time.Second
 	cleanupInterval  = 5 * time.Minute
 	maxReqsPerClient = 200
@@ -208,11 +211,13 @@ func eventHasToolCall(ev []byte) bool {
 	return false
 }
 
+// stallFor 返回「两个真实 SSE 事件之间允许的最大间隔」：
+// 首 token 之后按 token 节奏收敛到 tokenGapTimeout；工具流保留更长思考窗口。
 func stallFor(sawTool bool) time.Duration {
 	if sawTool {
 		return toolStallTimeout
 	}
-	return stallTimeout
+	return tokenGapTimeout
 }
 
 // ---- upstream reader goroutine --------------------------------------------
@@ -318,6 +323,7 @@ func (s *server) forwardStream(w http.ResponseWriter, resp *http.Response, fam, 
 
 	flusher, _ := w.(http.Flusher)
 	h := w.Header()
+	proxyheaders.ForwardResponseHeaders(h, resp.Header)
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
@@ -478,6 +484,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 
 	lastStatus := 0
 	var lastErrBody any
+	var lastHeaders http.Header
 
 	for _, fam := range []string{"v6", "v4"} {
 		if s.inCooldown(fam, time.Now()) {
@@ -498,7 +505,12 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+zenAPIKey)
+		proxyheaders.ForwardRequestHeaders(req.Header, r.Header)
+		if a := r.Header.Get("Authorization"); a != "" {
+			req.Header.Set("Authorization", a)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+zenAPIKey)
+		}
 
 		t0 := time.Now()
 		st := s.statsFor(fam)
@@ -527,6 +539,8 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			}
 			st.add(0, 0, 0, 0, 0, 0, 1, 0)
 			lastStatus = resp.StatusCode
+			lastHeaders = http.Header{}
+			proxyheaders.ForwardResponseHeaders(lastHeaders, resp.Header)
 			if len(obj) > 0 {
 				lastErrBody = obj
 			} else {
@@ -541,6 +555,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			resp.Body.Close()
 			st.add(0, 1, 0, int64(len(data)), 0, 0, 0, 0)
 			h := w.Header()
+			proxyheaders.ForwardResponseHeaders(h, resp.Header)
 			h.Set("Content-Type", "application/json")
 			setCORS(h)
 			w.WriteHeader(200)
@@ -562,6 +577,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 		return
 	}
 	if lastErrBody != nil {
+		proxyheaders.MergeHeaders(w.Header(), lastHeaders)
 		writeJSON(w, lastStatus, lastErrBody)
 		return
 	}

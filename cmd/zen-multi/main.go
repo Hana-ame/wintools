@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Hana-ame/wintools/pkg/proxyheaders"
 )
 
 const (
@@ -30,6 +32,7 @@ const (
 	connectTimeout   = 10 * time.Second
 	headerTimeout    = 30 * time.Second
 	stallTimeout     = 30 * time.Second
+	tokenGapTimeout  = 10 * time.Second
 	toolStallTimeout = 180 * time.Second
 	cooldownShort    = 60 * time.Second
 	maxRetries       = 3
@@ -195,11 +198,13 @@ func eventHasError(ev []byte) bool {
 	return false
 }
 
+// stallFor 返回「两个真实 SSE 事件之间允许的最大间隔」：
+// 首 token 之后按 token 节奏收敛到 tokenGapTimeout；工具流保留更长思考窗口。
 func stallFor(sawTool bool) time.Duration {
 	if sawTool {
 		return toolStallTimeout
 	}
-	return stallTimeout
+	return tokenGapTimeout
 }
 
 type chunkMsg struct {
@@ -367,13 +372,14 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	lastErrBody := any(nil)
 	lastStatus := 0
 	limitErr := any(nil)
+	lastHeaders := http.Header{}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		for _, u := range order(forced) {
 			if u.inCooldown(time.Now()) {
 				continue
 			}
-			ok := s.tryUpstream(w, u, r.Method, bodyStr, len(body) > 0, isStream, canInject, &lastErrBody, &lastStatus, &limitErr)
+			ok := s.tryUpstream(w, u, r.Method, bodyStr, r.Header, len(body) > 0, isStream, canInject, &lastErrBody, &lastStatus, &limitErr, &lastHeaders)
 			if ok {
 				return
 			}
@@ -385,6 +391,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if lastErrBody != nil {
+		proxyheaders.MergeHeaders(w.Header(), lastHeaders)
 		writeJSON(w, lastStatus, lastErrBody)
 		return
 	}
@@ -392,7 +399,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 // tryUpstream forwards to one source. Returns true if fully handled.
-func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr string, hasBody, isStream, canInject bool, lastErrBody *any, lastStatus *int, limitErr *any) bool {
+func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr string, head http.Header, hasBody, isStream, canInject bool, lastErrBody *any, lastStatus *int, limitErr *any, lastHeaders *http.Header) bool {
 	path := "/chat/completions"
 	if !hasBody {
 		path = "/v1/models"
@@ -404,6 +411,10 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	proxyheaders.ForwardRequestHeaders(req.Header, head)
+	if a := head.Get("Authorization"); a != "" {
+		req.Header.Set("Authorization", a)
+	}
 
 	log.Printf("%s: connecting...", u.name)
 	resp, err := u.client.Do(req)
@@ -432,6 +443,8 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		log.Printf("%s: HTTP %d -> try next source", u.name, resp.StatusCode)
 		u.setErr(fmt.Sprintf("HTTP %d", resp.StatusCode))
 		*lastStatus = resp.StatusCode
+		*lastHeaders = http.Header{}
+		proxyheaders.ForwardResponseHeaders(*lastHeaders, resp.Header)
 		if len(obj) > 0 {
 			*lastErrBody = obj
 		} else {
@@ -447,6 +460,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		h := w.Header()
+		proxyheaders.ForwardResponseHeaders(h, resp.Header)
 		h.Set("Content-Type", "application/json")
 		h.Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(200)
@@ -525,6 +539,7 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 
 	flusher, _ := w.(http.Flusher)
 	h := w.Header()
+	proxyheaders.ForwardResponseHeaders(h, resp.Header)
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")

@@ -1,8 +1,12 @@
-// Local Proxy in Go — pure forwarder. Ollama-compatible (11434) endpoint that
-// simply relays to opencode.ai/zen/v1 (dual-stack v6/v4 failover), nothing else.
+// Local Proxy (detected) — Ollama-compatible (11434) endpoint relaying to
+// opencode.ai/zen/v1 with dual-stack v6/v4 failover AND active stream detection:
+// pre-read wait for first token, token-cadence stall detection (10s/token),
+// 180s tool-call thinking window, keep-alive filtering, UpstreamStall / length
+// terminators. The vanilla twin (cmd/local-proxy) relays with zero detection.
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -20,10 +24,13 @@ import (
 )
 
 const (
-	zenHost        = "opencode.ai"
-	zenPath        = "/zen/v1"
-	freeLimitErr   = "FreeUsageLimitError"
-	connectTimeout = 10 * time.Second
+	zenHost          = "opencode.ai"
+	zenPath          = "/zen/v1"
+	freeLimitErr     = "FreeUsageLimitError"
+	connectTimeout   = 10 * time.Second
+	stallTimeout     = 30 * time.Second
+	tokenGapTimeout  = 10 * time.Second
+	toolStallTimeout = 180 * time.Second
 
 	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
 	maxRequestBody = 10 << 20
@@ -35,6 +42,55 @@ func nextUTCMidnight() time.Time {
 }
 
 // ---- SSE helpers -----------------------------------------------------------
+
+func hasRealSSE(buf []byte) bool {
+	return bytes.Contains(buf, []byte("data:")) || bytes.Contains(buf, []byte("event:"))
+}
+
+func nextSSEEvent(buf []byte) ([]byte, []byte, bool) {
+	if i := bytes.Index(buf, []byte("\r\n\r\n")); i != -1 {
+		if j := bytes.Index(buf, []byte("\n\n")); j == -1 || i < j {
+			return buf[:i], buf[i+4:], true
+		}
+	}
+	if i := bytes.Index(buf, []byte("\n\n")); i != -1 {
+		return buf[:i], buf[i+2:], true
+	}
+	return nil, buf, false
+}
+
+func eventHasToolCall(ev []byte) bool {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		var obj struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []json.RawMessage `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(line[len("data: "):], &obj); err != nil {
+			continue
+		}
+		for _, ch := range obj.Choices {
+			if len(ch.Delta.ToolCalls) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stallFor 返回「两个真实 SSE 事件之间允许的最大间隔」：
+// 首 token 之后按 token 节奏收敛到 tokenGapTimeout；工具流保留更长思考窗口。
+func stallFor(sawTool bool) time.Duration {
+	if sawTool {
+		return toolStallTimeout
+	}
+	return tokenGapTimeout
+}
 
 type chunkMsg struct {
 	data []byte
@@ -262,7 +318,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 			return
 		}
 
-		ok, committed := p.forwardStream(w, resp, fam)
+		ok, committed := p.forwardStream(w, resp, fam, model)
 		if ok || committed {
 			return
 		}
@@ -281,14 +337,40 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 	writeJSON(w, 503, map[string]any{"error": map[string]any{"message": "All upstream IPs exhausted or unavailable", "type": "UpstreamError"}})
 }
 
-// forwardStream 纯透传 SSE 流：不做任何 stall / 预读 / 首包检测，keep-alive
-// 与所有事件原样转发。返回 (ok, committed)；committed 表示响应头已提交，
-// 调用方此后不能再 failover（否则会双写响应）。
-func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam string) (bool, bool) {
+// forwardStream relays the SSE stream with keep-alive filtering and stall
+// detection (pre-read 30s 首 token；之后 10s/token；工具调用期间 180s)。
+// Returns (ok, committed) on success;
+// committed 表示响应头已提交，调用方此后不能再 failover（否则会双写响应）。
+func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, model string) (bool, bool) {
 	done := make(chan struct{})
 	defer close(done)
 	ch := startReader(resp.Body, done)
 	t0 := time.Now()
+
+	deadline := time.Now().Add(stallTimeout)
+	pre := []byte{}
+	hasReal := false
+	for !hasReal && time.Now().Before(deadline) {
+		remain := time.Until(deadline)
+		timer := time.NewTimer(remain)
+		select {
+		case m, ok := <-ch:
+			timer.Stop()
+			if !ok || m.eof || m.err != nil {
+				resp.Body.Close()
+				return false, false
+			}
+			pre = append(pre, m.data...)
+			hasReal = hasRealSSE(pre)
+		case <-timer.C:
+		}
+	}
+	if !hasReal {
+		log.Printf("%s no real data in %.0fs, try other stack", fam, stallTimeout.Seconds())
+		resp.Body.Close()
+		return false, false
+	}
+	log.Printf("%s first real data +%.2fs", fam, time.Since(t0).Seconds())
 
 	flusher, _ := w.(http.Flusher)
 	h := w.Header()
@@ -301,8 +383,41 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam st
 		flusher.Flush()
 	}
 
-	total := 0
+	buf := pre
+	sawTool := false
+	lastReal := time.Now()
+	timer := time.NewTimer(stallFor(false))
+	defer timer.Stop()
+	total := len(pre)
+
 	for {
+		for {
+			ev, rest, ok := nextSSEEvent(buf)
+			if !ok {
+				buf = rest
+				break
+			}
+			buf = rest
+			if !hasRealSSE(ev) {
+				continue
+			}
+			if eventHasToolCall(ev) {
+				sawTool = true
+			}
+			lastReal = time.Now()
+			total += len(ev) + 2
+			if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
+				log.Printf("client disconnected mid-stream")
+				resp.Body.Close()
+				return false, true
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			timer.Reset(stallFor(sawTool))
+		}
+
+		stall := stallFor(sawTool)
 		select {
 		case m, ok := <-ch:
 			if !ok || m.eof {
@@ -311,21 +426,34 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam st
 				return true, true
 			}
 			if m.err != nil {
-				log.Printf("%s upstream error: %v", fam, m.err)
-				resp.Body.Close()
-				return true, true
-			}
-			total += len(m.data)
-			if _, err := w.Write(m.data); err != nil {
-				log.Printf("client disconnected mid-stream")
+				log.Printf("%s mid-stream error: %v", fam, m.err)
 				resp.Body.Close()
 				return false, true
 			}
-			if flusher != nil {
-				flusher.Flush()
+			buf = append(buf, m.data...)
+		case <-timer.C:
+			if time.Since(lastReal) >= stall {
+				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
+				if !sawTool {
+					w.Write([]byte("data: {\"error\": {\"message\": \"upstream stalled\", \"type\": \"UpstreamStall\"}}\n\ndata: [DONE]\n\n"))
+				} else {
+					// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
+					w.Write(lengthChunk(model))
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				resp.Body.Close()
+				return false, true
 			}
+			timer.Reset(stall - time.Since(lastReal))
 		}
 	}
+}
+
+// lengthChunk 工具流 stall 截断时补发的终止事件：finish_reason=length + [DONE]。
+func lengthChunk(model string) []byte {
+	return []byte(fmt.Sprintf("data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", model))
 }
 
 // ---- server wiring ---------------------------------------------------------
