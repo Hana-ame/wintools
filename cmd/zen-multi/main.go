@@ -461,7 +461,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		isStream, _ = payload["stream"].(bool)
 		re, _ := json.Marshal(payload)
 		bodyStr = string(re)
-		log.Printf("req=%d model=%v src=%v stream=%v tools=%d can_inject=%v", reqID, payload["model"], forced, isStream, len(toolsOf(payload)), canInject)
+		log.Printf("req=%d model=%v src=%v stream=%v tools=%d can_inject=%v recoverable=%v", reqID, payload["model"], forced, isStream, len(toolsOf(payload)), canInject, recoverable)
 	}
 
 	lastErrBody := any(nil)
