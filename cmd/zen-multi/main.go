@@ -440,6 +440,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	bodyStr := string(body)
 	var forced string
 	canInject := false
+	recoverable := false
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &payload); err != nil {
 			writeJSON(w, 400, map[string]any{"error": "Invalid JSON"})
@@ -447,7 +448,11 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		model, _ := payload["model"].(string)
 		isInf := model == infModel
-		canInject = isInf && len(toolsOf(payload)) > 0
+		toolsN := len(toolsOf(payload))
+		// canInject: inf 模型完整续命（EOF 时注入 infInject 继续循环）。
+		// recoverable: 只要带 tools，流中断时就注入 idleInject（echo 继续）让客户端恢复工具循环。
+		canInject = isInf && toolsN > 0
+		recoverable = toolsN > 0
 		forced, model = resolveModel(model)
 		payload["model"] = model
 		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 131072 {
@@ -471,7 +476,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				skipped = append(skipped, u.name)
 				continue
 			}
-			ok := s.tryUpstream(w, u, r.Method, bodyStr, r.Header, len(body) > 0, isStream, canInject, &lastErrBody, &lastStatus, &limitErr, &lastHeaders, reqID)
+			ok := s.tryUpstream(w, u, r.Method, bodyStr, r.Header, len(body) > 0, isStream, canInject, recoverable, &lastErrBody, &lastStatus, &limitErr, &lastHeaders, reqID)
 			if ok {
 				return
 			}
@@ -497,7 +502,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 // tryUpstream forwards to one source. Returns true if fully handled.
-func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr string, head http.Header, hasBody, isStream, canInject bool, lastErrBody *any, lastStatus *int, limitErr *any, lastHeaders *http.Header, reqID uint64) bool {
+func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr string, head http.Header, hasBody, isStream, canInject, recoverable bool, lastErrBody *any, lastStatus *int, limitErr *any, lastHeaders *http.Header, reqID uint64) bool {
 	path := "/chat/completions"
 	if !hasBody {
 		path = "/v1/models"
@@ -570,7 +575,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		return true
 	}
 
-	ok, committed := s.forwardStream(w, u, resp, canInject, reqID)
+	ok, committed := s.forwardStream(w, u, resp, canInject, recoverable, reqID)
 	// committed=true 表示响应头已提交，此时不能再 failover（会双写响应）。
 	return ok || committed
 }
@@ -579,7 +584,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 // detection, tool-call protection and inf-loop injection.
 // 返回 (ok, committed)：committed 表示响应头已提交给客户端。
 // 一旦 committed，调用方禁止再 failover 到其他源（否则会双写响应）。
-func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Response, canInject bool, reqID uint64) (bool, bool) {
+func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Response, canInject, recoverable bool, reqID uint64) (bool, bool) {
 	name := u.name
 	done := make(chan struct{})
 	defer close(done)
@@ -685,7 +690,19 @@ loop:
 				sawTool = true
 			}
 			if eventHasError(ev) {
-				log.Printf("req=%d %s: mid-stream error event dropped", reqID, name)
+				// 上游 error 事件（如 zen-proxy 的 UpstreamStall/UpstreamError）：
+				// 不转发给客户端（否则客户端看到空流完成），而是注入「echo 继续」
+				// 让工具循环恢复；无 tools 的请求则丢弃并等 EOF 兜底 [DONE]。
+				if recoverable && !sawTool && !injected {
+					log.Printf("req=%d %s: mid-stream error event -> inject idle (saw_tool=%v)", reqID, name, sawTool)
+					if err := write(idleInject()); err != nil {
+						log.Printf("req=%d client disconnected", reqID)
+					}
+					injected = true
+					doneSent = true
+					break loop
+				}
+				log.Printf("req=%d %s: mid-stream error event dropped (recoverable=%v)", reqID, name, recoverable)
 				continue
 			}
 			if fr := eventFinishReason(ev); fr != nil && *fr == "tool_calls" {
@@ -800,7 +817,7 @@ loop:
 			stall := stallFor(sawTool)
 			if time.Since(lastReal) >= stall {
 				log.Printf("req=%d %s: idle %s (no real data, saw_tool=%v tool_closed=%v injected=%v)", reqID, name, stall.Round(time.Second), sawTool, toolClosed, injected)
-				if canInject && !sawTool && !injected {
+				if (canInject || recoverable) && !sawTool && !injected {
 					write(idleInject())
 					injected = true
 					log.Printf("req=%d SUCCESS (idle-timeout inject)", reqID)
