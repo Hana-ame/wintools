@@ -29,7 +29,7 @@ const (
 	zenAPIKey        = "public"
 	freeLimitErr     = "FreeUsageLimitError"
 	connectTimeout   = 10 * time.Second
-	stallTimeout     = 30 * time.Second
+	stallTimeout     = 10 * time.Second
 	tokenGapTimeout  = 10 * time.Second
 	toolStallTimeout = 180 * time.Second
 	cleanupInterval  = 5 * time.Minute
@@ -37,6 +37,13 @@ const (
 	banWindow        = 600 * time.Second
 	idleConnTimeout  = 90 * time.Second
 	maxIdleConns     = 64
+
+	// FreeUsageLimitError 连续失败阈值与冷却策略：
+	// 第 1 次短冷却 1 分钟，第 2 次 5 分钟，达到阈值（3 次）后才锁到午夜。
+	// opencode.ai 的该错误可能是瞬时限流，不能一上来就锁死一整天。
+	limFailThreshold = 3
+	limFailCooldown1 = 1 * time.Minute
+	limFailCooldown2 = 5 * time.Minute
 
 	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
 	maxRequestBody = 10 << 20
@@ -60,6 +67,8 @@ type server struct {
 	mu         sync.Mutex
 	cooldownV4 time.Time
 	cooldownV6 time.Time
+	limFailsV4 int // 连续 FreeUsageLimitError 次数，成功时清零
+	limFailsV6 int
 
 	statsMu sync.Mutex
 	stats   map[string]*famStats // 按协议栈（v4/v6）的用量统计
@@ -166,6 +175,45 @@ func (s *server) inCooldown(fam string, now time.Time) bool {
 	return s.cooldownFam(fam).After(now)
 }
 
+// onLimitErr 记录一次 FreeUsageLimitError，返回按连续失败次数升级的冷却时长：
+// 第 1 次 limFailCooldown1，第 2 次 limFailCooldown2，达到 limFailThreshold
+// 后才锁到午夜（此时可视为真·配额耗尽）。
+func (s *server) onLimitErr(fam string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fam == "v6" {
+		s.limFailsV6++
+		switch s.limFailsV6 {
+		case 1:
+			return limFailCooldown1
+		case 2:
+			return limFailCooldown2
+		default:
+			return time.Until(nextUTCMidnight())
+		}
+	}
+	s.limFailsV4++
+	switch s.limFailsV4 {
+	case 1:
+		return limFailCooldown1
+	case 2:
+		return limFailCooldown2
+	default:
+		return time.Until(nextUTCMidnight())
+	}
+}
+
+// clearLimFails 在源成功响应后清零连续失败计数。
+func (s *server) clearLimFails(fam string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fam == "v6" {
+		s.limFailsV6 = 0
+	} else {
+		s.limFailsV4 = 0
+	}
+}
+
 // ---- SSE helpers -----------------------------------------------------------
 
 func hasRealSSE(buf []byte) bool {
@@ -204,6 +252,73 @@ func eventHasToolCall(ev []byte) bool {
 		}
 		for _, ch := range obj.Choices {
 			if len(ch.Delta.ToolCalls) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// eventFinishReason returns the first non-nil finish_reason in the event.
+func eventFinishReason(ev []byte) *string {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		var obj struct {
+			Choices []struct {
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(line[len("data: "):], &obj); err != nil {
+			continue
+		}
+		for _, ch := range obj.Choices {
+			if ch.FinishReason != nil {
+				return ch.FinishReason
+			}
+		}
+	}
+	return nil
+}
+
+// eventHasContent reports whether the event actually advances the stream:
+// a non-empty content delta, a tool_call delta, a non-null finish_reason,
+// or the [DONE] sentinel. Empty deltas / heartbeat events do not count,
+// so a stream that only emits heartbeats still trips the stall detector.
+func eventHasContent(ev []byte) bool {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := line[len("data: "):]
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			return true
+		}
+		var obj struct {
+			Choices []struct {
+				Delta struct {
+					Content   *string           `json:"content"`
+					ToolCalls []json.RawMessage `json:"tool_calls"`
+					Reasoning *string           `json:"reasoning_content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(payload, &obj); err != nil {
+			continue
+		}
+		for _, ch := range obj.Choices {
+			if ch.Delta.Content != nil && *ch.Delta.Content != "" {
+				return true
+			}
+			if len(ch.Delta.ToolCalls) > 0 {
+				return true
+			}
+			if ch.Delta.Reasoning != nil && *ch.Delta.Reasoning != "" {
+				return true
+			}
+			if ch.FinishReason != nil {
 				return true
 			}
 		}
@@ -338,6 +453,8 @@ func (s *server) forwardStream(w http.ResponseWriter, resp *http.Response, fam, 
 
 	buf := pre
 	sawTool := false
+	toolDone := false
+	doneSent := false
 	lastReal := time.Now()
 	timer := time.NewTimer(stallFor(false))
 	defer timer.Stop()
@@ -361,7 +478,20 @@ loop:
 				sawTool = true
 				fwTools++
 			}
-			lastReal = time.Now()
+			if fr := eventFinishReason(ev); fr != nil && *fr == "tool_calls" {
+				toolDone = true // 工具调用自然收尾
+			}
+			if bytes.Contains(ev, []byte("data: [DONE]")) {
+				toolDone = true
+				doneSent = true // 已转发终止哨兵，后续 EOF 不再补
+			}
+			if eventHasContent(ev) {
+				// 只有内容推进事件才刷新 stall 时钟：
+				// 空 delta/心跳事件照常转发，但不算推进，否则上游持续心跳
+				// 会把 stall 检测喂饱，导致「卡住但既不注入也不断开」。
+				lastReal = time.Now()
+				timer.Reset(stallFor(sawTool))
+			}
 			total += len(ev) + 2
 			if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
 				log.Printf("client disconnected mid-stream (%d bytes, %s)", total, time.Since(t0).Round(time.Millisecond))
@@ -371,7 +501,6 @@ loop:
 			if flusher != nil {
 				flusher.Flush()
 			}
-			timer.Reset(stallFor(sawTool))
 		}
 
 		if len(buf) > 0 {
@@ -382,10 +511,42 @@ loop:
 		select {
 		case m, ok := <-ch:
 			if !ok || m.eof {
+				// EOF：若此前从未发过 [DONE]，补发终止哨兵收尾，
+				// 这样当上游正常结束时（即使没有 [DONE]）客户端也能区分完成/截断。
+				if !doneSent {
+					if sawTool && !toolDone {
+						// 工具调用被截断：补 finish_reason=length + [DONE]
+						w.Write(lengthChunk(model))
+					} else {
+						w.Write([]byte("data: [DONE]\n\n"))
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+					doneSent = true
+				}
 				break loop
 			}
 			if m.err != nil {
 				log.Printf("%s mid-stream error: %v", fam, m.err)
+				// 上游硬断流：与 stall 同等对待，补发终止哨兵再断开，
+				// 否则客户端收到截断流（无 [DONE]），无法区分「完成」与「截断」。
+				if !doneSent {
+					if !sawTool {
+						msgB, _ := json.Marshal(m.err.Error())
+						msg := fmt.Sprintf("data: {\"error\": {\"message\": %s, \"type\": \"UpstreamError\"}}\n\ndata: [DONE]\n\n", msgB)
+						w.Write([]byte(msg))
+					} else if !toolDone {
+						// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
+						w.Write(lengthChunk(model))
+					} else {
+						w.Write([]byte("data: [DONE]\n\n"))
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+					doneSent = true
+				}
 				break loop
 			}
 			buf = append(buf, m.data...)
@@ -466,8 +627,8 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			log.Printf("model deepseek-v4-flash -> deepseek-v4-flash-free")
 		}
 		payload["model"] = model
-		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 65536 {
-			payload["max_tokens"] = 65536
+		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 131072 {
+			payload["max_tokens"] = 131072
 		}
 		if tp, ok := payload["top_p"].(float64); !ok || tp <= 0 || tp > 1.0 {
 			payload["top_p"] = 1.0
@@ -532,9 +693,10 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 			var obj map[string]any
 			_ = json.Unmarshal(data, &obj)
 			if e, ok := obj["error"].(map[string]any); ok && e["type"] == freeLimitErr {
-				log.Printf("%s FreeUsageLimitError", fam)
+				d := s.onLimitErr(fam)
+				log.Printf("%s FreeUsageLimitError (lim_fails, cooldown=%s)", fam, d.Round(time.Second))
 				st.add(0, 0, 0, 0, 0, 0, 1, 1)
-				s.setCooldown(fam, nextUTCMidnight())
+				s.setCooldown(fam, time.Now().Add(d))
 				continue
 			}
 			st.add(0, 0, 0, 0, 0, 0, 1, 0)
@@ -553,6 +715,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 		if !isStream {
 			data, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			s.clearLimFails(fam)
 			st.add(0, 1, 0, int64(len(data)), 0, 0, 0, 0)
 			h := w.Header()
 			proxyheaders.ForwardResponseHeaders(h, resp.Header)
@@ -566,6 +729,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 
 		// Streaming.
 		if s.forwardStream(w, resp, fam, model, st) {
+			s.clearLimFails(fam)
 			return
 		}
 		resp.Body.Close()

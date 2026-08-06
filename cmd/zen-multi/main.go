@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hana-ame/wintools/pkg/proxyheaders"
@@ -31,12 +32,19 @@ const (
 
 	connectTimeout   = 10 * time.Second
 	headerTimeout    = 30 * time.Second
-	stallTimeout     = 30 * time.Second
+	stallTimeout     = 10 * time.Second
 	tokenGapTimeout  = 10 * time.Second
 	toolStallTimeout = 180 * time.Second
 	cooldownShort    = 60 * time.Second
 	maxRetries       = 3
 	idleConnTimeout  = 90 * time.Second
+
+	// FreeUsageLimitError 连续失败阈值与冷却策略：
+	// 第 1 次短冷却 1 分钟，第 2 次 5 分钟，达到阈值（3 次）后才锁到午夜。
+	// opencode.ai 的该错误可能是瞬时限流，不能一上来就锁死一整天。
+	limFailThreshold = 3
+	limFailCooldown1 = 1 * time.Minute
+	limFailCooldown2 = 5 * time.Minute
 
 	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
 	maxRequestBody = 10 << 20
@@ -50,6 +58,7 @@ type upstream struct {
 	cooldownUntil time.Time
 	lastErr       string
 	reqs          int64
+	limFails      int // 连续 FreeUsageLimitError 次数，成功时清零
 
 	client *http.Client
 }
@@ -77,6 +86,30 @@ func (u *upstream) setErr(e string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.lastErr = e
+}
+
+// onLimitErr 记录一次 FreeUsageLimitError，返回按连续失败次数升级的冷却时长：
+// 第 1 次 limFailCooldown1，第 2 次 limFailCooldown2，达到 limFailThreshold
+// 后才锁到午夜（此时可视为真·配额耗尽）。
+func (u *upstream) onLimitErr() time.Duration {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.limFails++
+	switch u.limFails {
+	case 1:
+		return limFailCooldown1
+	case 2:
+		return limFailCooldown2
+	default:
+		return time.Until(nextUTCMidnight())
+	}
+}
+
+// clearLimFails 在源成功响应后清零连续失败计数。
+func (u *upstream) clearLimFails() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.limFails = 0
 }
 
 func (u *upstream) incrReqs() {
@@ -148,6 +181,50 @@ func eventFinishReason(ev []byte) *string {
 		}
 	}
 	return nil
+}
+
+// eventHasContent reports whether the event actually advances the stream:
+// a non-empty content delta, a tool_call delta, a non-null finish_reason,
+// or the [DONE] sentinel. Empty deltas / heartbeat events do not count,
+// so a stream that only emits heartbeats still trips the stall detector.
+func eventHasContent(ev []byte) bool {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := line[len("data: "):]
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			return true
+		}
+		var obj struct {
+			Choices []struct {
+				Delta struct {
+					Content   *string           `json:"content"`
+					ToolCalls []json.RawMessage `json:"tool_calls"`
+					Reasoning *string           `json:"reasoning_content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(payload, &obj); err != nil {
+			continue
+		}
+		for _, ch := range obj.Choices {
+			if ch.Delta.Content != nil && *ch.Delta.Content != "" {
+				return true
+			}
+			if len(ch.Delta.ToolCalls) > 0 {
+				return true
+			}
+			if ch.Delta.Reasoning != nil && *ch.Delta.Reasoning != "" {
+				return true
+			}
+			if ch.FinishReason != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // neutralizeFinish returns the event with finish_reason cleared to null.
@@ -283,6 +360,15 @@ func idleInject() []byte {
 	return []byte("data: " + inject + "\n\ndata: " + finishEvt + "\n\ndata: [DONE]\n\n")
 }
 
+// finishToolCall seals a truncated tool call with finish_reason=tool_calls,
+// so the client executes the (possibly partial) tool call and the loop continues.
+func finishToolCall() []byte {
+	finishEvt := fmt.Sprintf(
+		`{"id":"inf","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		baseModel)
+	return []byte("data: " + finishEvt + "\n\ndata: [DONE]\n\n")
+}
+
 func jsonString(s string) string {
 	re, _ := json.Marshal(s)
 	return string(re)
@@ -333,8 +419,12 @@ func sourceModels() []map[string]any {
 // server carries per-instance state (currently stateless).
 type server struct{}
 
+// reqSeq 为每个请求生成递增序号，贯穿所有日志，方便并发请求下的追踪。
+var reqSeq atomic.Uint64
+
 func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	log.Printf("-> %s %s", r.Method, r.URL.Path)
+	reqID := reqSeq.Add(1)
+	log.Printf("req=%d -> %s %s", reqID, r.Method, r.URL.Path)
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"error": "Bad Request"})
@@ -360,13 +450,13 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		canInject = isInf && len(toolsOf(payload)) > 0
 		forced, model = resolveModel(model)
 		payload["model"] = model
-		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 65536 {
-			payload["max_tokens"] = 65536
+		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 131072 {
+			payload["max_tokens"] = 131072
 		}
 		isStream, _ = payload["stream"].(bool)
 		re, _ := json.Marshal(payload)
 		bodyStr = string(re)
-		log.Printf("req model=%v src=%v stream=%v tools=%d can_inject=%v", payload["model"], forced, isStream, len(toolsOf(payload)), canInject)
+		log.Printf("req=%d model=%v src=%v stream=%v tools=%d can_inject=%v", reqID, payload["model"], forced, isStream, len(toolsOf(payload)), canInject)
 	}
 
 	lastErrBody := any(nil)
@@ -375,31 +465,39 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	lastHeaders := http.Header{}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		skipped := []string{}
 		for _, u := range order(forced) {
 			if u.inCooldown(time.Now()) {
+				skipped = append(skipped, u.name)
 				continue
 			}
-			ok := s.tryUpstream(w, u, r.Method, bodyStr, r.Header, len(body) > 0, isStream, canInject, &lastErrBody, &lastStatus, &limitErr, &lastHeaders)
+			ok := s.tryUpstream(w, u, r.Method, bodyStr, r.Header, len(body) > 0, isStream, canInject, &lastErrBody, &lastStatus, &limitErr, &lastHeaders, reqID)
 			if ok {
 				return
 			}
 		}
+		if len(skipped) > 0 {
+			log.Printf("req=%d attempt=%d skipped(cooldown)=%v", reqID, attempt+1, skipped)
+		}
 	}
 
 	if limitErr != nil {
+		log.Printf("req=%d all sources failed; last limit err -> 429", reqID)
 		writeJSON(w, 429, limitErr)
 		return
 	}
 	if lastErrBody != nil {
+		log.Printf("req=%d all sources failed; last_status=%d -> %d", reqID, lastStatus, lastStatus)
 		proxyheaders.MergeHeaders(w.Header(), lastHeaders)
 		writeJSON(w, lastStatus, lastErrBody)
 		return
 	}
+	log.Printf("req=%d all sources failed/exhausted -> 503", reqID)
 	writeJSON(w, 503, map[string]any{"error": map[string]any{"message": "All upstream sources exhausted or unavailable", "type": "UpstreamError"}})
 }
 
 // tryUpstream forwards to one source. Returns true if fully handled.
-func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr string, head http.Header, hasBody, isStream, canInject bool, lastErrBody *any, lastStatus *int, limitErr *any, lastHeaders *http.Header) bool {
+func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr string, head http.Header, hasBody, isStream, canInject bool, lastErrBody *any, lastStatus *int, limitErr *any, lastHeaders *http.Header, reqID uint64) bool {
 	path := "/chat/completions"
 	if !hasBody {
 		path = "/v1/models"
@@ -408,6 +506,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 	var err error
 	req, err = http.NewRequest(method, u.base+path, strings.NewReader(bodyStr))
 	if err != nil {
+		log.Printf("req=%d %s: new request failed: %v", reqID, u.name, err)
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -416,17 +515,17 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		req.Header.Set("Authorization", a)
 	}
 
-	log.Printf("%s: connecting...", u.name)
+	log.Printf("req=%d %s: connecting...", reqID, u.name)
 	resp, err := u.client.Do(req)
 	if err != nil {
-		log.Printf("%s: %T", u.name, err)
+		log.Printf("req=%d %s: connect failed: %T %v", reqID, u.name, err, err)
 		u.setCooldown(cooldownShort)
 		u.setErr(err.Error())
 		*lastStatus = 502
 		*lastErrBody = map[string]any{"error": map[string]any{"message": err.Error(), "type": "UpstreamError"}}
 		return false
 	}
-	log.Printf("%s: connected status=%d", u.name, resp.StatusCode)
+	log.Printf("req=%d %s: connected status=%d", reqID, u.name, resp.StatusCode)
 
 	if resp.StatusCode != 200 {
 		data, _ := io.ReadAll(resp.Body)
@@ -434,13 +533,14 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		var obj map[string]any
 		_ = json.Unmarshal(data, &obj)
 		if e, ok := obj["error"].(map[string]any); ok && e["type"] == freeLimitErr {
-			log.Printf("%s: FreeUsageLimitError (cooldown to midnight)", u.name)
-			u.setCooldownUntil(nextUTCMidnight())
+			d := u.onLimitErr()
+			log.Printf("req=%d %s: FreeUsageLimitError (lim_fails=%d, cooldown=%s, msg=%v)", reqID, u.name, u.limFails, d.Round(time.Second), e["message"])
+			u.setCooldown(d)
 			u.setErr(freeLimitErr)
 			*limitErr = obj
 			return false
 		}
-		log.Printf("%s: HTTP %d -> try next source", u.name, resp.StatusCode)
+		log.Printf("req=%d %s: HTTP %d -> try next source (msg=%v)", reqID, u.name, resp.StatusCode, obj["error"])
 		u.setErr(fmt.Sprintf("HTTP %d", resp.StatusCode))
 		*lastStatus = resp.StatusCode
 		*lastHeaders = http.Header{}
@@ -455,6 +555,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 
 	u.incrReqs()
 	u.setErr("")
+	u.clearLimFails()
 
 	if !isStream {
 		data, _ := io.ReadAll(resp.Body)
@@ -465,11 +566,11 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		h.Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(200)
 		w.Write(data)
-		log.Printf("%s: done (non-stream)", u.name)
+		log.Printf("req=%d %s: done (non-stream)", reqID, u.name)
 		return true
 	}
 
-	ok, committed := s.forwardStream(w, u, resp, canInject)
+	ok, committed := s.forwardStream(w, u, resp, canInject, reqID)
 	// committed=true 表示响应头已提交，此时不能再 failover（会双写响应）。
 	return ok || committed
 }
@@ -478,7 +579,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 // detection, tool-call protection and inf-loop injection.
 // 返回 (ok, committed)：committed 表示响应头已提交给客户端。
 // 一旦 committed，调用方禁止再 failover 到其他源（否则会双写响应）。
-func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Response, canInject bool) (bool, bool) {
+func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Response, canInject bool, reqID uint64) (bool, bool) {
 	name := u.name
 	done := make(chan struct{})
 	defer close(done)
@@ -497,7 +598,7 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 			timer.Stop()
 			if !ok || m.eof || m.err != nil {
 				if m.err != nil {
-					log.Printf("%s: pre-read error: %v", name, m.err)
+					log.Printf("req=%d %s: pre-read error: %v", reqID, name, m.err)
 				}
 				u.setCooldown(cooldownShort)
 				u.setErr("pre-read error")
@@ -510,13 +611,13 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 		}
 	}
 	if !hasReal {
-		log.Printf("%s: no real data in %.0fs, try next source", name, stallTimeout.Seconds())
+		log.Printf("req=%d %s: no real data in %.0fs, try next source", reqID, name, stallTimeout.Seconds())
 		u.setCooldown(cooldownShort)
 		u.setErr("first token stall")
 		resp.Body.Close()
 		return false, false
 	}
-	log.Printf("%s: first token t=%.2fs", name, time.Since(t0).Seconds())
+	log.Printf("req=%d %s: first token t=%.2fs", reqID, name, time.Since(t0).Seconds())
 
 	// Verify no error in pre-read events.
 	{
@@ -528,7 +629,7 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 			}
 			eb = rest
 			if eventHasError(ev) {
-				log.Printf("%s: SSE error event, try next source", name)
+				log.Printf("req=%d %s: SSE error event, try next source", reqID, name)
 				u.setCooldown(cooldownShort)
 				u.setErr("SSE error")
 				resp.Body.Close()
@@ -551,6 +652,8 @@ func (s *server) forwardStream(w http.ResponseWriter, u *upstream, resp *http.Re
 
 	buf := pre
 	sawTool := false
+	toolClosed := false
+	doneSent := false
 	injected := false
 	lastReal := time.Now()
 	timer := time.NewTimer(stallFor(false))
@@ -582,16 +685,29 @@ loop:
 				sawTool = true
 			}
 			if eventHasError(ev) {
-				log.Printf("%s: mid-stream error event dropped", name)
+				log.Printf("req=%d %s: mid-stream error event dropped", reqID, name)
 				continue
 			}
-			lastReal = time.Now()
-			timer.Reset(stallFor(sawTool))
+			if fr := eventFinishReason(ev); fr != nil && *fr == "tool_calls" {
+				toolClosed = true // 工具调用自然收尾（finish_reason=tool_calls）
+			}
+			if bytes.Contains(ev, []byte("data: [DONE]")) {
+				toolClosed = true // 上游正常 [DONE]
+				doneSent = true   // 终止哨兵已转发，后续 EOF 不再重复补
+			}
+			if eventHasContent(ev) {
+				// 只有内容推进事件才刷新 stall 时钟：
+				// 空 delta/心跳事件照常转发，但不算推进，否则上游持续心跳
+				// 会把 stall 检测喂饱，导致「卡住但既不注入也不断开」。
+				lastReal = time.Now()
+				timer.Reset(stallFor(sawTool))
+			}
 
 			if canInject && !sawTool && !injected {
 				if fr := eventFinishReason(ev); fr != nil && *fr != "tool_calls" {
+					log.Printf("req=%d %s: finish_reason=%q -> neutralize + inject", reqID, name, *fr)
 					if err := write(neutralizeFinish(ev)); err != nil {
-						log.Printf("client disconnected")
+						log.Printf("req=%d client disconnected", reqID)
 						break loop
 					}
 					if err := write([]byte("\n\n")); err != nil {
@@ -604,6 +720,7 @@ loop:
 					continue
 				}
 				if bytes.Contains(ev, []byte("data: [DONE]")) {
+					log.Printf("req=%d %s: upstream [DONE] -> inject before EOF", reqID, name)
 					if err := write(infInject()); err != nil {
 						break loop
 					}
@@ -612,7 +729,7 @@ loop:
 			}
 
 			if err := write(append(ev, '\n', '\n')); err != nil {
-				log.Printf("client disconnected")
+				log.Printf("req=%d client disconnected", reqID)
 				break loop
 			}
 		}
@@ -620,11 +737,11 @@ loop:
 		select {
 		case m, ok := <-ch:
 			if !ok || m.eof {
-				// EOF: inject if the stream ended without any tool call.
-				// 上游断流时没有自己的 [DONE] 可兜底，必须补发终止哨兵，
-				// 否则客户端会认为流被截断。
+				// EOF 出口收敛：优先注入；否则 seal 残缺工具调用；
+				// 剩余的「非注入」路径（canInject=false / 已收尾但上游没发 [DONE]）
+				// 一律兜底补发 [DONE]，避免客户端收到截断流。
 				if canInject && !sawTool && !injected {
-					log.Printf("%s: stream ended without tool_call, injecting at EOF", name)
+					log.Printf("req=%d %s: EOF without tool_call -> inject (saw_tool=%v injected=%v)", reqID, name, sawTool, injected)
 					if err := write(infInject()); err != nil {
 						break loop
 					}
@@ -632,13 +749,49 @@ loop:
 						break loop
 					}
 					injected = true
+					doneSent = true
+				} else if sawTool && !toolClosed {
+					// 工具调用被上游截断（未等到 finish_reason=tool_calls/[DONE]）：
+					// seal 收尾，客户端把残缺 tool_call 视为完成并执行，循环得以继续。
+					log.Printf("req=%d %s: EOF, tool_call truncated -> seal (saw_tool=%v tool_closed=%v injected=%v)", reqID, name, sawTool, toolClosed, injected)
+					if err := write(finishToolCall()); err != nil {
+						break loop
+					}
+					doneSent = true
+				} else if !doneSent {
+					log.Printf("req=%d %s: EOF, no fatal, sealing [DONE] (saw_tool=%v tool_closed=%v injected=%v)", reqID, name, sawTool, toolClosed, injected)
+					if err := write([]byte("data: [DONE]\n\n")); err != nil {
+						break loop
+					}
+					doneSent = true
 				}
 				break loop
 			}
 			if m.err != nil {
-				log.Printf("%s: unexpected %v", name, m.err)
+				log.Printf("req=%d %s: upstream stream error: %v", reqID, name, m.err)
 				u.setCooldown(cooldownShort)
 				u.setErr("stream error")
+				// 硬断流与 EOF 同等对待：未产出 tool_call 时注入续流 tool_call，
+				// 否则客户端收到截断流而不会 echo 继续。
+				if canInject && !sawTool && !injected {
+					log.Printf("req=%d %s: stream error without tool_call -> inject (saw_tool=%v injected=%v)", reqID, name, sawTool, injected)
+					if err := write(infInject()); err == nil {
+						if err := write([]byte("data: [DONE]\n\n")); err == nil {
+							injected = true
+							doneSent = true
+						}
+					}
+				} else if sawTool && !toolClosed {
+					log.Printf("req=%d %s: tool_call truncated by error -> seal (saw_tool=%v tool_closed=%v injected=%v)", reqID, name, sawTool, toolClosed, injected)
+					if err := write(finishToolCall()); err == nil {
+						doneSent = true
+					}
+				} else if !doneSent {
+					log.Printf("req=%d %s: stream error, sealing [DONE] (saw_tool=%v tool_closed=%v injected=%v)", reqID, name, sawTool, toolClosed, injected)
+					if err := write([]byte("data: [DONE]\n\n")); err == nil {
+						doneSent = true
+					}
+				}
 				break loop
 			}
 			buf = append(buf, m.data...)
@@ -646,23 +799,30 @@ loop:
 			// stall
 			stall := stallFor(sawTool)
 			if time.Since(lastReal) >= stall {
-				log.Printf("%s: stream idle %s (no real data, saw_tool=%v)", name, stall.Round(time.Second), sawTool)
+				log.Printf("req=%d %s: idle %s (no real data, saw_tool=%v tool_closed=%v injected=%v)", reqID, name, stall.Round(time.Second), sawTool, toolClosed, injected)
 				if canInject && !sawTool && !injected {
 					write(idleInject())
 					injected = true
-					log.Printf("SUCCESS (idle-timeout inject)")
+					log.Printf("req=%d SUCCESS (idle-timeout inject)", reqID)
 					resp.Body.Close()
 					return true, true
 				}
-				if sawTool {
-					// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
+				if sawTool && !toolClosed {
+					// 工具流截断：补发终止事件再断开，客户端能区分「完成」与「截断」
 					write(lengthChunk())
+					doneSent = true
 				} else if injected {
 					// 已注入 tool_call（finish_reason=tool_calls），上游 [DONE] 未到就 stall，
 					// 只补 [DONE]，避免客户端认为流被截断
 					write([]byte("data: [DONE]\n\n"))
+					doneSent = true
+				} else if !doneSent {
+					// 非注入请求（canInject=false）stall：兜底补 [DONE]，避免截断流
+					log.Printf("req=%d %s: idle, sealing [DONE]", reqID, name)
+					write([]byte("data: [DONE]\n\n"))
+					doneSent = true
 				}
-				log.Printf("FAIL")
+				log.Printf("req=%d FAIL (idle, no inject possible)", reqID)
 				resp.Body.Close()
 				return false, true
 			}
@@ -671,8 +831,8 @@ loop:
 	}
 
 	resp.Body.Close()
-	log.Printf("%s: done (source=%s) fwd=%dB", name, name, total)
-	log.Printf("SUCCESS")
+	log.Printf("req=%d %s: done fwd=%dB saw_tool=%v tool_closed=%v injected=%v (%.2fs)", reqID, name, total, sawTool, toolClosed, injected, time.Since(t0).Seconds())
+	log.Printf("req=%d SUCCESS", reqID)
 	return true, true
 }
 

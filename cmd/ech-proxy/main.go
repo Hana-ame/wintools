@@ -48,8 +48,8 @@ func cleanZenPayload(body []byte) ([]byte, error) {
 	if _, ok := payload["model"]; !ok {
 		payload["model"] = "deepseek-v4-flash-free"
 	}
-	if mt, ok := payload["max_tokens"].(float64); !ok || mt > 65536 {
-		payload["max_tokens"] = 65536
+	if mt, ok := payload["max_tokens"].(float64); !ok || mt > 131072 {
+		payload["max_tokens"] = 131072
 	}
 	return json.Marshal(payload)
 }
