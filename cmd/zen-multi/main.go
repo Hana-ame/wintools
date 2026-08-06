@@ -60,6 +60,12 @@ type upstream struct {
 	reqs          int64
 	limFails      int // 连续 FreeUsageLimitError 次数，成功时清零
 
+	// token 累计（仅流式响应：从末尾 usage chunk 解析）
+	inTok     int64
+	outTok    int64
+	cacheHit  int64
+	cacheMiss int64
+
 	client *http.Client
 }
 
@@ -181,6 +187,52 @@ func eventFinishReason(ev []byte) *string {
 		}
 	}
 	return nil
+}
+
+// eventUsage extracts the usage object from an SSE event, if present.
+// Streams carry it in the final chunk (usage:null everywhere else).
+func eventUsage(ev []byte) *usageStats {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := line[len("data: "):]
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var obj struct {
+			Usage *usageStats `json:"usage"`
+		}
+		if err := json.Unmarshal(payload, &obj); err != nil {
+			continue
+		}
+		if obj.Usage != nil && obj.Usage.Prompt > 0 {
+			return obj.Usage
+		}
+	}
+	return nil
+}
+
+// usageStats mirrors the OpenAI-style usage block.
+type usageStats struct {
+	Prompt    int64 `json:"prompt_tokens"`
+	Completed int64 `json:"completion_tokens"`
+	Total     int64 `json:"total_tokens"`
+	CacheHit  int64 `json:"prompt_cache_hit_tokens"`
+	CacheMiss int64 `json:"prompt_cache_miss_tokens"`
+}
+
+// addUsage accumulates per-source token totals.
+func (u *upstream) addUsage(us *usageStats) {
+	if us == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.inTok += us.Prompt
+	u.outTok += us.Completed
+	u.cacheHit += us.CacheHit
+	u.cacheMiss += us.CacheMiss
 }
 
 // eventHasContent reports whether the event actually advances the stream:
@@ -686,6 +738,7 @@ loop:
 			if !hasRealSSE(ev) {
 				continue
 			}
+			u.addUsage(eventUsage(ev))
 			if eventHasToolCall(ev) {
 				sawTool = true
 			}
@@ -925,11 +978,15 @@ func (s *server) handlerMulti() http.Handler {
 			cd := u.cooldownUntil.Sub(now).Seconds()
 			reqs := u.reqs
 			lastErr := u.lastErr
+			inTok, outTok := u.inTok, u.outTok
+			cacheHit, cacheMiss := u.cacheHit, u.cacheMiss
 			u.mu.Unlock()
 			if cd < 0 {
 				cd = 0
 			}
-			srcs[u.name] = map[string]any{"cooldown_sec": int(cd), "reqs": reqs, "last_err": lastErr}
+			srcs[u.name] = map[string]any{"cooldown_sec": int(cd), "reqs": reqs, "last_err": lastErr,
+				"in_tokens": inTok, "out_tokens": outTok,
+				"cache_hit_tokens": cacheHit, "cache_miss_tokens": cacheMiss}
 		}
 		writeJSON(w, 200, map[string]any{"status": "ok", "sources": srcs})
 	})

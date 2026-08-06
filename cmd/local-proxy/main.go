@@ -113,6 +113,36 @@ func eventFinishReason(ev []byte) *string {
 	return nil
 }
 
+// eventUsage extracts the usage object from an SSE event, if present.
+// Streams carry it in the final chunk (usage:null everywhere else).
+// Returns zero values when absent.
+func eventUsage(ev []byte) (inTok, outTok, cacheHit, cacheMiss int64) {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := line[len("data: "):]
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var obj struct {
+			Usage *struct {
+				Prompt    int64 `json:"prompt_tokens"`
+				Completed int64 `json:"completion_tokens"`
+				CacheHit  int64 `json:"prompt_cache_hit_tokens"`
+				CacheMiss int64 `json:"prompt_cache_miss_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(payload, &obj); err != nil {
+			continue
+		}
+		if obj.Usage != nil && obj.Usage.Prompt > 0 {
+			return obj.Usage.Prompt, obj.Usage.Completed, obj.Usage.CacheHit, obj.Usage.CacheMiss
+		}
+	}
+	return 0, 0, 0, 0
+}
+
 // eventHasContent reports whether the event actually advances the stream:
 // a non-empty content delta, a tool_call delta, a non-null finish_reason,
 // or the [DONE] sentinel. Empty deltas / heartbeat events do not count,
@@ -227,6 +257,12 @@ type famStats struct {
 	Stalls    int64 // stall 超时中断次数
 	Errs      int64 // 传输错误 / 非 200 / 预读失败次数
 	FreeLimit int64 // FreeUsageLimitError 命中次数
+
+	// token 累计（仅流式响应：从末尾 usage chunk 解析）
+	InTok     int64
+	OutTok    int64
+	CacheHit  int64
+	CacheMiss int64
 }
 
 func (a *famStats) add(reqs, ok, streams, bytes, tools, stalls, errs, freeLimit int64) {
@@ -242,18 +278,32 @@ func (a *famStats) add(reqs, ok, streams, bytes, tools, stalls, errs, freeLimit 
 	a.FreeLimit += freeLimit
 }
 
+// addUsage 累加一次流式响应的 token 用量。
+func (a *famStats) addUsage(inTok, outTok, cacheHit, cacheMiss int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.InTok += inTok
+	a.OutTok += outTok
+	a.CacheHit += cacheHit
+	a.CacheMiss += cacheMiss
+}
+
 func (a *famStats) snapshot() map[string]int64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return map[string]int64{
-		"reqs":       a.Reqs,
-		"ok":         a.OK,
-		"streams":    a.Streams,
-		"bytes":      a.Bytes,
-		"tool_calls": a.ToolCalls,
-		"stalls":     a.Stalls,
-		"errs":       a.Errs,
-		"free_limit": a.FreeLimit,
+		"reqs":              a.Reqs,
+		"ok":                a.OK,
+		"streams":           a.Streams,
+		"bytes":             a.Bytes,
+		"tool_calls":        a.ToolCalls,
+		"stalls":            a.Stalls,
+		"errs":              a.Errs,
+		"free_limit":        a.FreeLimit,
+		"in_tokens":         a.InTok,
+		"out_tokens":        a.OutTok,
+		"cache_hit_tokens":  a.CacheHit,
+		"cache_miss_tokens": a.CacheMiss,
 	}
 }
 
@@ -657,6 +707,9 @@ loop:
 			buf = rest
 			if !hasRealSSE(ev) {
 				continue
+			}
+			if in, out, hit, miss := eventUsage(ev); in > 0 {
+				st.addUsage(in, out, hit, miss)
 			}
 			if eventHasToolCall(ev) {
 				sawTool = true
