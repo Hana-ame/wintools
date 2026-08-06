@@ -19,11 +19,15 @@ pi / opencode ──> local zen-multi :8443 ──> zen-proxy (vps / bwh / cloud
   失败自动 failover + cooldown，并提供 "inf loop" 工具调用注入
   （`deepseek-v4-flash-inf` 模型）。提供 `/v1/models`、`/status`。
 - **local-proxy**（本地，两版）：Ollama 兼容端口 `11434` 的本地转发器。
-  - **vanilla**（`cmd/local-proxy`）：纯透传，无任何检测（无 stall / 无预读 /
-    无 keep-alive 过滤），所有事件原样转发，仅保留 v6/v4 请求级 failover。
-  - **detected**（`cmd/local-proxy-detected`）：在透传基础上启用流检测——预读等首包
-    30s、首 token 后 10s/token 节奏、工具流 180s 思考窗口、keep-alive 过滤、
-    stall 时写 `UpstreamStall` / `finish_reason:"length"` 终止事件。
+  - **vanilla**（`cmd/local-proxy`）：透传 + stall 检测。预读等首包、首 token 后
+    10s/token 节奏、工具流 180s 思考窗口、keep-alive 过滤，stall / 断流时补发
+    `UpstreamStall` 或 `finish_reason:"length"` + `[DONE]` 终止事件；另有
+    v6/v4 请求级 failover、每栈 token/usage 统计、`/status` 端点。
+    监听默认 **IPv4(0.0.0.0) + IPv6([::]) 双栈**。
+  - **detected**（`cmd/local-proxy-detected`）：在透传基础上启用更强的流检测——
+    预读等首包 30s、首 token 后 10s/token 节奏、工具流 180s 思考窗口、keep-alive 过滤、
+    stall 时写 `UpstreamStall` / `finish_reason:"length"` 终止事件；另有 per-model
+    token/费用统计、`/stats` 端点。
   两版构建产物名均为 `local-proxy` / `local-proxy-detected`，release 自动发布。
 
 ## 构建
