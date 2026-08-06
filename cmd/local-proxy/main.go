@@ -932,16 +932,41 @@ func main() {
 		w.Write([]byte("Local proxy running\n"))
 	})
 
-	srv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", host, port),
-		Handler:           mux,
-		ReadHeaderTimeout: 15 * time.Second,
-	}
 	log.Printf("Local proxy on http://%s:%d/v1/chat/completions (forward -> opencode.ai)", host, port)
 	if mode != "" {
 		log.Printf("IP stack forced: %s", mode)
 	}
-	if err := srv.ListenAndServe(); err != nil {
+
+	// listenDual 同时监听 IPv4 (0.0.0.0) 与 IPv6 ([::]) 双栈，LAN 设备两种
+	// 协议族都能连上。各自跑同一个 mux。
+	listenDual := func() (net.Listener, net.Listener, error) {
+		ln4, err := net.Listen("tcp4", "0.0.0.0:"+fmt.Sprint(port))
+		if err != nil {
+			return nil, nil, err
+		}
+		ln6, err := net.Listen("tcp6", "[::]:"+fmt.Sprint(port))
+		if err != nil {
+			ln4.Close()
+			return nil, nil, err
+		}
+		return ln4, ln6, nil
+	}
+
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+
+	ln4, ln6, err := listenDual()
+	if err != nil {
+		log.Fatalf("listen dual-stack: %v", err)
+	}
+	log.Printf("listening on tcp4 0.0.0.0:%d and tcp6 [::]:%d (dual-stack)", port, port)
+
+	errc := make(chan error, 2)
+	go func() { errc <- srv.Serve(ln4) }()
+	go func() { errc <- srv.Serve(ln6) }()
+	if err := <-errc; err != nil {
 		log.Fatal(err)
 	}
 }
