@@ -250,6 +250,9 @@ type proxy struct {
 	v4URL string
 	v6URL string
 
+	// detect=true 时启用流检测（预读/stall/DONE 兜底）；false 时纯透传（vanilla 模式）。
+	detect bool
+
 	stats *stats
 }
 
@@ -441,11 +444,14 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 	writeJSON(w, 503, map[string]any{"error": map[string]any{"message": "All upstream IPs exhausted or unavailable", "type": "UpstreamError"}})
 }
 
-// forwardStream relays the SSE stream with keep-alive filtering and stall
-// detection (pre-read 30s 首 token；之后 10s/token；工具调用期间 180s)。
+// forwardStream relays the SSE stream. detect=true 时启用预读/stall/DONE 兜底；
+// detect=false（vanilla 模式）时纯透传，所有事件原样转发。
 // Returns (ok, committed) on success;
 // committed 表示响应头已提交，调用方此后不能再 failover（否则会双写响应）。
 func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, model string) (bool, bool) {
+	if !p.detect {
+		return p.forwardPassthrough(w, resp, fam, model)
+	}
 	done := make(chan struct{})
 	defer close(done)
 	ch := startReader(resp.Body, done)
@@ -491,6 +497,8 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 
 	buf := pre
 	sawTool := false
+	toolDone := false
+	doneSent := false
 	lastReal := time.Now()
 	timer := time.NewTimer(stallFor(false))
 	defer timer.Stop()
@@ -513,6 +521,9 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 			if eventHasToolCall(ev) {
 				sawTool = true
 			}
+			if fr := eventFinishReason(ev); fr != nil && *fr == "tool_calls" {
+				toolDone = true // 工具调用自然收尾
+			}
 			lastReal = time.Now()
 			total += len(ev) + 2
 			if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
@@ -526,7 +537,100 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 			timer.Reset(stallFor(sawTool))
 		}
 
+		if bytes.Contains(buf, []byte("data: [DONE]")) {
+			doneSent = true
+		}
+
 		stall := stallFor(sawTool)
+		select {
+		case m, ok := <-ch:
+			if !ok || m.eof {
+				// EOF：若此前从未发过 [DONE]，补发终止哨兵收尾，客户端才能
+				// 区分「完成」与「截断」（上游可能正常 close 但没发 [DONE]）。
+				if !doneSent {
+					if sawTool && !toolDone {
+						w.Write(lengthChunk(model))
+					} else {
+						w.Write([]byte("data: [DONE]\n\n"))
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+					doneSent = true
+				}
+				resp.Body.Close()
+				log.Printf("%s stream done (%d bytes, %.2fs)", fam, total, time.Since(t0).Seconds())
+				return true, true
+			}
+			if m.err != nil {
+				log.Printf("%s mid-stream error: %v", fam, m.err)
+				// 上游硬断流：与 stall 同等待遇，补发终止哨兵再断开，
+				// 否则客户端收到截断流（无 [DONE]），无法区分「完成」与「截断」。
+				if !doneSent {
+					if !sawTool {
+						msgB, _ := json.Marshal(m.err.Error())
+						w.Write([]byte(fmt.Sprintf("data: {\"error\": {\"message\": %s, \"type\": \"UpstreamError\"}}\n\ndata: [DONE]\n\n", msgB)))
+					} else if !toolDone {
+						w.Write(lengthChunk(model))
+					} else {
+						w.Write([]byte("data: [DONE]\n\n"))
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+					doneSent = true
+				}
+				resp.Body.Close()
+				return false, true
+			}
+			buf = append(buf, m.data...)
+		case <-timer.C:
+			if time.Since(lastReal) >= stall {
+				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
+				if !doneSent {
+					if !sawTool {
+						w.Write([]byte("data: {\"error\": {\"message\": \"upstream stalled\", \"type\": \"UpstreamStall\"}}\n\ndata: [DONE]\n\n"))
+					} else {
+						// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
+						w.Write(lengthChunk(model))
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+					doneSent = true
+				}
+				resp.Body.Close()
+				return false, true
+			}
+			timer.Reset(stall - time.Since(lastReal))
+		}
+	}
+}
+
+// forwardPassthrough 纯透传模式：不做预读 / stall 检测 / DONE 兜底，
+// 上游事件原样转发，仅统计请求数（usage 若有也记录）。
+func (p *proxy) forwardPassthrough(w http.ResponseWriter, resp *http.Response, fam, model string) (bool, bool) {
+	done := make(chan struct{})
+	defer close(done)
+	ch := startReader(resp.Body, done)
+	t0 := time.Now()
+
+	flusher, _ := w.(http.Flusher)
+	h := w.Header()
+	proxyheaders.ForwardResponseHeaders(h, resp.Header)
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	setCORS(h)
+	w.WriteHeader(200)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	p.stats.add(model, true, nil)
+
+	total := 0
+	buf := []byte{}
+	for {
 		select {
 		case m, ok := <-ch:
 			if !ok || m.eof {
@@ -535,29 +639,62 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 				return true, true
 			}
 			if m.err != nil {
-				log.Printf("%s mid-stream error: %v", fam, m.err)
+				log.Printf("%s upstream error: %v", fam, m.err)
 				resp.Body.Close()
-				return false, true
+				return true, true
 			}
 			buf = append(buf, m.data...)
-		case <-timer.C:
-			if time.Since(lastReal) >= stall {
-				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
-				if !sawTool {
-					w.Write([]byte("data: {\"error\": {\"message\": \"upstream stalled\", \"type\": \"UpstreamStall\"}}\n\ndata: [DONE]\n\n"))
-				} else {
-					// 工具流：补发终止事件再断开，客户端能区分「完成」与「截断」
-					w.Write(lengthChunk(model))
+			total += len(m.data)
+			// 逐事件转发，顺带解析 usage 统计
+			for {
+				ev, rest, ok := nextSSEEvent(buf)
+				if !ok {
+					buf = rest
+					break
 				}
-				if flusher != nil {
-					flusher.Flush()
+				buf = rest
+				if u := parseSSEUsage(ev); u != nil {
+					p.stats.add(model, false, u)
 				}
-				resp.Body.Close()
-				return false, true
+				total += len(ev) + 2
+				if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
+					log.Printf("client disconnected mid-stream")
+					resp.Body.Close()
+					return false, true
+				}
 			}
-			timer.Reset(stall - time.Since(lastReal))
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 	}
+}
+
+// eventFinishReason returns the first non-nil finish_reason in the event.
+func eventFinishReason(ev []byte) *string {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		payload := line[len("data: "):]
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var obj struct {
+			Choices []struct {
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(payload, &obj); err != nil {
+			continue
+		}
+		for _, ch := range obj.Choices {
+			if ch.FinishReason != nil {
+				return ch.FinishReason
+			}
+		}
+	}
+	return nil
 }
 
 // lengthChunk 工具流 stall 截断时补发的终止事件：finish_reason=length + [DONE]。
@@ -602,11 +739,11 @@ func makeClient(endpoint, sniHost string) *http.Client {
 }
 
 func main() {
-	host := "127.0.0.1"
 	port := 11434
-	mode := ""
+	mode := ""  // "", "v4", or "v6"
+	detect := true // 默认 detected 模式；传 "vanilla" 纯透传
 	if len(os.Args) > 1 {
-		host = os.Args[1]
+		// host 参数保留兼容；双栈监听固定 0.0.0.0 / [::]
 	}
 	if len(os.Args) > 2 {
 		fmt.Sscanf(os.Args[2], "%d", &port)
@@ -616,6 +753,12 @@ func main() {
 	}
 	if mode != "v4" && mode != "v6" {
 		mode = ""
+	}
+	if len(os.Args) > 4 {
+		switch os.Args[4] {
+		case "vanilla":
+			detect = false
+		}
 	}
 
 	v4, v6 := resolveOnce(zenHost)
@@ -628,6 +771,7 @@ func main() {
 		mode:     mode,
 		v4URL:    "https://" + v4,
 		v6URL:    "https://[" + v6 + "]",
+		detect:   detect,
 		stats:    newStats(),
 	}
 	if v4 == "" && v6 == "" {
@@ -669,15 +813,29 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", host, port),
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
 	}
-	log.Printf("Local proxy on http://%s:%d/v1/chat/completions (forward -> opencode.ai)", host, port)
+
+	// 双栈监听：IPv4 (0.0.0.0) + IPv6 ([::])，LAN 设备两种协议族都能连上。
+	ln4, err := net.Listen("tcp4", "0.0.0.0:"+fmt.Sprint(port))
+	if err != nil {
+		log.Fatalf("listen tcp4: %v", err)
+	}
+	ln6, err := net.Listen("tcp6", "[::]:"+fmt.Sprint(port))
+	if err != nil {
+		ln4.Close()
+		log.Fatalf("listen tcp6: %v", err)
+	}
+	log.Printf("Local proxy on 0.0.0.0:%d & [::]:%d/v1/chat/completions (forward -> opencode.ai)", port, port)
 	if mode != "" {
 		log.Printf("IP stack forced: %s", mode)
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	if !detect {
+		log.Printf("mode: vanilla (passthrough, no stall detection)")
+	}
+	if err := srv.Serve(ln4); err != nil {
 		log.Fatal(err)
 	}
+	go srv.Serve(ln6)
 }

@@ -18,28 +18,24 @@ pi / opencode ──> local zen-multi :8443 ──> zen-proxy (vps / bwh / cloud
 - **zen-multi**（本地）：聚合 bwh/vps/cloudcone 三个 zen-proxy，
   失败自动 failover + cooldown，并提供 "inf loop" 工具调用注入
   （`deepseek-v4-flash-inf` 模型）。提供 `/v1/models`、`/status`。
-- **local-proxy**（本地，两版）：Ollama 兼容端口 `11434` 的本地转发器。
-  - **vanilla**（`cmd/local-proxy`）：透传 + stall 检测。预读等首包、首 token 后
-    10s/token 节奏、工具流 180s 思考窗口、keep-alive 过滤，stall / 断流时补发
-    `UpstreamStall` 或 `finish_reason:"length"` + `[DONE]` 终止事件；另有
-    v6/v4 请求级 failover、每栈 token/usage 统计、`/status` 端点。
-    监听默认 **IPv4(0.0.0.0) + IPv6([::]) 双栈**。
-  - **detected**（`cmd/local-proxy-detected`）：在透传基础上启用更强的流检测——
-    预读等首包 30s、首 token 后 10s/token 节奏、工具流 180s 思考窗口、keep-alive 过滤、
-    stall 时写 `UpstreamStall` / `finish_reason:"length"` 终止事件；另有 per-model
-    token/费用统计、`/stats` 端点。
-  两版构建产物名均为 `local-proxy` / `local-proxy-detected`，release 自动发布。
+- **local-proxy**（本地，`cmd/local-proxy-detected`）：Ollama 兼容端口 `11434` 的本地转发器。
+  单二进制双模式，第 4 个参数切换：
+  - **detected**（默认）：流检测——预读等首包 30s、首 token 后 10s/token 节奏、
+    工具流 180s 思考窗口、keep-alive 过滤；stall / EOF / 硬断流时补发
+    `UpstreamStall` / `finish_reason:"length"` + `[DONE]` 终止事件；
+    per-model token/费用统计、`/stats` 端点。
+  - **vanilla**（第 4 参数传 `vanilla`）：纯透传，不预读、不判 stall、不过滤 keep-alive，
+    仅转发 + 请求数/usage 统计。
+  两模式都带 v6/v4 请求级 failover，监听默认 **IPv4(0.0.0.0) + IPv6([::]) 双栈**。
+  release 构建产物名为 `local-proxy-detected`。
 
 ## 构建
 
 ```bash
 # 全部
-go build ./cmd/zen-proxy/ ./cmd/zen-multi/ ./cmd/local-proxy/ ./cmd/local-proxy-detected/
+go build ./cmd/zen-proxy/ ./cmd/zen-multi/ ./cmd/local-proxy-detected/
 
-# 交叉编译 local-proxy 两版（Windows / Termux / Linux）
-GOOS=windows GOARCH=amd64 go build -o local_proxy_windows_amd64.exe ./cmd/local-proxy/
-GOOS=linux   GOARCH=arm64  go build -o local_proxy_termux_arm64 ./cmd/local-proxy/
-GOOS=linux   GOARCH=amd64  go build -o local_proxy_linux_amd64 ./cmd/local-proxy/
+# 交叉编译 local-proxy（Windows / Termux / Linux）
 GOOS=windows GOARCH=amd64 go build -o local_proxy_detected_windows_amd64.exe ./cmd/local-proxy-detected/
 GOOS=linux   GOARCH=arm64  go build -o local_proxy_detected_termux_arm64 ./cmd/local-proxy-detected/
 GOOS=linux   GOARCH=amd64  go build -o local_proxy_detected_linux_amd64 ./cmd/local-proxy-detected/
@@ -206,9 +202,9 @@ data: [DONE]
   `finish_reason:"length"` 终止事件 + `data: [DONE]` 再断开，客户端能区分
   「完成」与「截断」；非工具流 zen-proxy 写 `UpstreamStall` 错误，zen-multi
   走 idle 注入或静默断开。`lengthChunk(model)` 为共用格式。
-- **local-proxy vanilla 无检测**：`cmd/local-proxy` 纯透传，不预读、不判 stall、
-  不过滤 keep-alive。带检测的变体在 `cmd/local-proxy-detected`（保持与
-  zen-proxy / zen-multi 相同的检测语义）。
+- **local-proxy vanilla/detected 同二进制**：`cmd/local-proxy-detected` 默认 detected
+  （预读、判 stall、过滤 keep-alive、补发 `[DONE]`），第 4 参数传 `vanilla` 即纯透传。
+  检测语义与 zen-proxy / zen-multi 一致。
 - **reader goroutine**：`startReader` 用 done channel 中止，退出循环后必须能立即
   终止阻塞中的 send/read，不能依赖 `resp.Body.Close()` 兜底。
 
