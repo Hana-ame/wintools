@@ -34,6 +34,12 @@ const (
 
 	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
 	maxRequestBody = 10 << 20
+
+	// 计费价格（每百万 token），与 opencode.json 中 zen-multi 一致。
+	priceInputM     = 1.0
+	priceOutputM    = 2.0
+	priceCacheReadM = 0.02
+	priceCacheWriteM = 0.0
 )
 
 func nextUTCMidnight() time.Time {
@@ -98,6 +104,101 @@ type chunkMsg struct {
 	err  error
 }
 
+// ---- usage stats ------------------------------------------------------------
+
+// usage 记录响应体里的 token 用量。非流式响应整体解析；
+// 流式响应每个 SSE 事件里可能带 usage（通常只在最后一个事件）。
+type usage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	Cache            struct {
+		Read  int64 `json:"read"`
+		Write int64 `json:"write"`
+	} `json:"cache"`
+}
+
+type modelStats struct {
+	Requests   int64   `json:"requests"`
+	Input      int64   `json:"input"`
+	Output     int64   `json:"output"`
+	Reasoning  int64   `json:"reasoning"`
+	CacheRead  int64   `json:"cache_read"`
+	CacheWrite int64   `json:"cache_write"`
+	Cost       float64 `json:"est_cost"`
+}
+
+type stats struct {
+	mu     sync.Mutex
+	models map[string]*modelStats
+}
+
+func newStats() *stats {
+	return &stats{models: make(map[string]*modelStats)}
+}
+
+func (s *stats) add(model string, req bool, u *usage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.models[model]
+	if m == nil {
+		m = &modelStats{}
+		s.models[model] = m
+	}
+	if req {
+		m.Requests++
+	}
+	if u == nil {
+		return
+	}
+	m.Input += u.PromptTokens
+	m.Output += u.CompletionTokens
+	m.Reasoning += u.ReasoningTokens
+	m.CacheRead += u.Cache.Read
+	m.CacheWrite += u.Cache.Write
+	m.Cost += estCost(u)
+}
+
+func (s *stats) snapshot() map[string]*modelStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]*modelStats, len(s.models))
+	for k, v := range s.models {
+		c := *v
+		out[k] = &c
+	}
+	return out
+}
+
+func estCost(u *usage) float64 {
+	return float64(u.Cache.Read)/1e6*priceCacheReadM +
+		float64(u.PromptTokens)/1e6*priceInputM +
+		float64(u.CompletionTokens+u.ReasoningTokens)/1e6*priceOutputM
+}
+
+func parseUsage(data []byte) *usage {
+	var obj struct {
+		Usage *usage `json:"usage"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil || obj.Usage == nil {
+		return nil
+	}
+	return obj.Usage
+}
+
+// parseSSEUsage 从单个 SSE 事件（"data: {...}" 行）里抽取 usage。
+func parseSSEUsage(ev []byte) *usage {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		if u := parseUsage(line[len("data: "):]); u != nil {
+			return u
+		}
+	}
+	return nil
+}
+
 func startReader(body io.Reader, done <-chan struct{}) chan chunkMsg {
 	ch := make(chan chunkMsg, 32)
 	go func() {
@@ -148,6 +249,8 @@ type proxy struct {
 	mode  string // "", "v4", or "v6"
 	v4URL string
 	v6URL string
+
+	stats *stats
 }
 
 // resolveOnce resolves host via public DNS, bypassing the system resolver
@@ -309,6 +412,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 		if !isStream {
 			data, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			p.stats.add(model, true, parseUsage(data))
 			h := w.Header()
 			proxyheaders.ForwardResponseHeaders(h, resp.Header)
 			h.Set("Content-Type", "application/json")
@@ -383,6 +487,8 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 		flusher.Flush()
 	}
 
+	p.stats.add(model, true, nil)
+
 	buf := pre
 	sawTool := false
 	lastReal := time.Now()
@@ -400,6 +506,9 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 			buf = rest
 			if !hasRealSSE(ev) {
 				continue
+			}
+			if u := parseSSEUsage(ev); u != nil {
+				p.stats.add(model, false, u)
 			}
 			if eventHasToolCall(ev) {
 				sawTool = true
@@ -519,6 +628,7 @@ func main() {
 		mode:     mode,
 		v4URL:    "https://" + v4,
 		v6URL:    "https://[" + v6 + "]",
+		stats:    newStats(),
 	}
 	if v4 == "" && v6 == "" {
 		log.Fatalf("could not resolve %s via public DNS", zenHost)
@@ -540,6 +650,13 @@ func main() {
 	})
 	mux.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
 		p.handle(w, r, "GET")
+	})
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			writeJSON(w, 204, map[string]any{})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"models": p.stats.snapshot()})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
