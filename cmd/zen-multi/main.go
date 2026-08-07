@@ -532,6 +532,19 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			if ok {
 				return
 			}
+			if forced != "" {
+				// model 指定了特定 endpoint：失败即返回，不 fallback 到其他源。
+				log.Printf("req=%d forced=%s failed -> no fallback", reqID, forced)
+				if limitErr != nil {
+					writeJSON(w, 429, limitErr)
+				} else if lastErrBody != nil {
+					proxyheaders.MergeHeaders(w.Header(), lastHeaders)
+					writeJSON(w, lastStatus, lastErrBody)
+				} else {
+					writeJSON(w, 503, map[string]any{"error": map[string]any{"message": "Forced upstream unavailable", "type": "UpstreamError"}})
+				}
+				return
+			}
 		}
 		if len(skipped) > 0 {
 			log.Printf("req=%d attempt=%d skipped(cooldown)=%v", reqID, attempt+1, skipped)

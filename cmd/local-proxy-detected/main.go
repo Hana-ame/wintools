@@ -32,6 +32,15 @@ const (
 	tokenGapTimeout  = 10 * time.Second
 	toolStallTimeout = 180 * time.Second
 
+	// 非工具流首 token 后的思考宽限：模型在组织长回复 / reasoning 时，
+	// 两个不完整 token 之间可能停顿超过 tokenGapTimeout。给一个秒级宽限，
+	// 小于该值不判 stall（仍用 tokenGapTimeout 作为紧凑检测）。
+	thinkGrace = 45 * time.Second
+
+	// stall/断流时注入的「echo 继续」tool_call，让客户端恢复工具循环而不是报错。
+	infTool    = "bash"
+	infIdleArg = `{"command": "echo 继续"}`
+
 	// maxRequestBody 限制请求体大小，防止恶意超大 body 耗尽内存。
 	maxRequestBody = 10 << 20
 
@@ -89,13 +98,14 @@ func eventHasToolCall(ev []byte) bool {
 	return false
 }
 
-// stallFor 返回「两个真实 SSE 事件之间允许的最大间隔」：
-// 首 token 之后按 token 节奏收敛到 tokenGapTimeout；工具流保留更长思考窗口。
+// stallFor 返回「两个真实 SSE 事件之间允许的最大间隔」。
+// 首 token 后按 token 节奏收敛到 tokenGapTimeout；工具流保留更长思考窗口。
+// 普通流给 thinkGrace 宽限，避免推理模型思考停顿被误杀。
 func stallFor(sawTool bool) time.Duration {
 	if sawTool {
 		return toolStallTimeout
 	}
-	return tokenGapTimeout
+	return thinkGrace
 }
 
 type chunkMsg struct {
@@ -324,6 +334,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 
 	isStream := false
 	model := "deepseek-v4-flash-free"
+	recoverable := false
 	var payload map[string]any
 	bodyStr := string(body)
 	if len(body) > 0 {
@@ -339,6 +350,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 			payload["max_tokens"] = 131072
 		}
 		isStream, _ = payload["stream"].(bool)
+		// 请求带 tools：stall/断流时可注入 idle tool_call 恢复工具循环。
+		if tools, _ := payload["tools"].([]any); len(tools) > 0 {
+			recoverable = true
+		}
 		re, _ := json.Marshal(payload)
 		bodyStr = string(re)
 	}
@@ -425,7 +440,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 			return
 		}
 
-		ok, committed := p.forwardStream(w, resp, fam, model)
+		ok, committed := p.forwardStream(w, resp, fam, model, recoverable)
 		if ok || committed {
 			return
 		}
@@ -448,7 +463,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 // detect=false（vanilla 模式）时纯透传，所有事件原样转发。
 // Returns (ok, committed) on success;
 // committed 表示响应头已提交，调用方此后不能再 failover（否则会双写响应）。
-func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, model string) (bool, bool) {
+func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, model string, recoverable bool) (bool, bool) {
 	if !p.detect {
 		return p.forwardPassthrough(w, resp, fam, model)
 	}
@@ -547,7 +562,12 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 			if !ok || m.eof {
 				// EOF：若此前从未发过 [DONE]，补发终止哨兵收尾，客户端才能
 				// 区分「完成」与「截断」（上游可能正常 close 但没发 [DONE]）。
-				if !doneSent {
+				if recoverable && !sawTool && !doneSent {
+					// 带 tools 且无产出：注入「echo 继续」让客户端恢复工具循环。
+					log.Printf("%s EOF without output -> inject idle (recoverable)", fam)
+					w.Write(idleInject(model))
+					doneSent = true
+				} else if !doneSent {
 					if sawTool && !toolDone {
 						w.Write(lengthChunk(model))
 					} else {
@@ -566,7 +586,12 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 				log.Printf("%s mid-stream error: %v", fam, m.err)
 				// 上游硬断流：与 stall 同等待遇，补发终止哨兵再断开，
 				// 否则客户端收到截断流（无 [DONE]），无法区分「完成」与「截断」。
-				if !doneSent {
+				if recoverable && !sawTool && !doneSent {
+					// 带 tools 且无产出：注入「echo 继续」恢复工具循环。
+					log.Printf("%s mid-stream error without output -> inject idle (recoverable)", fam)
+					w.Write(idleInject(model))
+					doneSent = true
+				} else if !doneSent {
 					if !sawTool {
 						msgB, _ := json.Marshal(m.err.Error())
 						w.Write([]byte(fmt.Sprintf("data: {\"error\": {\"message\": %s, \"type\": \"UpstreamError\"}}\n\ndata: [DONE]\n\n", msgB)))
@@ -587,7 +612,12 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 		case <-timer.C:
 			if time.Since(lastReal) >= stall {
 				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
-				if !doneSent {
+				if recoverable && !sawTool && !doneSent {
+					// 带 tools 且无产出：注入「echo 继续」恢复工具循环，而不是报错。
+					log.Printf("%s stall without output -> inject idle (recoverable)", fam)
+					w.Write(idleInject(model))
+					doneSent = true
+				} else if !doneSent {
 					if !sawTool {
 						w.Write([]byte("data: {\"error\": {\"message\": \"upstream stalled\", \"type\": \"UpstreamStall\"}}\n\ndata: [DONE]\n\n"))
 					} else {
@@ -700,6 +730,18 @@ func eventFinishReason(ev []byte) *string {
 // lengthChunk 工具流 stall 截断时补发的终止事件：finish_reason=length + [DONE]。
 func lengthChunk(model string) []byte {
 	return []byte(fmt.Sprintf("data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", model))
+}
+
+// idleInject 构造一个「echo 继续」tool_call 事件流：客户端收到后执行 bash echo 继续，
+// 工具循环恢复，而不是被 UpstreamStall 错误打断。
+func idleInject(model string) []byte {
+	toolEvt := fmt.Sprintf(
+		`{"id":"idle","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_idle","type":"function","function":{"name":"%s","arguments":%s}}]},"finish_reason":null}]}`,
+		model, infTool, infIdleArg)
+	finishEvt := fmt.Sprintf(
+		`{"id":"idle","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		model)
+	return []byte("data: " + toolEvt + "\n\ndata: " + finishEvt + "\n\ndata: [DONE]\n\n")
 }
 
 // ---- server wiring ---------------------------------------------------------
