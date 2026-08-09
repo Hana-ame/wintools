@@ -562,12 +562,8 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 			if !ok || m.eof {
 				// EOF：若此前从未发过 [DONE]，补发终止哨兵收尾，客户端才能
 				// 区分「完成」与「截断」（上游可能正常 close 但没发 [DONE]）。
-				if recoverable && !sawTool && !doneSent {
-					// 带 tools 且无产出：注入「echo 继续」让客户端恢复工具循环。
-					log.Printf("%s EOF without output -> inject idle (recoverable)", fam)
-					w.Write(idleInject(model))
-					doneSent = true
-				} else if !doneSent {
+				// 正常终止不注入任何 tool_call，直接 seal 结束。
+				if !doneSent {
 					if sawTool && !toolDone {
 						w.Write(lengthChunk(model))
 					} else {
@@ -735,9 +731,16 @@ func lengthChunk(model string) []byte {
 // idleInject 构造一个「echo 继续」tool_call 事件流：客户端收到后执行 bash echo 继续，
 // 工具循环恢复，而不是被 UpstreamStall 错误打断。
 func idleInject(model string) []byte {
+	return toolInject(model, "call_idle", infIdleArg)
+}
+
+// toolInject 构造一个 tool_call 事件流（delta 带 arguments JSON 字符串），
+// 以 finish_reason=tool_calls + [DONE] 收尾。
+func toolInject(model, callID, arg string) []byte {
+	argJSON, _ := json.Marshal(arg)
 	toolEvt := fmt.Sprintf(
-		`{"id":"idle","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_idle","type":"function","function":{"name":"%s","arguments":%s}}]},"finish_reason":null}]}`,
-		model, infTool, infIdleArg)
+		`{"id":"idle","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"%s","type":"function","function":{"name":"%s","arguments":%s}}]},"finish_reason":null}]}`,
+		model, callID, infTool, argJSON)
 	finishEvt := fmt.Sprintf(
 		`{"id":"idle","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		model)
