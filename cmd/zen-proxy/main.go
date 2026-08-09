@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 
@@ -607,6 +608,29 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, method stri
 	if len(body) > maxRequestBody {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "Request body too large"})
 		return
+	}
+
+	// gzip 请求体: 解压后再转发，并去掉 Content-Encoding 头。
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		zr, gerr := gzip.NewReader(bytes.NewReader(body))
+		if gerr != nil {
+			log.Printf("gzip open error: %v", gerr)
+			writeJSON(w, 400, map[string]any{"error": "Invalid gzip body"})
+			return
+		}
+		body, err = io.ReadAll(io.LimitReader(zr, maxRequestBody+1))
+		zr.Close()
+		if err != nil {
+			log.Printf("gzip read error: %v", err)
+			writeJSON(w, 400, map[string]any{"error": "Invalid gzip body"})
+			return
+		}
+		if len(body) > maxRequestBody {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "Request body too large"})
+			return
+		}
+		log.Printf("gunzip request body: %d bytes", len(body))
+		r.Header.Del("Content-Encoding")
 	}
 
 	isStream := false

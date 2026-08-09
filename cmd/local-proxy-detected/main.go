@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strings"
 	"sync"
@@ -256,6 +257,10 @@ type proxy struct {
 	clientV4 *http.Client
 	clientV6 *http.Client
 
+	// http/1.1 fallback clients (http2 can hang on some paths)
+	clientV4H1 *http.Client
+	clientV6H1 *http.Client
+
 	mode  string // "", "v4", or "v6"
 	v4URL string
 	v6URL string
@@ -397,14 +402,53 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 		}
 
 		t0 := time.Now()
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("%s upstream error: %v", fam, err)
-			lastStatus = 502
-			lastErrBody = map[string]any{"error": map[string]any{"message": err.Error(), "type": "UpstreamError"}}
-			continue
+		var tDial, tTLS, tWrote time.Time
+		var proto string
+		trace := &httptrace.ClientTrace{
+			ConnectDone: func(network, addr string, err error) { tDial = time.Now() },
+			TLSHandshakeDone: func(cs tls.ConnectionState, err error) { tTLS = time.Now() },
+			WroteRequest: func(info httptrace.WroteRequestInfo) { tWrote = time.Now() },
+			GotConn: func(info httptrace.GotConnInfo) { proto = "reused" },
 		}
-		log.Printf("%s upstream %d in %.2fs", fam, resp.StatusCode, time.Since(t0).Seconds())
+		resp, err := doWithTrace(client, req, trace)
+		if err != nil {
+			if strings.Contains(err.Error(), "timeout awaiting response headers") || strings.Contains(err.Error(), "http2") {
+				// http/2 挂起/超时: 用 http/1.1 重试一次 (有些路径 http2 被干扰)
+				log.Printf("%s %s failed: %v (dial=%s tls=%s wrote=%s) -> retry h1", fam, base, err,
+					ms(tDial, t0), ms(tTLS, t0), ms(tWrote, t0))
+				h1c := p.clientV6H1
+				if fam == "v4" {
+					h1c = p.clientV4H1
+				}
+				// 必须重建请求: 原 req 的 Body 已被第一次尝试耗尽/关闭,
+				// 直接复用会报 "ContentLength=X with Body length 0"。
+				retryReq, rerr := http.NewRequest(method, base+zenPath+path, strings.NewReader(bodyStr))
+				if rerr != nil {
+					err = rerr
+				} else {
+					retryReq.Host = zenHost
+					retryReq.Header = req.Header.Clone()
+					t0 = time.Now()
+					tDial, tTLS, tWrote = time.Time{}, time.Time{}, time.Time{}
+					resp, err = doWithTrace(h1c, retryReq, trace)
+					if err == nil {
+						proto += " (h1 retry)"
+					}
+				}
+			}
+			if err != nil {
+				log.Printf("%s upstream error: %v (dial=%s tls=%s wrote=%s)", fam, err,
+					ms(tDial, t0), ms(tTLS, t0), ms(tWrote, t0))
+				lastStatus = 502
+				lastErrBody = map[string]any{"error": map[string]any{"message": err.Error(), "type": "UpstreamError"}}
+				continue
+			}
+		}
+		if resp.Proto != "" {
+			proto = resp.Proto
+		}
+		log.Printf("%s upstream %d in %.2fs proto=%s (dial=%s tls=%s wrote=%s)", fam, resp.StatusCode, time.Since(t0).Seconds(), proto,
+			ms(tDial, t0), ms(tTLS, t0), ms(tWrote, t0))
 
 		if resp.StatusCode != 200 {
 			data, _ := io.ReadAll(resp.Body)
@@ -765,11 +809,31 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func makeClient(endpoint, sniHost string) *http.Client {
+// doWithTrace performs client.Do with an attached ClientTrace, rebuilding the
+// request's context without mutating the caller's request (safe for retries).
+func doWithTrace(client *http.Client, req *http.Request, trace *httptrace.ClientTrace) (*http.Response, error) {
+	req2 := req.Clone(req.Context())
+	req2 = req2.WithContext(httptrace.WithClientTrace(req2.Context(), trace))
+	return client.Do(req2)
+}
+
+// ms renders elapsed time from t0 to t, or "-" if t is zero.
+func ms(t, t0 time.Time) time.Duration {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Sub(t0).Round(time.Millisecond)
+}
+
+func makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
+	tlsCfg := &tls.Config{ServerName: sniHost, InsecureSkipVerify: true}
+	if !forceH2 {
+		tlsCfg.NextProtos = []string{"http/1.1"}
+	}
 	tr := &http.Transport{
 		// Dial the resolved IP directly (no per-request DNS). Skip cert verify
 		// like curl -k (IP dial makes some chains fail even with SNI).
-		TLSClientConfig: &tls.Config{ServerName: sniHost, InsecureSkipVerify: true},
+		TLSClientConfig:       tlsCfg,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 			return d.DialContext(ctx, "tcp", endpoint)
@@ -778,7 +842,7 @@ func makeClient(endpoint, sniHost string) *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   8,
 		TLSHandshakeTimeout:   connectTimeout,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     forceH2,
 	}
 	return &http.Client{Transport: tr}
 }
@@ -811,8 +875,10 @@ func main() {
 		log.Fatalf("no %s address for %s", mode, zenHost)
 	}
 	p := &proxy{
-		clientV4: makeClient(net.JoinHostPort(v4, "443"), zenHost),
-		clientV6: makeClient(net.JoinHostPort(v6, "443"), zenHost),
+		clientV4: makeClient(net.JoinHostPort(v4, "443"), zenHost, true),
+		clientV6: makeClient(net.JoinHostPort(v6, "443"), zenHost, true),
+		clientV4H1: makeClient(net.JoinHostPort(v4, "443"), zenHost, false),
+		clientV6H1: makeClient(net.JoinHostPort(v6, "443"), zenHost, false),
 		mode:     mode,
 		v4URL:    "https://" + v4,
 		v6URL:    "https://[" + v6 + "]",

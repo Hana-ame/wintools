@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -574,10 +575,31 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 	}
 	var req *http.Request
 	var err error
-	req, err = http.NewRequest(method, u.base+path, strings.NewReader(bodyStr))
-	if err != nil {
-		log.Printf("req=%d %s: new request failed: %v", reqID, u.name, err)
-		return false
+	// 请求体 gzip 压缩后转发（zen-proxy 会解压），压缩失败则按原文发送。
+	if hasBody {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, werr := zw.Write([]byte(bodyStr)); werr == nil && zw.Close() == nil {
+			bodyStr = buf.String()
+			req, err = http.NewRequest(method, u.base+path, strings.NewReader(bodyStr))
+			if err != nil {
+				log.Printf("req=%d %s: new request failed: %v", reqID, u.name, err)
+				return false
+			}
+			req.Header.Set("Content-Encoding", "gzip")
+		} else {
+			req, err = http.NewRequest(method, u.base+path, strings.NewReader(bodyStr))
+			if err != nil {
+				log.Printf("req=%d %s: new request failed: %v", reqID, u.name, err)
+				return false
+			}
+		}
+	} else {
+		req, err = http.NewRequest(method, u.base+path, nil)
+		if err != nil {
+			log.Printf("req=%d %s: new request failed: %v", reqID, u.name, err)
+			return false
+		}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	proxyheaders.ForwardRequestHeaders(req.Header, head)
@@ -585,7 +607,7 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, method, bodyStr
 		req.Header.Set("Authorization", a)
 	}
 
-	log.Printf("req=%d %s: connecting...", reqID, u.name)
+	log.Printf("req=%d %s: connecting... (gzip_body=%v)", reqID, u.name, req.Header.Get("Content-Encoding") == "gzip")
 	resp, err := u.client.Do(req)
 	if err != nil {
 		log.Printf("req=%d %s: connect failed: %T %v", reqID, u.name, err, err)

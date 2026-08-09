@@ -1,5 +1,10 @@
 # Changelog — v1.7.x
 
+## v1.7.7 (2026-08-10)
+- **zen-multi**: 转发给 zen-proxy 的请求体 gzip 压缩并带 `Content-Encoding: gzip`(压缩失败自动 fallback 明文)。
+- **zen-proxy**: 收到 `Content-Encoding: gzip` 请求体时解压并去掉该头再转发;解压前后均有体积限制。
+- **local-proxy-detected**: 请求级 httptrace 阶段日志(`dial/tls/wrote` 耗时 + proto);http2 响应头超时自动用 HTTP/1.1 重试一次(重建请求,修复复用耗尽 Body 导致 `ContentLength=X with Body length 0` 的 bug)。
+
 ## v1.7.6 (2026-08-09)
 - **zen-proxy**: 新增第 7 位置参数 `mode`(`http`/`https`/空=自动),显式选择监听协议;`https` 时强制要求 cert/key,`http` 忽略 cert/key。
 
