@@ -962,6 +962,10 @@ func main() {
 	if len(os.Args) > 6 {
 		serverID = os.Args[6]
 	}
+	mode := ""
+	if len(os.Args) > 7 {
+		mode = os.Args[7]
+	}
 
 	s := &server{
 		zenURL:   "https://" + zenHost + zenPath,
@@ -981,9 +985,22 @@ func main() {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	log.Printf("Zen proxy on %s://%s (timeout=%s)", proto, listen, stallTimeout)
+	serveTLS := false
+	switch mode {
+	case "https":
+		if cert == "" || key == "" {
+			log.Fatal("https mode requires cert and key")
+		}
+		serveTLS = true
+	case "http":
+		serveTLS = false
+	default:
+		serveTLS = cert != "" && key != ""
+	}
+
+	log.Printf("Zen proxy on %s://%s (timeout=%s, mode=%s)", proto, listen, stallTimeout, mode)
 	var err error
-	if cert != "" && key != "" {
+	if serveTLS {
 		proto = "https"
 		log.Printf("Zen proxy on https://%s (timeout=%s)", listen, stallTimeout)
 		err = srv.ListenAndServeTLS(cert, key)
