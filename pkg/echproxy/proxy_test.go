@@ -7,6 +7,29 @@ import (
 	"time"
 )
 
+// TestCopyHeadersKeepsSetCookie 验证响应头透传时 Set-Cookie 不被剥掉
+// （cookie 必须原样回给浏览器/进入内存 jar）。
+func TestCopyHeadersKeepsSetCookie(t *testing.T) {
+	dst := http.Header{}
+	src := http.Header{}
+	src.Add("Set-Cookie", "sid=abc123; Path=/; HttpOnly")
+	src.Add("Set-Cookie", "theme=dark; Path=/")
+	src.Add("Connection", "close") // hop-by-hop 头应被剔除
+	src.Add("Content-Type", "text/html")
+
+	copyHeaders(dst, src)
+
+	if got := dst.Values("Set-Cookie"); len(got) != 2 {
+		t.Fatalf("Set-Cookie 透传丢失: %v", got)
+	}
+	if dst.Get("Content-Type") != "text/html" {
+		t.Fatalf("普通头丢失: %v", dst)
+	}
+	if dst.Get("Connection") != "" {
+		t.Fatalf("hop-by-hop 头未剔除: %v", dst)
+	}
+}
+
 // TestMemJar 验证内存 cookie jar：Set-Cookie 存取、过期清理、与客户端 cookie 合并。
 func TestMemJar(t *testing.T) {
 	cookieMu.Lock()
