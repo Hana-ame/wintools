@@ -66,7 +66,12 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --generate-notes
+        run: |
+          {
+            echo "## 每个 exe 的功能"
+            cat RELEASE.md
+          } > release_body.md
+          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md
 
       - name: Upload assets
         env:
