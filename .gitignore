@@ -1,0 +1,23 @@
+.last_upload_url
+
+*.exe
+# build artifacts (at repo root)
+/ech-proxy
+/localdns
+/signaling-server
+/wintools
+/peer-client
+/api-server
+/message-signal
+/local-proxy
+/local-proxy-detected
+/zen-multi
+/zen-proxy
+/webrtc-demo
+# leftover foreign js chunks at repo root (origin unknown, untracked)
+/[0-9a-f]*.js
+/layout.js
+/main-app.js
+/page.js
+
+cmd/ip-proxy/client.json

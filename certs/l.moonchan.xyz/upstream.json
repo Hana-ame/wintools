@@ -1,0 +1,63 @@
+{
+    "cert_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/fullchain.cer?proxy_host=raw.githubusercontent.com",
+    "key_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/privkey.pem?proxy_host=raw.githubusercontent.com",
+    "upstreams": {
+        "l.moonchan.xyz": {
+            "host": "reminder.moonchan.xyz",
+            "mode": "direct"
+        },
+        "twimg.l.moonchan.xyz": {
+            "host": "video-cf.twimg.com",
+            "referer": "https://x.com"
+        },
+        "ex.l.moonchan.xyz": {
+            "host": "exhentai.org"
+        },
+        "sukebei.l.moonchan.xyz": {
+            "host": "sukebei.nyaa.si",
+            "mode": "sni"
+        },
+        "ao3.l.moonchan.xyz": {
+            "host": "archiveofourown.org"
+        },
+        "iwara.l.moonchan.xyz": {
+            "host": "iwara.tv",
+            "rewrites": {
+                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
+                "files.iwara.tv": "iwara-files.l.moonchan.xyz"
+            }
+        },
+        "iwara-api.l.moonchan.xyz": {
+            "host": "api.iwara.tv"
+        },
+        "iwara-files.l.moonchan.xyz": {
+            "host": "files.iwara.tv",
+            "mode": "sni"
+        },
+        "pixiv.l.moonchan.xyz": {
+            "host": "www.pixiv.net",
+            "rewrites": {
+                "www.pixiv.net": "pixiv.l.moonchan.xyz",
+                "pixiv.net": "pixiv.l.moonchan.xyz",
+                "app-api.pixiv.net": "pixiv-api.l.moonchan.xyz",
+                "oauth.secure.pixiv.net": "pixiv-oauth.l.moonchan.xyz",
+                "i.pximg.net": "pixiv-img.l.moonchan.xyz",
+                "s.pximg.net": "pixiv-img.l.moonchan.xyz"
+            }
+        },
+        "pixiv-api.l.moonchan.xyz": {
+            "host": "app-api.pixiv.net"
+        },
+        "pixiv-oauth.l.moonchan.xyz": {
+            "host": "oauth.secure.pixiv.net"
+        },
+        "pixiv-img.l.moonchan.xyz": {
+            "host": "i.pximg.net",
+            "mode": "sni",
+            "referer": "https://www.pixiv.net/"
+        },
+        "zen.l.moonchan.xyz": {
+            "host": "opencode.ai"
+        }
+    }
+}

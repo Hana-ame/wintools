@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, windows]
+        arch: [amd64, aarch64]
+        exclude:
+          - os: windows
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build all cmds (static, CGO off for old-glibc/Termux)
+        run: |
+          for cmd in cmd/*/; do
+            name=$(basename "$cmd")
+            # skip CGo shared library (needs C cross-compiler)
+            [ "$name" = "ech-shared" ] && continue
+            ext=""
+            [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+            mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
+            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} CGO_ENABLED=0 \
+               go build -trimpath -ldflags="-s -w" \
+               -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
+          done
+          # scripts/*.go 单文件工具（无 .go 时跳过, 目录可能已清空）
+          for script in scripts/*.go; do
+            [ -f "$script" ] || continue
+            name=$(basename "$script" .go)
+            ext=""
+            [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+            mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
+            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} CGO_ENABLED=0 \
+               go build -trimpath -ldflags="-s -w" \
+               -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${script}"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/${{ matrix.os }}/${{ matrix.arch }}/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## 每个 exe 的功能"
+            cat RELEASE.md
+          } > release_body.md
+          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find dist -type f | while read -r f; do
+            filename=$(basename "$f")
+            label="${filename}"
+            echo "Uploading: $label"
+            gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
+          done
