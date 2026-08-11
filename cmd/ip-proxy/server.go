@@ -8,9 +8,16 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+)
+
+// opencode.ai 访问量统计: 总 CONNECT 次数 + 每分钟增量。
+var (
+	statsTotal atomic.Int64
+	statsMin   atomic.Int64
 )
 
 func runServer(args []string) {
@@ -27,6 +34,13 @@ func runServer(args []string) {
 	mux.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
 		handleServerConn(w, r, *force)
 	})
+	// /status: opencode.ai 访问量统计 (本分钟 + 累计)
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(200)
+		fmt.Fprintf(w, `{"opencode_conns": %d, "last_minute": %d}`, statsTotal.Load(), statsMin.Load())
+	})
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -35,6 +49,23 @@ func runServer(args []string) {
 	}
 	// 纯 ws 监听, wss 由外层 nginx 终止 TLS 后反代到本端口。
 	log.Printf("server 监听 ws://%s (force=%s), WS 路径 /connect?target=host:port", *listen, *force)
+	// 每分钟打印本分钟增量; 每天 UTC+0 00:00 重置当天计数。
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			log.Printf("opencode.ai 访问量: 本分钟 %d 次, 当天 %d 次", statsMin.Swap(0), statsTotal.Load())
+		}
+	}()
+	go func() {
+		for {
+			now := time.Now().UTC()
+			next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+			time.Sleep(time.Until(next))
+			log.Printf("UTC+0 00:00: 当天 opencode.ai 访问量 %d 次, 重置", statsTotal.Load())
+			statsTotal.Store(0)
+			statsMin.Store(0)
+		}
+	}()
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
@@ -65,7 +96,9 @@ func handleServerConn(w http.ResponseWriter, r *http.Request, force string) {
 
 	conn := websocket.NetConn(context.Background(), ws, websocket.MessageBinary)
 	defer conn.Close()
-	log.Printf("CONNECT %s -> %s (force=%s) established via ws", target, upstream.RemoteAddr(), force)
+	statsTotal.Add(1)
+	statsMin.Add(1)
+	log.Printf("CONNECT %s -> %s (force=%s) established via ws (累计 %d)", target, upstream.RemoteAddr(), force, statsTotal.Load())
 	relay(conn, upstream)
 }
 

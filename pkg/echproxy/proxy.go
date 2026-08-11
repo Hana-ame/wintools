@@ -102,10 +102,12 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
-// copyHeaders 复制 src 的请求/响应头到 dst，剔除逐跳头。
+// copyHeaders 复制 src 的请求/响应头到 dst，剔除逐跳头与上游 CORS 头
+// （CORS 由本代理自定，透传会与 CORSMiddleware 产生重复冲突头）。
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
-		if isHopByHop(k) {
+		l := strings.ToLower(k)
+		if isHopByHop(k) || strings.HasPrefix(l, "access-control-") {
 			continue
 		}
 		for _, v := range vs {
