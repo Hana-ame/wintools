@@ -6,18 +6,24 @@ opencode.ai 免费 zen 端点的代理栈，纯 Go 实现，替代原先的 Pyth
 ## 架构
 
 ```
-pi / opencode ──> local zen-multi :8443 ──> zen-proxy (vps / bwh / cloudcone) :8443 ──> opencode.ai/zen/v1
-                                                       │
-                  local local-proxy :11434 (Ollama 端口, OpenAI 协议) ── 直接转发多源 ──┘
+opencode ──> zen-multi :8443 ──> capture-proxy A :8000 (v4/v6/auto) ──> opencode.ai/zen/v1
+                          │
+                          └──────> capture-proxy B :8001 (v4/v6/auto) ──> opencode.ai/zen/v1
 ```
 
+- **capture-proxy**（本地，`scripts/capture_proxy.go`）：双栈 (v4/v6) 转发代理。
+  抓取每个客户端请求到文件、伪装 opencode client（opencode UA + x-opencode-* +
+  X-Session-Id，缺失时补齐，否则上游 Cloudflare 会 hang）、gzip 请求体解压、
+  模式开关 auto/v4/v6 经 `/mode` API 控制（双栈 = 双 IP 额度）、SSE 预读 +
+  stall 检测 + 工具流保护 + 意外中断注入 `echo 继续`。与 zen-proxy 仅监听侧
+  证书不同（本地默认 HTTP，`--cert/--key` 可起 TLS）。用 `--flags` 配置。
+- **zen-multi**（本地）：聚合多个 capture_proxy 实例，`--source name=base` 指定。
+  失败自动 failover + cooldown，提供 "inf loop" 工具调用注入（`deepseek-v4-flash-inf`
+  模型），`/mode` 一个开关同步所有源的模式。用 `--flags` 配置。
 - **zen-proxy**（远程，每台服务器一个）：直接连 `opencode.ai`，负责上游转发。
   v6/v4 双栈 failover、FreeUsageLimitError cooldown（到 UTC 午夜）、
   keep-alive 注释过滤、token 节奏 stall 检测（首 token 后 10s/token；工具调用期间 180s）、
   每客户端限流/封禁。
-- **zen-multi**（本地）：聚合 bwh/vps/cloudcone 三个 zen-proxy，
-  失败自动 failover + cooldown，并提供 "inf loop" 工具调用注入
-  （`deepseek-v4-flash-inf` 模型）。提供 `/v1/models`、`/status`。
 - **local-proxy**（本地，`cmd/local-proxy-detected`）：Ollama 兼容端口 `11434` 的本地转发器。
   单二进制双模式，第 4 个参数切换：
   - **detected**（默认）：流检测——预读等首包 30s、首 token 后 10s/token 节奏、
@@ -73,10 +79,18 @@ RestartSec=3
 CGO_ENABLED=0 go build -o /usr/local/bin/zen_multi_go ./cmd/zen-multi/
 ```
 
-systemd `zen-multi.service`：`ExecStart=/usr/local/bin/zen_multi_go 127.0.0.1 8443`
+systemd `zen-multi.service`：`ExecStart=/usr/local/bin/zen_multi_go --listen 127.0.0.1:8443 --source cp1=http://127.0.0.1:8000`
 
-上游源在 `cmd/zen-multi/main.go` 的 `upList` 中配置
-（`https://{bwh,vps,cloudcone}.moonchan.xyz:8443`）。
+上游 capture_proxy 在启动参数 `--source name=base` 中配置（可重复，聚合多个实例）。
+
+### capture-proxy（本地）
+
+```bash
+CGO_ENABLED=0 go build -o capture_proxy ./scripts/capture_proxy.go
+./capture_proxy --listen 0.0.0.0:8000 --mode auto --out /tmp/opencode/captured
+```
+
+`--mode auto|v4|v6` 运行中可经 `POST /mode?mode=v4` 切换；`/status` 看 cooldown/统计。
 
 ### local-proxy（可选，两版）
 
@@ -92,9 +106,13 @@ systemd `zen-multi.service`：`ExecStart=/usr/local/bin/zen_multi_go 127.0.0.1 8
 |------|------|------|
 | zen-proxy `/chat/completions`、`/v1/chat/completions` | POST | 转发到 opencode.ai |
 | zen-proxy `/status` | GET | cooldown / banned / goroutines / 分 v4/v6 用量统计 |
-| zen-multi `/v1/chat/completions` | POST | 多源 failover + inf 注入 |
+| zen-multi `/v1/chat/completions` | POST | 多 capture_proxy failover + inf 注入 |
 | zen-multi `/v1/models` | GET | 模型列表 |
-| zen-multi `/status` | GET | 各源 cooldown / reqs |
+| zen-multi `/status` | GET | 各源 cooldown / reqs / base |
+| zen-multi `/mode` | GET/POST | 查看 / 切换所有源 v4/v6/auto 模式 |
+| capture-proxy `/v1/chat/completions`、`/v1/models` | POST/GET | 双栈 v4/v6 转发 + 伪装 opencode client |
+| capture-proxy `/mode` | GET/POST | 查看 / 切换该实例 v4/v6/auto 模式 |
+| capture-proxy `/status` | GET | cooldown / 分栈统计 |
 | local-proxy（两版）`/v1/chat/completions`、`/v1/models` | POST/GET | 请求级多源转发；detected 版额外带流检测 |
 
 ### 用量统计（zen-proxy `/status`）
@@ -166,7 +184,9 @@ data: [DONE]
 
 ## Header 透传
 
-三个代理统一使用共享包 `pkg/proxyheaders` 做 header 转发，规则保持一致：
+各代理统一使用共享包 `pkg/proxyheaders` 做 header 转发，规则保持一致：
+capture-proxy 额外在缺失时补齐 opencode client 特征头（opencode UA、`x-opencode-*`、
+`X-Session-Id`/`X-Session-Affinity`），否则上游 Cloudflare 会 hang 而非返回。
 
 - **上行（客户端 → 上游）**：`ForwardRequestHeaders(req.Header, r.Header)` 透传客户端
   安全 header（User-Agent、Accept、Cookie、Origin、Content-Type 之外的自定义头等）；
@@ -184,7 +204,7 @@ data: [DONE]
 
 ## 实现约束
 
-三个 Go 代理共享以下实现约束（改动时需保持一致）：
+Go 代理共享以下实现约束（改动时需保持一致）：
 
 - **SSE 提交后禁止 failover**：`forwardStream` 一旦 `WriteHeader(200)` + flush 首包，
   后续任何失败（stall / mid-stream 错误 / 客户端断开）都不允许再切换到下一个源，

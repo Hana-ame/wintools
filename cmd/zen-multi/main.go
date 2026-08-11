@@ -7,13 +7,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -123,6 +123,29 @@ func (u *upstream) incrReqs() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.reqs++
+}
+
+// setMode 通过 capture_proxy 的 /mode API 切换该源的模式 (v4|v6|auto)。
+func (u *upstream) setMode(mode string) error {
+	if u.client == nil {
+		return fmt.Errorf("no http client")
+	}
+	body := strings.NewReader(`{"mode":"` + mode + `"}`)
+	req, err := http.NewRequest("POST", u.base+"/mode", body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return nil
 }
 
 // ---- SSE helpers (shared with zen_proxy.go) --------------------------------
@@ -450,11 +473,9 @@ func resolveModel(model string) (forced string, resolved string) {
 	return "", model
 }
 
-var upList = []*upstream{
-	{name: "bwh", base: "https://bwh.moonchan.xyz:8443"},
-	{name: "vps", base: "https://vps.moonchan.xyz:8443"},
-	{name: "cloudcone", base: "https://c.moonchan.xyz:8443"},
-}
+// upList 聚合多个 capture_proxy 实例 (本地 :8000 等), 每个实例可独立
+// v4/v6/auto 模式。默认一个本地 capture_proxy; 可用 --source name=base 追加。
+var upList = []*upstream{}
 
 func sourceModels() []map[string]any {
 	models := []map[string]any{
@@ -472,19 +493,51 @@ func sourceModels() []map[string]any {
 // server carries per-instance state (currently stateless).
 type server struct{}
 
+var errTooLarge = fmt.Errorf("request body too large")
+
+// readBody 读取请求体并处理 gzip: Content-Encoding: gzip 时先解压再解析。
+func readBody(r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxRequestBody {
+		return nil, errTooLarge
+	}
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		zr, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("invalid gzip body: %w", err)
+		}
+		defer zr.Close()
+		out, err := io.ReadAll(io.LimitReader(zr, maxRequestBody+1))
+		if err != nil {
+			return nil, fmt.Errorf("gzip read: %w", err)
+		}
+		if len(out) > maxRequestBody {
+			return nil, errTooLarge
+		}
+		log.Printf("req gunzip body: %d -> %d bytes", len(body), len(out))
+		return out, nil
+	}
+	return body, nil
+}
+
 // reqSeq 为每个请求生成递增序号，贯穿所有日志，方便并发请求下的追踪。
 var reqSeq atomic.Uint64
 
 func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	reqID := reqSeq.Add(1)
 	log.Printf("req=%d -> %s %s", reqID, r.Method, r.URL.Path)
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
+	body, err := readBody(r)
 	if err != nil {
-		writeJSON(w, 400, map[string]any{"error": "Bad Request"})
-		return
-	}
-	if len(body) > maxRequestBody {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "Request body too large"})
+		status := 400
+		msg := "Bad Request"
+		if err == errTooLarge {
+			status = http.StatusRequestEntityTooLarge
+			msg = "Request body too large"
+		}
+		writeJSON(w, status, map[string]any{"error": msg})
 		return
 	}
 
@@ -514,7 +567,7 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		isStream, _ = payload["stream"].(bool)
 		re, _ := json.Marshal(payload)
 		bodyStr = string(re)
-		log.Printf("req=%d model=%v src=%v stream=%v tools=%d can_inject=%v recoverable=%v", reqID, payload["model"], forced, isStream, len(toolsOf(payload)), canInject, recoverable)
+		log.Printf("req=%d model=%v src=%v stream=%v max_tokens=%v tools=%d can_inject=%v recoverable=%v", reqID, payload["model"], forced, isStream, payload["max_tokens"], len(toolsOf(payload)), canInject, recoverable)
 	}
 
 	lastErrBody := any(nil)
@@ -1021,9 +1074,66 @@ func (s *server) handlerMulti() http.Handler {
 			}
 			srcs[u.name] = map[string]any{"cooldown_sec": int(cd), "reqs": reqs, "last_err": lastErr,
 				"in_tokens": inTok, "out_tokens": outTok,
-				"cache_hit_tokens": cacheHit, "cache_miss_tokens": cacheMiss}
+				"cache_hit_tokens": cacheHit, "cache_miss_tokens": cacheMiss,
+				"base": u.base}
 		}
 		writeJSON(w, 200, map[string]any{"status": "ok", "sources": srcs})
+	})
+	// 模式控制: 聚合多个 capture_proxy, 一个开关同步到所有源。
+	//   POST /mode?mode=v4|v6|auto   切换所有源的模式
+	//   POST /mode  body {"mode":"v6"}
+	//   GET  /mode                   返回当前各源模式 + 上游 cooldown
+	mux.HandleFunc("/mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			writeJSON(w, 204, map[string]any{})
+			return
+		}
+		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+			m := r.URL.Query().Get("mode")
+			if m == "" {
+				if b, err := io.ReadAll(io.LimitReader(r.Body, 4096)); err == nil && len(b) > 0 {
+					var v struct {
+						Mode string `json:"mode"`
+					}
+					if json.Unmarshal(b, &v) == nil {
+						m = v.Mode
+					}
+				}
+			}
+			if m == "" {
+				writeJSON(w, 400, map[string]any{"error": "mode required (v4|v6|auto)"})
+				return
+			}
+			if m != "v4" && m != "v6" && m != "auto" {
+				writeJSON(w, 400, map[string]any{"error": "mode must be v4|v6|auto"})
+				return
+			}
+			fail := 0
+			for _, u := range upList {
+				if err := u.setMode(m); err != nil {
+					log.Printf("%s setMode %s: %v", u.name, m, err)
+					fail++
+				} else {
+					log.Printf("%s mode -> %s", u.name, m)
+				}
+			}
+			if fail > 0 && fail == len(upList) {
+				writeJSON(w, 502, map[string]any{"error": "all sources failed to switch mode"})
+				return
+			}
+		}
+		now := time.Now()
+		srcs := map[string]any{}
+		for _, u := range upList {
+			u.mu.Lock()
+			cd := u.cooldownUntil.Sub(now).Seconds()
+			u.mu.Unlock()
+			if cd < 0 {
+				cd = 0
+			}
+			srcs[u.name] = map[string]any{"base": u.base, "cooldown_sec": int(cd)}
+		}
+		writeJSON(w, 200, map[string]any{"status": "ok", "mode": "aggregated", "sources": srcs})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
@@ -1038,13 +1148,32 @@ func (s *server) handlerMulti() http.Handler {
 }
 
 func main() {
-	host := "127.0.0.1"
-	port := 8443
-	if len(os.Args) > 1 {
-		host = os.Args[1]
+	// --flags 而非 argv
+	listen := flag.String("listen", "127.0.0.1:8443", "监听地址")
+	var sources arrayFlags
+	flag.Var(&sources, "source", "上游 capture_proxy, 格式 name=base (可重复)。默认 cp1=http://127.0.0.1:8000")
+	flag.Parse()
+
+	if len(sources) == 0 {
+		sources = []string{"cp1=http://127.0.0.1:8000"}
 	}
-	if len(os.Args) > 2 {
-		fmt.Sscanf(os.Args[2], "%d", &port)
+
+	for _, src := range sources {
+		name, base, ok := strings.Cut(src, "=")
+		if !ok {
+			log.Fatalf("invalid --source %q: want name=base", src)
+		}
+		name = strings.TrimSpace(name)
+		base = strings.TrimRight(strings.TrimSpace(base), "/")
+		if name == "" || base == "" {
+			log.Fatalf("invalid --source %q: name and base required", src)
+		}
+		upList = append(upList, &upstream{name: name, base: base})
+	}
+
+	host, port, err := net.SplitHostPort(*listen)
+	if err != nil {
+		log.Fatalf("invalid --listen %q: %v", *listen, err)
 	}
 
 	for _, u := range upList {
@@ -1061,17 +1190,29 @@ func main() {
 
 	s := &server{}
 	srv := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", host, port),
+		Addr:              net.JoinHostPort(host, port),
 		Handler:           s.handlerMulti(),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 	names := make([]string, 0, len(upList))
 	for _, u := range upList {
-		names = append(names, u.name)
+		names = append(names, u.name+"@"+u.base)
 	}
 	log.Printf("Zen multi proxy sources: %s", strings.Join(names, ", "))
-	log.Printf("Listening on %s:%d", host, port)
+	log.Printf("Listening on %s", *listen)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// arrayFlags 支持重复 --source 参数。
+type arrayFlags []string
+
+func (a *arrayFlags) String() string {
+	return strings.Join(*a, ",")
+}
+
+func (a *arrayFlags) Set(v string) error {
+	*a = append(*a, v)
+	return nil
 }
