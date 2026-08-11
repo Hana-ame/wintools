@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -34,6 +34,10 @@ const embeddedConfig = `{
     },
     "ex.l.moonchan.xyz": {
         "host": "exhentai.org"
+    },
+    "sukebei.l.moonchan.xyz": {
+        "host": "sukebei.nyaa.si",
+        "mode": "sni"
     },
     "zen.l.moonchan.xyz": {
         "host": "opencode.ai"
@@ -97,11 +101,6 @@ func main() {
 		c.String(200, "ok")
 	})
 
-	r.GET("/", func(c *gin.Context) {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(200, chatHTML)
-	})
-
 	zenAPIKey := os.Getenv("ZEN_API_KEY")
 	if zenAPIKey == "" {
 		zenAPIKey = "public"
@@ -122,36 +121,39 @@ func main() {
 
 	var upstreamCfg echproxy.UpstreamMap
 	var upstreamHandler gin.HandlerFunc
+	var tlsCert *tls.Certificate
 
 	if *httpMode {
 		if err := json.Unmarshal([]byte(embeddedConfig), &upstreamCfg); err != nil {
 			log.Fatalf("解析内置上游配置失败: %v", err)
 		}
 		log.Printf("内置上游配置加载成功: %d 条规则", len(upstreamCfg))
-
-		for domain, uc := range upstreamCfg {
-			if uc.Host == "video-cf.twimg.com" {
-				upstreamHandler = localProxyHandler(upstreamCfg, domain)
-				break
-			}
-		}
+		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
 	} else {
+		// 全部配置（证书、密钥、上游规则）每次启动经 proxy.moonchan.xyz
+		// 拉取到内存，不落盘，避免路径/权限兼容性问题。
 		proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
 		certURL := fmt.Sprintf(proxyBase, *cert)
 		keyURL := fmt.Sprintf(proxyBase, *key)
 		upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
 
-		log.Printf("正在下载证书: %s", certURL)
-		if err := echproxy.DownloadFile(*cert, certURL); err != nil {
-			log.Fatalf("下载证书失败: %v", err)
+		log.Printf("正在拉取证书: %s", certURL)
+		certPEM, err := echproxy.FetchBytes(certURL)
+		if err != nil {
+			log.Fatalf("拉取证书失败: %v", err)
 		}
-		log.Printf("正在下载密钥: %s", keyURL)
-		if err := echproxy.DownloadFile(*key, keyURL); err != nil {
-			log.Fatalf("下载密钥失败: %v", err)
+		log.Printf("正在拉取密钥: %s", keyURL)
+		keyPEM, err := echproxy.FetchBytes(keyURL)
+		if err != nil {
+			log.Fatalf("拉取密钥失败: %v", err)
 		}
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			log.Fatalf("解析证书密钥失败: %v", err)
+		}
+		tlsCert = &cert
 
 		log.Printf("正在加载上游配置: %s", upstreamConfigURL)
-		var err error
 		upstreamCfg, err = echproxy.LoadConfig(upstreamConfigURL)
 		if err != nil {
 			log.Fatalf("加载上游配置失败: %v", err)
@@ -160,6 +162,23 @@ func main() {
 
 		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
 	}
+
+	r.GET("/", func(c *gin.Context) {
+		host := c.Request.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if host == "zen.l.moonchan.xyz" {
+			zenHandler(c)
+			return
+		}
+		if _, ok := upstreamCfg[host]; ok {
+			upstreamHandler(c)
+			return
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(200, chatHTML)
+	})
 
 	r.NoRoute(func(c *gin.Context) {
 		host := c.Request.Host
@@ -192,7 +211,11 @@ func main() {
 			fmt.Printf("  域名: %s -> opencode.ai (Zen API 直连)\n", d)
 		} else {
 			uc := upstreamCfg[d]
-			fmt.Printf("  域名: %s -> %s", d, uc.Host)
+			mode := "ECH"
+			if uc.Mode == "sni" {
+				mode = "SNI 伪装"
+			}
+			fmt.Printf("  域名: %s -> %s (%s)", d, uc.Host, mode)
 			if uc.Referer != "" {
 				fmt.Printf(" (referer: %s)", uc.Referer)
 			}
@@ -205,54 +228,23 @@ func main() {
 		if err := r.Run(*addr); err != nil {
 			log.Fatalf("启动失败: %v", err)
 		}
-	} else {
-		r.RunTLS(*addr, *cert, *key)
+		return
 	}
-}
 
-func localProxyHandler(cfg echproxy.UpstreamMap, domain string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		uc := cfg[domain]
-
-		clientIP := c.ClientIP()
-		method := c.Request.Method
-		rawPath := c.Request.URL.RequestURI()
-
-		upstreamURL := fmt.Sprintf("https://%s%s", uc.Host, rawPath)
-
-		log.Printf("[%s] %s %s -> %s", clientIP, method, rawPath, upstreamURL)
-
-		outReq, err := http.NewRequest(method, upstreamURL, c.Request.Body)
-		if err != nil {
-			log.Printf("[%s] 创建请求失败: %v", clientIP, err)
-			c.String(http.StatusInternalServerError, "创建请求失败: %v", err)
-			return
-		}
-
-		for k, vs := range c.Request.Header {
-			for _, v := range vs {
-				outReq.Header.Add(k, v)
-			}
-		}
-		if uc.Referer != "" {
-			outReq.Header.Set("Referer", uc.Referer)
-		}
-		outReq.Host = uc.Host
-
-		resp, err := cloudflare_ech.Do(outReq)
-		if err != nil {
-			log.Printf("[%s] ECH 请求失败: %v", clientIP, err)
-			c.String(http.StatusBadGateway, "上游请求失败: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		for k, vs := range resp.Header {
-			for _, v := range vs {
-				c.Header(k, v)
-			}
-		}
-		c.Status(resp.StatusCode)
-		io.Copy(c.Writer, resp.Body)
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("监听失败: %v", err)
+	}
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: r,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{*tlsCert},
+			MinVersion:   tls.VersionTLS12,
+		},
+	}
+	tlsLn := tls.NewListener(ln, srv.TLSConfig)
+	if err := srv.Serve(tlsLn); err != nil {
+		log.Fatalf("启动失败: %v", err)
 	}
 }
