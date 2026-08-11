@@ -3,6 +3,8 @@
 package echproxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -12,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,10 +28,14 @@ import (
 // Mode 为 "" / "ech" 时走 ECH 域前置（要求目标在 Cloudflare 后面），
 // 为 "sni" 时走 SNI 伪装直连（DoH 解析真实 IP + 假 SNI + Host 路由，
 // 用于不在 Cloudflare 后面、仅被 SNI 阻断的站点）。
+// Rewrites 非空时启用响应域名替换：key 为真实域名，value 为代理入口域名。
+// 替换应用到响应头（Location/Refresh）与文本 body（html/js/json/xml），
+// 使页面内所有指向真实域名的绝对 URL 都改走代理入口，形成闭环。
 type UpstreamConfig struct {
-	Host    string `json:"host"`
-	Referer string `json:"referer,omitempty"`
-	Mode    string `json:"mode,omitempty"`
+	Host     string            `json:"host"`
+	Referer  string            `json:"referer,omitempty"`
+	Mode     string            `json:"mode,omitempty"`
+	Rewrites map[string]string `json:"rewrites,omitempty"`
 }
 
 // UpstreamMap 按请求域名索引的上游配置集合。
@@ -113,7 +121,66 @@ func isHopByHop(name string) bool {
 	return false
 }
 
+// buildRewriter 预排序替换键（长域名优先，避免子串误伤），返回替换函数。
+// port 非空时追加到替换目标末尾（如 pixiv.l.moonchan.xyz:8443）。
+func buildRewriter(rt map[string]string) func([]byte, string) []byte {
+	keys := make([]string, 0, len(rt))
+	for k := range rt {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
+	return func(body []byte, port string) []byte {
+		for _, k := range keys {
+			target := rt[k]
+			if port != "" && !strings.Contains(target, ":") {
+				target += ":" + port
+			}
+			body = replaceDomainBounded(body, k, target)
+		}
+		return body
+	}
+}
+
+// replaceDomainBounded 把 from 域名替换为 to，要求匹配位置前后都不是
+// 域名组成字符（[a-zA-Z0-9-.]），避免误伤 accounts.pixiv.net、
+// pixiv.net.cn 这类仅子串相同的名字。
+func replaceDomainBounded(body []byte, from, to string) []byte {
+	var out []byte
+	rest := body
+	fromB := []byte(from)
+	toB := []byte(to)
+	for {
+		i := bytes.Index(rest, fromB)
+		if i < 0 {
+			out = append(out, rest...)
+			break
+		}
+		var left, right byte
+		if i > 0 {
+			left = rest[i-1]
+		}
+		if i+len(fromB) < len(rest) {
+			right = rest[i+len(fromB)]
+		}
+		if isDomainChar(left) || isDomainChar(right) {
+			out = append(out, rest[:i+1]...)
+			rest = rest[i+1:]
+			continue
+		}
+		out = append(out, rest[:i]...)
+		out = append(out, toB...)
+		rest = rest[i+len(fromB):]
+	}
+	return out
+}
+
+func isDomainChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' || c == '-' || c == '.'
+}
+
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并通过 ECH 转发。
+// 命中规则的 Rewrites 非空时启用响应域名替换。
 func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -132,6 +199,11 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 			log.Printf("[%s] 未找到上游配置: %s", clientIP, host)
 			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
 			return
+		}
+
+		var rewriter func([]byte, string) []byte
+		if len(uc.Rewrites) > 0 {
+			rewriter = buildRewriter(uc.Rewrites)
 		}
 
 		targetURL := &url.URL{
@@ -158,6 +230,11 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		outReq.Host = uc.Host
 		outReq.ContentLength = c.Request.ContentLength
 
+		// 启用域名替换时只接受 gzip/identity，保证响应可解压（br 无标准库支持）。
+		if rewriter != nil {
+			outReq.Header.Set("Accept-Encoding", "gzip")
+		}
+
 		applyCookies(uc.Host, outReq)
 
 		var resp *http.Response
@@ -182,6 +259,35 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		copyHeaders(c.Writer.Header(), resp.Header)
 		c.Status(resp.StatusCode)
 
+		if rewriter != nil {
+			port := ""
+			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+				port = p
+			}
+			if loc := resp.Header.Get("Location"); loc != "" {
+				c.Writer.Header().Set("Location", string(rewriter([]byte(loc), port)))
+			}
+			if refresh := resp.Header.Get("Refresh"); refresh != "" {
+				c.Writer.Header().Set("Refresh", string(rewriter([]byte(refresh), port)))
+			}
+
+			// 文本响应整体读入 → 解压 → 域名替换 → 原文输出（去掉 Content-Encoding）。
+			// 已知大响应（>8MB）跳过替换，保持流式。
+			if isTextContent(resp.Header.Get("Content-Type")) &&
+				(resp.ContentLength <= 0 || resp.ContentLength <= 8<<20) {
+				if body, err := io.ReadAll(resp.Body); err == nil {
+					if body, err = decompressBody(body, resp.Header.Get("Content-Encoding")); err == nil {
+						body = rewriter(body, port)
+						c.Writer.Header().Del("Content-Encoding")
+						c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+						if _, werr := c.Writer.Write(body); werr == nil {
+							return
+						}
+					}
+				}
+			}
+		}
+
 		// 流式转发（SSE 等）：边读边写并 flush，避免缓冲导致的首字节延迟。
 		buf := make([]byte, 32*1024)
 		for {
@@ -198,6 +304,36 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 				break
 			}
 		}
+	}
+}
+
+// ---- 响应域名替换 ----
+
+// maxRewriteSize 超过该字节数的文本响应不做替换（直接流式透传）。
+const maxRewriteSize = 8 << 20
+
+// isTextContent 判断 Content-Type 是否为可替换的文本类型。
+func isTextContent(ct string) bool {
+	ct = strings.ToLower(ct)
+	return strings.HasPrefix(ct, "text/") ||
+		strings.Contains(ct, "json") ||
+		strings.Contains(ct, "javascript") ||
+		strings.Contains(ct, "xml") ||
+		strings.Contains(ct, "x-www-form-urlencoded")
+}
+
+// decompressBody 按 Content-Encoding 解压响应体，仅支持 gzip/identity。
+func decompressBody(body []byte, encoding string) ([]byte, error) {
+	switch strings.ToLower(encoding) {
+	case "gzip":
+		r, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	default:
+		return body, nil
 	}
 }
 

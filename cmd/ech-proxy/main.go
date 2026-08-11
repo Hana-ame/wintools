@@ -24,26 +24,50 @@ import (
 var chatHTML string
 
 const embeddedConfig = `{
-    "l.moonchan.xyz": {
-        "host": "video-cf.twimg.com",
-        "referer": "https://x.com"
-    },
-    "twimg.l.moonchan.xyz": {
-        "host": "video-cf.twimg.com",
-        "referer": "https://x.com"
-    },
-    "ex.l.moonchan.xyz": {
-        "host": "exhentai.org"
-    },
-    "sukebei.l.moonchan.xyz": {
-        "host": "sukebei.nyaa.si",
-        "mode": "sni"
-    },
-    "ao3.l.moonchan.xyz": {
-        "host": "archiveofourown.org"
-    },
-    "zen.l.moonchan.xyz": {
-        "host": "opencode.ai"
+    "upstreams": {
+        "l.moonchan.xyz": {
+            "host": "video-cf.twimg.com",
+            "referer": "https://x.com"
+        },
+        "twimg.l.moonchan.xyz": {
+            "host": "video-cf.twimg.com",
+            "referer": "https://x.com"
+        },
+        "ex.l.moonchan.xyz": {
+            "host": "exhentai.org"
+        },
+        "sukebei.l.moonchan.xyz": {
+            "host": "sukebei.nyaa.si",
+            "mode": "sni"
+        },
+        "ao3.l.moonchan.xyz": {
+            "host": "archiveofourown.org"
+        },
+        "pixiv.l.moonchan.xyz": {
+            "host": "www.pixiv.net",
+            "rewrites": {
+                "www.pixiv.net": "pixiv.l.moonchan.xyz",
+                "pixiv.net": "pixiv.l.moonchan.xyz",
+                "app-api.pixiv.net": "pixivapi.l.moonchan.xyz",
+                "oauth.secure.pixiv.net": "pixivoauth.l.moonchan.xyz",
+                "i.pximg.net": "pixivimg.l.moonchan.xyz",
+                "s.pximg.net": "pixivimg.l.moonchan.xyz"
+            }
+        },
+        "pixivapi.l.moonchan.xyz": {
+            "host": "app-api.pixiv.net"
+        },
+        "pixivoauth.l.moonchan.xyz": {
+            "host": "oauth.secure.pixiv.net"
+        },
+        "pixivimg.l.moonchan.xyz": {
+            "host": "i.pximg.net",
+            "mode": "sni",
+            "referer": "https://www.pixiv.net/"
+        },
+        "zen.l.moonchan.xyz": {
+            "host": "opencode.ai"
+        }
     }
 }`
 
@@ -125,9 +149,11 @@ func main() {
 	var tlsCert *tls.Certificate
 
 	if *httpMode {
-		if err := json.Unmarshal([]byte(embeddedConfig), &upstreamCfg); err != nil {
+		var cfg echproxy.Config
+		if err := json.Unmarshal([]byte(embeddedConfig), &cfg); err != nil {
 			log.Fatalf("解析内置上游配置失败: %v", err)
 		}
+		upstreamCfg = cfg.Upstreams
 		log.Printf("内置上游配置加载成功: %d 条规则", len(upstreamCfg))
 		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
 	} else {

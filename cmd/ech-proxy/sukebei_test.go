@@ -136,11 +136,11 @@ func TestProxyHandlerSNIMode(t *testing.T) {
 		t.Setenv(k, "")
 	}
 
-	var cfg echproxy.UpstreamMap
+	var cfg echproxy.Config
 	if err := json.Unmarshal([]byte(embeddedConfig), &cfg); err != nil {
 		t.Fatalf("解析 embeddedConfig 失败: %v", err)
 	}
-	uc, ok := cfg["sukebei.l.moonchan.xyz"]
+	uc, ok := cfg.Upstreams["sukebei.l.moonchan.xyz"]
 	if !ok {
 		t.Fatal("embeddedConfig 缺少 sukebei.l.moonchan.xyz")
 	}
@@ -150,7 +150,7 @@ func TestProxyHandlerSNIMode(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.NoRoute(echproxy.ProxyHandler(cfg))
+	r.NoRoute(echproxy.ProxyHandler(cfg.Upstreams))
 	ts := httptest.NewServer(r)
 	defer ts.Close()
 
