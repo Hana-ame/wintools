@@ -787,6 +787,7 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 	buf := pre
 	sawTool := false
 	toolClosed := false
+	finished := false
 	doneSent := false
 	injected := false
 	lastReal := time.Now()
@@ -832,10 +833,14 @@ loop:
 				log.Printf("%s mid-stream error event dropped (recoverable=%v)", fam, recoverable)
 				continue
 			}
-			if fr := eventFinishReason(ev); fr != nil && *fr == "tool_calls" {
-				toolClosed = true
+			if fr := eventFinishReason(ev); fr != nil {
+				finished = true // stop / tool_calls / length 任一都算正常收尾
+				if *fr == "tool_calls" {
+					toolClosed = true
+				}
 			}
 			if bytes.Contains(ev, []byte("data: [DONE]")) {
+				finished = true
 				toolClosed = true
 				doneSent = true
 			}
@@ -853,9 +858,10 @@ loop:
 		select {
 		case m, ok := <-ch:
 			if !ok || m.eof {
-				// EOF 出口收敛: 优先注入; 否则 seal 残缺工具调用; 兜底补 [DONE]。
-				if recoverable && !sawTool && !injected {
-					log.Printf("%s EOF without tool_call -> inject idle (recoverable)", fam)
+				// EOF 出口收敛: 未正常收尾且带 tools 无产出才注入;
+				// 否则 seal 残缺工具调用; 兜底补 [DONE]。
+				if recoverable && !finished && !sawTool && !injected {
+					log.Printf("%s EOF without finish -> inject idle (recoverable)", fam)
 					if err := write(idleInject(model)); err != nil {
 						break loop
 					}
@@ -878,8 +884,8 @@ loop:
 			}
 			if m.err != nil {
 				log.Printf("%s mid-stream error: %v", fam, m.err)
-				if recoverable && !sawTool && !injected {
-					log.Printf("%s stream error without tool_call -> inject idle (recoverable)", fam)
+				if recoverable && !finished && !sawTool && !injected {
+					log.Printf("%s stream error without finish -> inject idle (recoverable)", fam)
 					if err := write(idleInject(model)); err == nil {
 						injected = true
 						doneSent = true
@@ -901,8 +907,8 @@ loop:
 			stall := stallFor(sawTool)
 			if time.Since(lastReal) >= stall {
 				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
-				if recoverable && !sawTool && !injected {
-					log.Printf("%s stall without output -> inject idle (recoverable)", fam)
+				if recoverable && !finished && !sawTool && !injected {
+					log.Printf("%s stall without finish -> inject idle (recoverable)", fam)
 					write(idleInject(model))
 					injected = true
 					doneSent = true
