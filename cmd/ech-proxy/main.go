@@ -60,8 +60,6 @@ func cleanZenPayload(body []byte) ([]byte, error) {
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
-	cert := flag.String("cert", "certs/l.moonchan.xyz/fullchain.cer", "TLS cert file")
-	key := flag.String("key", "certs/l.moonchan.xyz/privkey.pem", "TLS key file")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
 	flag.Parse()
 
@@ -130,20 +128,27 @@ func main() {
 		log.Printf("内置上游配置加载成功: %d 条规则", len(upstreamCfg))
 		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
 	} else {
-		// 全部配置（证书、密钥、上游规则）每次启动经 proxy.moonchan.xyz
-		// 拉取到内存，不落盘，避免路径/权限兼容性问题。
+		// 全部配置每次启动经 proxy.moonchan.xyz 拉取到内存，不落盘。
+		// 证书 URL 与上游路由都写死在 repo 的 upstream.json 配置里，
+		// 证书续期后只需更新该配置指向的 URL。
 		proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
-		certURL := fmt.Sprintf(proxyBase, *cert)
-		keyURL := fmt.Sprintf(proxyBase, *key)
 		upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
 
-		log.Printf("正在拉取证书: %s", certURL)
-		certPEM, err := echproxy.FetchBytes(certURL)
+		log.Printf("正在加载上游配置: %s", upstreamConfigURL)
+		cfg, err := echproxy.LoadConfig(upstreamConfigURL)
+		if err != nil {
+			log.Fatalf("加载上游配置失败: %v", err)
+		}
+		upstreamCfg = cfg.Upstreams
+		log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
+
+		log.Printf("正在拉取证书: %s", cfg.CertPath)
+		certPEM, err := echproxy.FetchBytes(cfg.CertPath)
 		if err != nil {
 			log.Fatalf("拉取证书失败: %v", err)
 		}
-		log.Printf("正在拉取密钥: %s", keyURL)
-		keyPEM, err := echproxy.FetchBytes(keyURL)
+		log.Printf("正在拉取密钥: %s", cfg.KeyPath)
+		keyPEM, err := echproxy.FetchBytes(cfg.KeyPath)
 		if err != nil {
 			log.Fatalf("拉取密钥失败: %v", err)
 		}
@@ -152,13 +157,6 @@ func main() {
 			log.Fatalf("解析证书密钥失败: %v", err)
 		}
 		tlsCert = &cert
-
-		log.Printf("正在加载上游配置: %s", upstreamConfigURL)
-		upstreamCfg, err = echproxy.LoadConfig(upstreamConfigURL)
-		if err != nil {
-			log.Fatalf("加载上游配置失败: %v", err)
-		}
-		log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
 
 		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
 	}

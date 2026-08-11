@@ -1,20 +1,24 @@
 {
-    "l.moonchan.xyz": {
-        "host": "video-cf.twimg.com",
-        "referer": "https://x.com"
-    },
-    "twimg.l.moonchan.xyz": {
-        "host": "video-cf.twimg.com",
-        "referer": "https://x.com"
-    },
-    "ex.l.moonchan.xyz": {
-        "host": "exhentai.org"
-    },
-    "sukebei.l.moonchan.xyz": {
-        "host": "sukebei.nyaa.si",
-        "mode": "sni"
-    },
-    "zen.l.moonchan.xyz": {
-        "host": "opencode.ai"
+    "cert_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/fullchain.cer?proxy_host=raw.githubusercontent.com",
+    "key_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/privkey.pem?proxy_host=raw.githubusercontent.com",
+    "upstreams": {
+        "l.moonchan.xyz": {
+            "host": "video-cf.twimg.com",
+            "referer": "https://x.com"
+        },
+        "twimg.l.moonchan.xyz": {
+            "host": "video-cf.twimg.com",
+            "referer": "https://x.com"
+        },
+        "ex.l.moonchan.xyz": {
+            "host": "exhentai.org"
+        },
+        "sukebei.l.moonchan.xyz": {
+            "host": "sukebei.nyaa.si",
+            "mode": "sni"
+        },
+        "zen.l.moonchan.xyz": {
+            "host": "opencode.ai"
+        }
     }
 }

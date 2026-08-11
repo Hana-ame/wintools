@@ -10,13 +10,17 @@ import (
 )
 
 func TestLoadUpstreamConfig(t *testing.T) {
-	sample := echproxy.UpstreamMap{
-		"twimg.l.moonchan.xyz": {
-			Host:    "video-cf.twimg.com",
-			Referer: "https://x.com",
-		},
-		"ex.l.moonchan.xyz": {
-			Host: "exhentai.org",
+	sample := echproxy.Config{
+		CertPath: "https://example.com/fullchain.cer",
+		KeyPath:  "https://example.com/privkey.pem",
+		Upstreams: echproxy.UpstreamMap{
+			"twimg.l.moonchan.xyz": {
+				Host:    "video-cf.twimg.com",
+				Referer: "https://x.com",
+			},
+			"ex.l.moonchan.xyz": {
+				Host: "exhentai.org",
+			},
 		},
 	}
 
@@ -30,11 +34,11 @@ func TestLoadUpstreamConfig(t *testing.T) {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 
-	if len(cfg) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(cfg))
+	if len(cfg.Upstreams) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(cfg.Upstreams))
 	}
 
-	twimg, ok := cfg["twimg.l.moonchan.xyz"]
+	twimg, ok := cfg.Upstreams["twimg.l.moonchan.xyz"]
 	if !ok {
 		t.Fatal("missing twimg.l.moonchan.xyz")
 	}
@@ -45,7 +49,7 @@ func TestLoadUpstreamConfig(t *testing.T) {
 		t.Errorf("twimg referer = %q, want %q", twimg.Referer, "https://x.com")
 	}
 
-	ex, ok := cfg["ex.l.moonchan.xyz"]
+	ex, ok := cfg.Upstreams["ex.l.moonchan.xyz"]
 	if !ok {
 		t.Fatal("missing ex.l.moonchan.xyz")
 	}
@@ -54,6 +58,13 @@ func TestLoadUpstreamConfig(t *testing.T) {
 	}
 	if ex.Referer != "" {
 		t.Errorf("ex referer = %q, want empty", ex.Referer)
+	}
+
+	if cfg.CertPath != "https://example.com/fullchain.cer" {
+		t.Errorf("cert_path = %q, want URL", cfg.CertPath)
+	}
+	if cfg.KeyPath != "https://example.com/privkey.pem" {
+		t.Errorf("key_path = %q, want URL", cfg.KeyPath)
 	}
 }
 
@@ -71,20 +82,27 @@ func TestLoadUpstreamConfigHTTPError(t *testing.T) {
 
 func TestUpstreamMapRoundtrip(t *testing.T) {
 	raw := `{
-		"a.l.moonchan.xyz": {"host": "example.com", "referer": "https://x.com"},
-		"b.l.moonchan.xyz": {"host": "other.com"}
+		"cert_path": "https://example.com/fullchain.cer",
+		"key_path": "https://example.com/privkey.pem",
+		"upstreams": {
+			"a.l.moonchan.xyz": {"host": "example.com", "referer": "https://x.com"},
+			"b.l.moonchan.xyz": {"host": "other.com"}
+		}
 	}`
-	var cfg echproxy.UpstreamMap
+	var cfg echproxy.Config
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-	if len(cfg) != 2 {
-		t.Fatalf("expected 2, got %d", len(cfg))
+	if len(cfg.Upstreams) != 2 {
+		t.Fatalf("expected 2, got %d", len(cfg.Upstreams))
 	}
-	if cfg["a.l.moonchan.xyz"].Referer != "https://x.com" {
+	if cfg.Upstreams["a.l.moonchan.xyz"].Referer != "https://x.com" {
 		t.Errorf("referer not loaded")
 	}
-	if cfg["b.l.moonchan.xyz"].Referer != "" {
+	if cfg.Upstreams["b.l.moonchan.xyz"].Referer != "" {
 		t.Errorf("expected empty referer")
+	}
+	if cfg.CertPath == "" || cfg.KeyPath == "" {
+		t.Errorf("cert_path/key_path not loaded")
 	}
 }

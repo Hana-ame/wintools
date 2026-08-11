@@ -33,6 +33,15 @@ type UpstreamConfig struct {
 // UpstreamMap 按请求域名索引的上游配置集合。
 type UpstreamMap map[string]UpstreamConfig
 
+// Config 是上游配置文件的完整结构：证书 URL + 上游路由规则。
+// 证书位置直接写死在此配置里（cert_path/key_path 为可访问的 URL），
+// 证书续期后只需更新该文件，无需改代码。
+type Config struct {
+	CertPath  string      `json:"cert_path"`
+	KeyPath   string      `json:"key_path"`
+	Upstreams UpstreamMap `json:"upstreams"`
+}
+
 // FetchBytes 从 URL 拉取内容到内存（不落盘），请求失败或状态非 200 时报错。
 func FetchBytes(rawURL string) ([]byte, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -49,8 +58,8 @@ func FetchBytes(rawURL string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
-// LoadConfig 从远程 URL 加载上游配置 JSON。
-func LoadConfig(rawURL string) (UpstreamMap, error) {
+// LoadConfig 从远程 URL 加载上游配置 JSON（证书 URL + 路由规则）。
+func LoadConfig(rawURL string) (*Config, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(rawURL)
 	if err != nil {
@@ -60,11 +69,14 @@ func LoadConfig(rawURL string) (UpstreamMap, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
-	var cfg UpstreamMap
+	var cfg Config
 	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("decode upstream config: %w", err)
 	}
-	return cfg, nil
+	if len(cfg.Upstreams) == 0 {
+		return nil, fmt.Errorf("upstream config has no upstreams")
+	}
+	return &cfg, nil
 }
 
 // hopByHopHeaders 是需要按 RFC 2616 处理的逐跳头，转发时必须剔除。
