@@ -51,11 +51,15 @@ GOOS=linux   GOARCH=amd64  go build -o local_proxy_detected_linux_amd64 ./cmd/lo
 
 ## 部署
 
-### zen-proxy（远程三台）
+### zen-proxy（远程三台 → 现为 capture-proxy）
+
+三台服务器 (vps/bwh/cloudcone) 现已部署 **capture-proxy** 取代原 zen-proxy，
+监听 8443 + TLS，`--mode auto` 双栈：
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o zen_proxy_go ./cmd/zen-proxy/
-scp zen_proxy_go <server>:/root/zen_proxy_go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o capture_proxy_go ./scripts/capture_proxy.go
+bash ~/script/ssh/vps.sh "cat > /root/capture_proxy_go.new" < capture_proxy_go
+bash ~/script/ssh/vps.sh "systemctl stop zen && mv /root/capture_proxy_go.new /root/capture_proxy_go && chmod +x /root/capture_proxy_go && systemctl start zen"
 ```
 
 systemd `zen.service`：
@@ -63,14 +67,14 @@ systemd `zen.service`：
 ```
 [Service]
 Type=simple
-ExecStart=/root/zen_proxy_go 0.0.0.0 8443 \
-  /root/.acme.sh/*.moonchan.xyz_ecc/fullchain.cer \
-  /root/.acme.sh/*.moonchan.xyz_ecc/*.moonchan.xyz.key 30 vps
+ExecStart=/root/capture_proxy_go --listen 0.0.0.0:8443 --mode auto \
+  --cert /root/.acme.sh/*.moonchan.xyz_ecc/fullchain.cer \
+  --key  /root/.acme.sh/*.moonchan.xyz_ecc/*.moonchan.xyz.key \
+  --out /root/captured
 Restart=always
 RestartSec=3
 ```
 
-位置参数：`[addr] [port] [cert] [key] [timeout] [server_id]`。
 证书目录名含字面 `*`（acme.sh 产物），systemd 直接按字面解析。
 
 ### zen-multi（本地）
@@ -79,7 +83,7 @@ RestartSec=3
 CGO_ENABLED=0 go build -o /usr/local/bin/zen_multi_go ./cmd/zen-multi/
 ```
 
-systemd `zen-multi.service`：`ExecStart=/usr/local/bin/zen_multi_go --listen 127.0.0.1:8443 --source cp1=http://127.0.0.1:8000`
+systemd `zen-multi.service`：`ExecStart=/usr/local/bin/zen_multi_go --listen 127.0.0.1:8443 --source vps=https://vps.moonchan.xyz:8443 --source bwh=https://bwh.moonchan.xyz:8443 --source cloudcone=https://c.moonchan.xyz:8443`
 
 上游 capture_proxy 在启动参数 `--source name=base` 中配置（可重复，聚合多个实例）。
 
