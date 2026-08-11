@@ -991,7 +991,7 @@ func makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8000", "监听地址")
 	mode := flag.String("mode", "auto", "初始转发模式: auto | v4 | v6")
-	outDir := flag.String("out", "captured", "抓包输出目录 (空字符串则禁用抓包)")
+	outDir := flag.String("out", "", "抓包输出目录 (默认不抓包)")
 	cert := flag.String("cert", "", "TLS 证书文件 (提供后以 HTTPS 监听)")
 	key := flag.String("key", "", "TLS 私钥文件")
 	flag.Parse()
