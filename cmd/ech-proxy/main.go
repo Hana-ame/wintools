@@ -39,6 +39,9 @@ const embeddedConfig = `{
         "host": "sukebei.nyaa.si",
         "mode": "sni"
     },
+    "ao3.l.moonchan.xyz": {
+        "host": "archiveofourown.org"
+    },
     "zen.l.moonchan.xyz": {
         "host": "opencode.ai"
     }
