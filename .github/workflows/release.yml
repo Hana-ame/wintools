@@ -35,6 +35,16 @@ jobs:
                go build -trimpath -ldflags="-s -w" \
                -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
           done
+          # scripts/*.go 单文件工具（capture-proxy 等）
+          for script in scripts/*.go; do
+            name=$(basename "$script" .go)
+            ext=""
+            [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+            mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
+            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} CGO_ENABLED=0 \
+               go build -trimpath -ldflags="-s -w" \
+               -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${script}"
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
