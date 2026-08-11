@@ -36,6 +36,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Hana-ame/wintools/pkg/netdial"
 	"github.com/Hana-ame/wintools/pkg/peerjs"
 )
 
@@ -107,7 +108,7 @@ type pipeStream struct {
 func newServe(target string) *serve {
 	return &serve{
 		target:  target,
-		client:  &http.Client{},
+		client:  netdial.Client(0),
 		streams: make(map[uint32]*pipeStream),
 	}
 }

@@ -16,6 +16,8 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/Hana-ame/wintools/pkg/netdial"
 )
 
 const (
@@ -147,7 +149,7 @@ func (p *Peer) Start(ctx context.Context) error {
 		scheme, host, p.cfg.Key, p.cfg.ID, p.cfg.Token, version)
 
 	p.Debugf("dialing signaling %s", u)
-	ws, _, err := websocket.Dial(ctx, u, nil)
+	ws, _, err := websocket.Dial(ctx, u, netdial.WebsocketDialOptions())
 	if err != nil {
 		return fmt.Errorf("signal dial: %w", err)
 	}

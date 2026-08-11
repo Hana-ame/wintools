@@ -16,5 +16,10 @@
   - `cmd/ip-proxy`:多 IP 分流 CONNECT 代理,`client`(JSON 配置 client.json 已 gitignore,六线 wss://vps|bwh|cloudcone-zen-v4|v6.moonchan.xyz,opencode 设 HTTPS_PROXY 选线)+ `server`(VPS 端 WS 隧道,`--force v4|v6`,纯 ws 由 nginx 反代,loopback 127.26.8.12/13:8080)
 
 ## 项目结构
-- `cmd/*` 为多个独立可执行程序(ech-proxy / ip-proxy / kv-store / localdns / webrtc-proxy 等),CI 全部 build。
+- `cmd/*` 为多个独立可执行程序(ech-proxy / ip-proxy / kv-store / localdns / webrtc-proxy / opencode-proxy 等),CI 全部 build。
 - `pkg/proxyheaders` — 请求/响应头透传工具。
+- `pkg/netdial` — **Termux/Android 环境网络坑的公共修复**(重要):
+  - Termux 无 `/etc/resolv.conf`,Go 纯解析器默认走 `[::1]:53` 会失败(`connection refused`),必须固定公共 DNS(8.8.8.8/1.1.1.1/223.5.5.5/114.114.114.114)。
+  - Termux CA 在 `$PREFIX/etc/tls/cert.pem`,不在 Go 默认搜索路径,https 会报 `certificate signed by unknown authority`,需附加到 RootCAs。
+  - 任何在 Termux 上跑、有出站请求的 proxy 一律用 `netdial.Client()/Dialer()/WebsocketDialOptions()`/`Transport()`,不要裸 `&http.Client{}` 或 `websocket.Dial(..., nil)`。已知坑过的:`opencode-proxy`(DNS+CA 都踩过,已修)、`ip-proxy`、`webrtc-proxy`、`peerjs`、`echproxy`、`apifwd`。ech-proxy 的 `zen_provider.go` 用 IP 直连 + InsecureSkipVerify,自带公共 DNS(resolveOnce),不受影响。
+- `cmd/opencode-proxy`:aichat.moonchan.xyz 的 CORS chat proxy。`POST /chat/completion` → `https://opencode.ai/zen/go/v1/chat/completions`,CORS 仅放行 `https://aichat.moonchan.xyz`,key 从环境变量 `OPENCODE_GO_API_KEY` 读(不写死)。已部署 Termux `u0_a297.d.moonchan.xyz:8000`(ssh -p 8022,免代理直连,后台 `nohup`,PID 存 `~/opencode-proxy.pid`)。

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Hana-ame/wintools/pkg/netdial"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -17,7 +18,7 @@ func newGET(ctx context.Context, url string) (*http.Request, error) {
 }
 
 func doHTTP(req *http.Request, timeout time.Duration) (*http.Response, error) {
-	c := &http.Client{Timeout: timeout}
+	c := netdial.Client(timeout)
 	return c.Do(req)
 }
 

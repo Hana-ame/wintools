@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/Hana-ame/wintools/pkg/netdial"
 )
 
 // 每个本地监听地址对应的 server 出口 (空 = 直连目标)。
@@ -94,7 +96,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, exit string) {
 		}
 		log.Printf("CONNECT %s -> exit %s://%s", target, scheme, wsAddr)
 		wsURL := scheme + "://" + wsAddr + "/connect?target=" + url.QueryEscape(target)
-		ws, _, werr := websocket.Dial(context.Background(), wsURL, nil)
+		ws, _, werr := websocket.Dial(context.Background(), wsURL, netdial.WebsocketDialOptions())
 		if werr != nil {
 			log.Printf("CONNECT %s ws dial %s fail: %v", target, wsURL, werr)
 			http.Error(w, werr.Error(), 502)
