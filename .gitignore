@@ -19,3 +19,8 @@
 /layout.js
 /main-app.js
 /page.js
+capture-proxy
+
+# ip-proxy 本地配置 (线路出口, 按部署修改, 不提交)
+cmd/ip-proxy/client.json
+ip-proxy

@@ -85,20 +85,6 @@ const embeddedConfig = `{
     }
 }`
 
-func cleanZenPayload(body []byte) ([]byte, error) {
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
-	}
-	if _, ok := payload["model"]; !ok {
-		payload["model"] = "deepseek-v4-flash-free"
-	}
-	if mt, ok := payload["max_tokens"].(float64); !ok || mt > 131072 {
-		payload["max_tokens"] = 131072
-	}
-	return json.Marshal(payload)
-}
-
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
@@ -144,19 +130,7 @@ func main() {
 	if zenAPIKey == "" {
 		zenAPIKey = "public"
 	}
-	log.Printf("正在解析 opencode.ai  IP...")
-	v4ep, err4 := apifwd.ResolveIP("opencode.ai", "/zen/v1", 4)
-	v6ep, err6 := apifwd.ResolveIP("opencode.ai", "/zen/v1", 6)
-	if v4ep != nil {
-		log.Printf("  IPv4: %s", v4ep.URL)
-	}
-	if v6ep != nil {
-		log.Printf("  IPv6: %s", v6ep.URL)
-	}
-	if err4 != nil && err6 != nil {
-		log.Fatalf("解析 opencode.ai 失败: v4=%v v6=%v", err4, err6)
-	}
-	zenHandler := apifwd.Zen(v4ep, v6ep, zenAPIKey, cleanZenPayload)
+	zenHandler := NewZenProvider()
 
 	var upstreamCfg echproxy.UpstreamMap
 	var upstreamHandler gin.HandlerFunc
@@ -208,7 +182,7 @@ func main() {
 		if c.GetHeader("Authorization") == "" {
 			c.Request.Header.Set("Authorization", "Bearer "+zenAPIKey)
 		}
-		zenHandler(c)
+		zenHandler.ServeHTTP(c.Writer, c.Request)
 	}
 
 	hostOf := func(c *gin.Context) string {

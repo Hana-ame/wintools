@@ -1,25 +1,36 @@
-// Capture Proxy — 本地双栈 (v4/v6) 转发代理, 抓取并转发 opencode.ai/zen/v1。
+// Local Proxy — Ollama-compatible endpoint relaying to opencode.ai/zen/v1 with
+// dual-stack v6/v4 failover, active stream detection, capture, and mode switch.
 //
-// 设计目标: 与 zen-proxy / local-proxy 行为一致 (v6/v4 failover、FreeUsageLimitError
-// cooldown、SSE 预读 + stall 检测、工具流保护、意外中断注入 "echo 继续")。
-// 与远程 zen-proxy 仅监听侧证书不同: 本代理默认纯 HTTP (local 用), 也可 --cert/--key 起 TLS。
+// 合并自 cmd/local-proxy-detected 与 scripts/capture_proxy.go (两者核心转发
+// 逻辑一致): local-proxy-detected 的 usage 计费统计 + vanilla 透传开关 +
+// 双栈监听, capture_proxy 的抓包 / /mode API / 伪装 opencode client / gzip
+// 请求体 / TLS 监听。
 //
-// 额外能力:
-//   - 请求抓包: 每个客户端请求 (method/URL/全部 header/body) 存到 --out 目录, 方便排查;
-//   - 伪装 opencode client: 透传客户端 header, 缺失时补 opencode UA / x-opencode-* /
-//     X-Session-Id, 使上游 (Cloudflare) 视作真实 opencode 客户端而不是被 hang;
-//   - gzip 请求体: 客户端 Content-Encoding: gzip 时先解压再转发;
-//   - 模式开关: auto / v4 / v6, 运行中可经 /mode API 切换 (双栈 = 双 IP 额度)。
+// 设计目标:
+//   - 转发到 opencode.ai/zen/v1 (v6/v4 failover、FreeUsageLimitError cooldown);
+//   - 流检测: 预读等待首 token、token 节奏 stall 检测、180s 工具调用思考窗口、
+//     keep-alive 过滤、EOF/DONE 兜底封流、意外中断注入 "echo 继续" 恢复工具循环;
+//   - 抓包: 每个请求 (method/URL/全部 header/body) 存到 --out 目录;
+//   - 伪装 opencode client: 透传客户端 header, 缺失时补 opencode UA /
+//     x-opencode-* / X-Session-Id, 使上游 (Cloudflare) 视作真实 opencode 客户端;
+//   - gzip 请求体: Content-Encoding: gzip 时先解压再转发;
+//   - 模式开关: v4 / v6 (单栈), 运行中可经 /mode API 切换;
+//   - usage 计费统计: 按模型累计 token/cost, /stats 端点查询;
+//   - vanilla 纯透传 (--detect=false): 不做流检测, 仅转发 + 统计。
 //
 // 用法:
-//   go run scripts/capture_proxy.go --listen 127.0.0.1:8000 --mode auto --out captured
-//   go run scripts/capture_proxy.go --mode v4 --out captured          # 强制 v4
-//   go run scripts/capture_proxy.go --cert fullchain.cer --key key    # HTTPS 监听
+//
+//	capture-proxy -role provider --listen 127.0.0.1:8000 --mode v4 [--out dir]
+//	capture-proxy -role local --mode v4 --out captured          # 强制 v4
+//	capture-proxy -role local --cert fullchain.cer --key key    # HTTPS 监听
+//	capture-proxy -role local --detect=false                    # vanilla 纯透传
 //
 // 模式 API:
-//   GET  /mode            -> {"mode":"auto","v4_cooldown_sec":..,"v6_cooldown_sec":..}
-//   POST /mode            body {"mode":"v4"}  或 query ?mode=v6  (v4|v6|auto)
-//   GET  /status          -> 同 /mode + 累计统计
+//
+//	GET  /mode            -> {"mode":"v4","v4_cooldown_sec":..,"v6_cooldown_sec":..}
+//	POST /mode            body {"mode":"v6"}  或 query ?mode=v6  (v4|v6)
+//	GET  /status          -> 同 /mode + 按协议族累计统计
+//	GET  /stats           -> 按模型 usage 计费统计
 package main
 
 import (
@@ -47,12 +58,12 @@ import (
 )
 
 const (
-	zenHost          = "opencode.ai"
-	zenPath          = "/zen/v1"
-	freeLimitErr     = "FreeUsageLimitError"
-	defaultModel     = "deepseek-v4-flash-free"
-	defaultAPIKey    = "public"
-	opencodeUA       = "opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+	zenHost       = "opencode.ai"
+	zenPath       = "/zen/v1"
+	freeLimitErr  = "FreeUsageLimitError"
+	defaultModel  = "deepseek-v4-flash-free"
+	defaultAPIKey = "public"
+	opencodeUA    = "opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 
 	connectTimeout   = 10 * time.Second
 	stallTimeout     = 30 * time.Second
@@ -65,6 +76,24 @@ const (
 	// 意外中断时注入的「echo 继续」tool_call, 让客户端恢复工具循环而不是报错。
 	infTool    = "bash"
 	infIdleArg = `{"command": "echo 继续"}`
+
+	// FreeUsageLimitError 连续失败阈值与冷却策略: 第 1 次短冷却 1 分钟, 第 2 次
+	// 5 分钟, 达到阈值 (3 次) 后才锁到午夜 (瞬时限流不锁死一整天)。
+	limFailThreshold = 3
+	limFailCooldown1 = 1 * time.Minute
+	limFailCooldown2 = 5 * time.Minute
+
+	idleConnTimeout  = 90 * time.Second
+	cleanupInterval  = 5 * time.Minute
+	maxReqsPerClient = 200
+	banWindow        = 600 * time.Second
+	banLen           = 600 * time.Second
+
+	// 计费价格 (每百万 token), 与 zen-multi 的 usage 一致。
+	priceInputM      = 1.0
+	priceOutputM     = 2.0
+	priceCacheReadM  = 0.02
+	priceCacheWriteM = 0.0
 )
 
 func nextUTCMidnight() time.Time {
@@ -72,7 +101,7 @@ func nextUTCMidnight() time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
 }
 
-// ---- SSE helpers (与 zen-proxy / local-proxy 共享语义) ----------------------
+// ---- SSE helpers (与 zen-proxy 共享语义) -----------------------------------
 
 func hasRealSSE(buf []byte) bool {
 	return bytes.Contains(buf, []byte("data:")) || bytes.Contains(buf, []byte("event:"))
@@ -198,13 +227,14 @@ func eventHasError(ev []byte) bool {
 	return false
 }
 
-// stallFor 返回「两个真实 SSE 事件之间允许的最大间隔」:
-// 首 token 之后按 token 节奏收敛到 tokenGapTimeout; 工具流保留更长思考窗口。
-func stallFor(sawTool bool) time.Duration {
+// stallFor 返回「两个真实 SSE 事件之间允许的最大间隔」。首 token 后按 token 节奏
+// 收敛; 工具流保留更长思考窗口; 普通流给 gap 宽限 (local 角色用 thinkGrace
+// 避免推理模型思考停顿被误杀; remote/multi 角色用 tokenGapTimeout)。
+func stallFor(sawTool bool, gap time.Duration) time.Duration {
 	if sawTool {
 		return toolStallTimeout
 	}
-	return tokenGapTimeout
+	return gap
 }
 
 type chunkMsg struct {
@@ -250,7 +280,102 @@ func startReader(body io.Reader, done <-chan struct{}) chan chunkMsg {
 	return ch
 }
 
-// ---- 意外中断注入 (意外中断 + 对应条件=tools call -> 继续) ------------------
+// ---- usage 计费统计 (来自 local-proxy-detected) ------------------------------
+
+// usage 记录响应体里的 token 用量。非流式响应整体解析;
+// 流式响应每个 SSE 事件里可能带 usage (通常只在最后一个事件)。
+type usage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	Cache            struct {
+		Read  int64 `json:"read"`
+		Write int64 `json:"write"`
+	} `json:"cache"`
+}
+
+type modelStats struct {
+	Requests   int64   `json:"requests"`
+	Input      int64   `json:"input"`
+	Output     int64   `json:"output"`
+	Reasoning  int64   `json:"reasoning"`
+	CacheRead  int64   `json:"cache_read"`
+	CacheWrite int64   `json:"cache_write"`
+	Cost       float64 `json:"est_cost"`
+}
+
+type usageStats struct {
+	mu     sync.Mutex
+	models map[string]*modelStats
+}
+
+func newUsageStats() *usageStats {
+	return &usageStats{models: make(map[string]*modelStats)}
+}
+
+func (s *usageStats) add(model string, req bool, u *usage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.models[model]
+	if m == nil {
+		m = &modelStats{}
+		s.models[model] = m
+	}
+	if req {
+		m.Requests++
+	}
+	if u == nil {
+		return
+	}
+	m.Input += u.PromptTokens
+	m.Output += u.CompletionTokens
+	m.Reasoning += u.ReasoningTokens
+	m.CacheRead += u.Cache.Read
+	m.CacheWrite += u.Cache.Write
+	m.Cost += estCost(u)
+}
+
+func (s *usageStats) snapshot() map[string]*modelStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]*modelStats, len(s.models))
+	for k, v := range s.models {
+		c := *v
+		out[k] = &c
+	}
+	return out
+}
+
+func estCost(u *usage) float64 {
+	return float64(u.Cache.Read)/1e6*priceCacheReadM +
+		float64(u.PromptTokens)/1e6*priceInputM +
+		float64(u.CompletionTokens+u.ReasoningTokens)/1e6*priceOutputM
+}
+
+func parseUsage(data []byte) *usage {
+	var obj struct {
+		Usage *usage `json:"usage"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil || obj.Usage == nil {
+		return nil
+	}
+	return obj.Usage
+}
+
+// parseSSEUsage 从单个 SSE 事件 ("data: {...}" 行) 里抽取 usage。
+func parseSSEUsage(ev []byte) *usage {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		if u := parseUsage(line[len("data: "):]); u != nil {
+			return u
+		}
+	}
+	return nil
+}
+
+// ---- 意外中断注入 ------------------------------------------------------------
 
 func jsonString(s string) string {
 	re, _ := json.Marshal(s)
@@ -292,9 +417,9 @@ func lengthChunk(model string) []byte {
 // ---- 抓包 (capture) ----------------------------------------------------------
 
 type capture struct {
-	mu   sync.Mutex
-	seq  atomic.Uint64
-	dir  string
+	mu  sync.Mutex
+	seq atomic.Uint64
+	dir string
 }
 
 func (c *capture) save(r *http.Request, body []byte) {
@@ -343,20 +468,28 @@ func sanitize(p string) string {
 
 type proxy struct {
 	mu         sync.Mutex
-	mode       string // auto | v4 | v6
+	mode       string // v4 | v6
 	cooldownV4 time.Time
 	cooldownV6 time.Time
+	limFailsV4 int // 连续 FreeUsageLimitError 次数，成功时清零
+	limFailsV6 int
 
-	clientV4 *http.Client
-	clientV6 *http.Client
+	ban *banList
+
+	clientV4   *http.Client
+	clientV6   *http.Client
 	clientV4H1 *http.Client
 	clientV6H1 *http.Client
 
 	v4URL string
 	v6URL string
 
-	stats map[string]*famStat
-	start time.Time
+	// detect=true 时启用流检测 (预读/stall/DONE 兜底); false 时纯透传 (vanilla 模式)。
+	detect bool
+
+	famStats map[string]*famStat
+	start    time.Time
+	usage    *usageStats
 }
 
 type famStat struct {
@@ -379,10 +512,10 @@ func (f *famStat) add(reqs, ok, errs, free int64) {
 func (p *proxy) statsFor(fam string) *famStat {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	s := p.stats[fam]
+	s := p.famStats[fam]
 	if s == nil {
 		s = &famStat{}
-		p.stats[fam] = s
+		p.famStats[fam] = s
 	}
 	return s
 }
@@ -404,19 +537,26 @@ func (p *proxy) setMode(m string) bool {
 	return false
 }
 
-// stacks 返回按当前模式确定的尝试顺序。auto 默认 v6 优先, 与 local-proxy 一致。
-func (p *proxy) stacks() []string {
+// stacks 返回按当前模式确定的尝试顺序(单栈, 无 auto)。
+// stacks 返回尝试顺序: 默认先 v6 再 v4; override 为请求级指定栈 (绕过 mode)。
+func (p *proxy) stacks(override string) []string {
+	switch override {
+	case "v4":
+		return []string{"v4"}
+	case "v6":
+		return []string{"v6"}
+	}
 	switch p.currentMode() {
 	case "v4":
 		return []string{"v4"}
 	case "v6":
 		return []string{"v6"}
-	default:
+	default: // auto: 先 v6 再 v4
 		return []string{"v6", "v4"}
 	}
 }
 
-// resolveOnce 用公共 DNS 解析宿主 (Termux 本机 resolver 可能指向不可达的 ::1:53)。
+// resolveOnce 用公共 DNS 解析宿主 (本机 resolver 可能指向不可达的 ::1:53)。
 func resolveOnce(host string) (v4, v6 string) {
 	for _, dns := range []string{"1.1.1.1:53", "8.8.8.8:53", "223.5.5.5:53", "114.114.114.114:53"} {
 		r := &net.Resolver{
@@ -469,21 +609,59 @@ func (p *proxy) setCooldownUntil(fam string, t time.Time) {
 	}
 }
 
+// onLimitErr 记录一次 FreeUsageLimitError, 返回按连续失败次数升级的冷却时长:
+// 第 1 次 limFailCooldown1, 第 2 次 limFailCooldown2, 达到 limFailThreshold
+// 后才锁到午夜 (此时可视为真·配额耗尽)。
+func (p *proxy) onLimitErr(fam string) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if fam == "v6" {
+		p.limFailsV6++
+		switch p.limFailsV6 {
+		case 1:
+			return limFailCooldown1
+		case 2:
+			return limFailCooldown2
+		default:
+			return time.Until(nextUTCMidnight())
+		}
+	}
+	p.limFailsV4++
+	switch p.limFailsV4 {
+	case 1:
+		return limFailCooldown1
+	case 2:
+		return limFailCooldown2
+	default:
+		return time.Until(nextUTCMidnight())
+	}
+}
+
+// clearLimFails 在源成功响应后清零连续失败计数。
+func (p *proxy) clearLimFails(fam string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if fam == "v6" {
+		p.limFailsV6 = 0
+	} else {
+		p.limFailsV4 = 0
+	}
+}
+
 func (p *proxy) cooldownSec(fam string, now time.Time) int {
-	d := p.cooldownFam(fam).Sub(now).Seconds()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var t time.Time
+	if fam == "v6" {
+		t = p.cooldownV6
+	} else {
+		t = p.cooldownV4
+	}
+	d := t.Sub(now).Seconds()
 	if d < 0 {
 		return 0
 	}
 	return int(d)
-}
-
-func (p *proxy) cooldownFam(fam string) time.Time {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if fam == "v6" {
-		return p.cooldownV6
-	}
-	return p.cooldownV4
 }
 
 // impersonate 让上游看到「真实 opencode 客户端」特征: 透传客户端 header, 缺失则补齐。
@@ -548,7 +726,21 @@ func readBody(r *http.Request) ([]byte, error) {
 var errTooLarge = fmt.Errorf("request body too large")
 
 func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, cap *capture) {
-	log.Printf("-> %s %s", method, r.URL.Path)
+	clientIP := clientIPOf(r)
+	stackOverride := r.URL.Query().Get("stack")
+	if stackOverride != "" && stackOverride != "v4" && stackOverride != "v6" {
+		writeJSON(w, 400, map[string]any{"error": "stack must be v4|v6"})
+		return
+	}
+	log.Printf("-> %s %s from %s", method, r.URL.Path, clientIP)
+	if p.ban != nil && p.ban.isBanned(clientIP) {
+		log.Printf("banned")
+		writeJSON(w, 429, map[string]any{"error": "Banned"})
+		return
+	}
+	if p.ban != nil {
+		p.ban.incr(clientIP)
+	}
 	body, err := readBody(r)
 	if err != nil {
 		status := 400
@@ -577,11 +769,22 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		if m, _ := payload["model"].(string); m != "" {
 			model = m
 		}
+		if model == "deepseek-v4-flash" {
+			model = defaultModel
+			log.Printf("model deepseek-v4-flash -> deepseek-v4-flash-free")
+		}
 		payload["model"] = model
 		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 131072 {
 			payload["max_tokens"] = 131072
 		}
+		if tp, ok := payload["top_p"].(float64); !ok || tp <= 0 || tp > 1.0 {
+			payload["top_p"] = 1.0
+		}
+		if temp, ok := payload["temperature"].(float64); !ok || temp < 0 || temp > 2.0 {
+			payload["temperature"] = 1.0
+		}
 		isStream, _ = payload["stream"].(bool)
+		// 请求带 tools: stall/断流时可注入 idle tool_call 恢复工具循环。
 		if tools, _ := payload["tools"].([]any); len(tools) > 0 {
 			recoverable = true
 		}
@@ -593,7 +796,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 	var lastErrBody any
 	var lastHeaders http.Header
 
-	for _, fam := range p.stacks() {
+	for _, fam := range p.stacks(stackOverride) {
 		if p.inCooldown(fam, time.Now()) {
 			continue
 		}
@@ -622,20 +825,23 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		var tDial, tTLS, tWrote time.Time
 		var proto string
 		trace := &httptrace.ClientTrace{
-			ConnectDone:     func(network, addr string, err error) { tDial = time.Now() },
+			ConnectDone:      func(network, addr string, err error) { tDial = time.Now() },
 			TLSHandshakeDone: func(cs tls.ConnectionState, err error) { tTLS = time.Now() },
-			WroteRequest:    func(info httptrace.WroteRequestInfo) { tWrote = time.Now() },
-			GotConn:         func(info httptrace.GotConnInfo) { proto = "reused" },
+			WroteRequest:     func(info httptrace.WroteRequestInfo) { tWrote = time.Now() },
+			GotConn:          func(info httptrace.GotConnInfo) { proto = "reused" },
 		}
 		resp, err := doWithTrace(client, req, trace)
 		if err != nil {
 			if strings.Contains(err.Error(), "timeout awaiting response headers") || strings.Contains(err.Error(), "http2") {
+				// http/2 挂起/超时: 用 http/1.1 重试一次 (有些路径 http2 被干扰)
 				log.Printf("%s %s failed: %v (dial=%s tls=%s wrote=%s) -> retry h1", fam, base, err,
 					ms(tDial, t0), ms(tTLS, t0), ms(tWrote, t0))
 				h1c := p.clientV6H1
 				if fam == "v4" {
 					h1c = p.clientV4H1
 				}
+				// 必须重建请求: 原 req 的 Body 已被第一次尝试耗尽/关闭,
+				// 直接复用会报 "ContentLength=X with Body length 0"。
 				retryReq, rerr := http.NewRequest(method, base+zenPath+path, strings.NewReader(bodyStr))
 				if rerr != nil {
 					err = rerr
@@ -671,9 +877,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 			var obj map[string]any
 			_ = json.Unmarshal(data, &obj)
 			if e, ok := obj["error"].(map[string]any); ok && e["type"] == freeLimitErr {
-				log.Printf("%s FreeUsageLimitError (cooldown to midnight)", fam)
+				d := p.onLimitErr(fam)
+				log.Printf("%s FreeUsageLimitError (lim_fails, cooldown=%s)", fam, d.Round(time.Second))
 				st.add(0, 0, 1, 1)
-				p.setCooldownUntil(fam, nextUTCMidnight())
+				p.setCooldownUntil(fam, time.Now().Add(d))
 				continue
 			}
 			st.add(0, 0, 1, 0)
@@ -693,6 +900,8 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		if !isStream {
 			data, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			p.clearLimFails(fam)
+			p.usage.add(model, true, parseUsage(data))
 			h := w.Header()
 			proxyheaders.ForwardResponseHeaders(h, resp.Header)
 			h.Set("Content-Type", "application/json")
@@ -705,6 +914,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 
 		ok, committed := p.forwardStream(w, resp, fam, model, recoverable)
 		if ok || committed {
+			p.clearLimFails(fam)
 			return
 		}
 		resp.Body.Close()
@@ -784,6 +994,8 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 		flusher.Flush()
 	}
 
+	p.usage.add(model, true, nil)
+
 	buf := pre
 	sawTool := false
 	toolClosed := false
@@ -791,7 +1003,7 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 	doneSent := false
 	injected := false
 	lastReal := time.Now()
-	timer := time.NewTimer(stallFor(false))
+	timer := time.NewTimer(stallFor(false, thinkGrace))
 	defer timer.Stop()
 	total := len(pre)
 	write := func(b []byte) error {
@@ -815,6 +1027,9 @@ loop:
 			buf = rest
 			if !hasRealSSE(ev) {
 				continue
+			}
+			if u := parseSSEUsage(ev); u != nil {
+				p.usage.add(model, false, u)
 			}
 			if eventHasToolCall(ev) {
 				sawTool = true
@@ -846,7 +1061,7 @@ loop:
 			}
 			if eventHasContent(ev) {
 				lastReal = time.Now()
-				timer.Reset(stallFor(sawTool))
+				timer.Reset(stallFor(sawTool, thinkGrace))
 			}
 			if err := write(append(ev, '\n', '\n')); err != nil {
 				log.Printf("client disconnected mid-stream")
@@ -904,7 +1119,7 @@ loop:
 			}
 			buf = append(buf, m.data...)
 		case <-timer.C:
-			stall := stallFor(sawTool)
+			stall := stallFor(sawTool, thinkGrace)
 			if time.Since(lastReal) >= stall {
 				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
 				if recoverable && !finished && !sawTool && !injected {
@@ -935,6 +1150,169 @@ loop:
 	resp.Body.Close()
 	log.Printf("%s stream done (%d bytes, %.2fs) saw_tool=%v tool_closed=%v injected=%v", fam, total, time.Since(t0).Seconds(), sawTool, toolClosed, injected)
 	return true, true
+}
+
+// forwardPassthrough 纯透传 (vanilla) 模式: 不做预读 / stall 检测 / DONE 兜底,
+// 上游事件原样转发, 仅统计请求数与 usage。
+func (p *proxy) forwardPassthrough(w http.ResponseWriter, resp *http.Response, fam, model string) (bool, bool) {
+	done := make(chan struct{})
+	defer close(done)
+	ch := startReader(resp.Body, done)
+	t0 := time.Now()
+
+	flusher, _ := w.(http.Flusher)
+	h := w.Header()
+	proxyheaders.ForwardResponseHeaders(h, resp.Header)
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	setCORS(h)
+	w.WriteHeader(200)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	p.usage.add(model, true, nil)
+
+	total := 0
+	buf := []byte{}
+	for {
+		select {
+		case m, ok := <-ch:
+			if !ok || m.eof {
+				resp.Body.Close()
+				log.Printf("%s stream done (%d bytes, %.2fs)", fam, total, time.Since(t0).Seconds())
+				return true, true
+			}
+			if m.err != nil {
+				log.Printf("%s upstream error: %v", fam, m.err)
+				resp.Body.Close()
+				return true, true
+			}
+			buf = append(buf, m.data...)
+			total += len(m.data)
+			// 逐事件转发, 顺带解析 usage 统计
+			for {
+				ev, rest, ok := nextSSEEvent(buf)
+				if !ok {
+					buf = rest
+					break
+				}
+				buf = rest
+				if u := parseSSEUsage(ev); u != nil {
+					p.usage.add(model, false, u)
+				}
+				total += len(ev) + 2
+				if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
+					log.Printf("client disconnected mid-stream")
+					resp.Body.Close()
+					return false, true
+				}
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+func messagesOf(p map[string]any) []any {
+	m, _ := p["messages"].([]any)
+	return m
+}
+
+func toolsOf(p map[string]any) []any {
+	t, _ := p["tools"].([]any)
+	return t
+}
+
+func clientIPOf(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// ---- ban list (来自 zen-proxy) ----------------------------------------------
+
+type banList struct {
+	mu     sync.Mutex
+	counts map[string][2]int64 // key -> [count, windowStart]
+	banned map[string]time.Time
+	max    int
+	window time.Duration
+	banLen time.Duration
+}
+
+func newBanList(max int, window, banLen time.Duration) *banList {
+	b := &banList{
+		counts: map[string][2]int64{},
+		banned: map[string]time.Time{},
+		max:    max,
+		window: window,
+		banLen: banLen,
+	}
+	go b.cleanupLoop()
+	return b
+}
+
+func (b *banList) cleanupLoop() {
+	for {
+		time.Sleep(cleanupInterval)
+		now := time.Now()
+		b.mu.Lock()
+		for k, until := range b.banned {
+			if now.After(until) {
+				delete(b.banned, k)
+			}
+		}
+		for k, c := range b.counts {
+			if time.Now().Sub(time.Unix(c[1], 0)) > b.window {
+				delete(b.counts, k)
+			}
+		}
+		b.mu.Unlock()
+	}
+}
+
+func (b *banList) incr(key string) {
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, banned := b.banned[key]; banned {
+		return
+	}
+	c, ok := b.counts[key]
+	if !ok || now.Sub(time.Unix(c[1], 0)) > b.window {
+		c = [2]int64{0, now.Unix()}
+	}
+	c[0]++
+	if c[0] > int64(b.max) {
+		b.banned[key] = now.Add(b.banLen)
+		delete(b.counts, key)
+		return
+	}
+	b.counts[key] = c
+}
+
+func (b *banList) isBanned(key string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	until, banned := b.banned[key]
+	if !banned {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(b.banned, key)
+		return false
+	}
+	return true
+}
+
+func (b *banList) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.banned)
 }
 
 // ---- server wiring ----------------------------------------------------------
@@ -974,7 +1352,7 @@ func makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
 		tlsCfg.NextProtos = []string{"http/1.1"}
 	}
 	tr := &http.Transport{
-		TLSClientConfig:       tlsCfg,
+		TLSClientConfig: tlsCfg,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 			return d.DialContext(ctx, "tcp", endpoint)
@@ -988,13 +1366,16 @@ func makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-func main() {
-	listen := flag.String("listen", "127.0.0.1:8000", "监听地址")
-	mode := flag.String("mode", "auto", "初始转发模式: auto | v4 | v6")
-	outDir := flag.String("out", "", "抓包输出目录 (默认不抓包)")
-	cert := flag.String("cert", "", "TLS 证书文件 (提供后以 HTTPS 监听)")
-	key := flag.String("key", "", "TLS 私钥文件")
-	flag.Parse()
+func runProvider(args []string) {
+	fs := flag.NewFlagSet("provider", flag.ExitOnError)
+	listen := fs.String("listen", "127.0.0.1:8000", "监听地址")
+	mode := fs.String("mode", "auto", "转发模式: auto(先 v6 再 v4) | v4 | v6")
+	outDir := fs.String("out", "", "抓包输出目录 (默认不抓包)")
+	cert := fs.String("cert", "", "TLS 证书文件 (提供后以 HTTPS 监听)")
+	key := fs.String("key", "", "TLS 私钥文件")
+	detect := fs.Bool("detect", true, "流检测 (true=detected, false=vanilla 纯透传)")
+	ban := fs.Bool("ban", false, "按 IP 限流 (200 req/10min, zen-proxy 行为)")
+	fs.Parse(args)
 
 	if *mode != "v4" && *mode != "v6" {
 		*mode = "auto"
@@ -1006,15 +1387,20 @@ func main() {
 	}
 
 	p := &proxy{
-		mode:      *mode,
-		clientV4:  makeClient(net.JoinHostPort(v4, "443"), zenHost, true),
-		clientV6:  makeClient(net.JoinHostPort(v6, "443"), zenHost, true),
+		mode:       *mode,
+		clientV4:   makeClient(net.JoinHostPort(v4, "443"), zenHost, true),
+		clientV6:   makeClient(net.JoinHostPort(v6, "443"), zenHost, true),
 		clientV4H1: makeClient(net.JoinHostPort(v4, "443"), zenHost, false),
 		clientV6H1: makeClient(net.JoinHostPort(v6, "443"), zenHost, false),
-		v4URL:     "https://" + v4,
-		v6URL:     "https://[" + v6 + "]",
-		stats:     map[string]*famStat{},
-		start:     time.Now(),
+		v4URL:      "https://" + v4,
+		v6URL:      "https://[" + v6 + "]",
+		detect:     *detect,
+		famStats:   map[string]*famStat{},
+		start:      time.Now(),
+		usage:      newUsageStats(),
+	}
+	if *ban {
+		p.ban = newBanList(maxReqsPerClient, banWindow, banLen)
 	}
 	if v4 == "" && v6 == "" {
 		log.Fatalf("could not resolve %s via public DNS", zenHost)
@@ -1029,30 +1415,30 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+	chat := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			writeJSON(w, 204, map[string]any{})
 			return
 		}
 		p.handle(w, r, r.Method, cap)
-	})
-	mux.HandleFunc("/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		p.handle(w, r, r.Method, cap)
-	})
-	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+	}
+	models := func(w http.ResponseWriter, r *http.Request) {
 		p.handle(w, r, "GET", cap)
-	})
-	mux.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
-		p.handle(w, r, "GET", cap)
-	})
+	}
+	mux.HandleFunc("/zen/v1/chat/completions", chat)
+	mux.HandleFunc("/v1/chat/completions", chat)
+	mux.HandleFunc("/chat/completions", chat)
+	mux.HandleFunc("/zen/v1/models", models)
+	mux.HandleFunc("/v1/models", models)
+	mux.HandleFunc("/models", models)
 
 	// 模式控制 API
 	writeMode := func(w http.ResponseWriter) {
 		now := time.Now()
 		writeJSON(w, 200, map[string]any{
-			"mode":             p.currentMode(),
-			"v4_cooldown_sec":  p.cooldownSec("v4", now),
-			"v6_cooldown_sec":  p.cooldownSec("v6", now),
+			"mode":            p.currentMode(),
+			"v4_cooldown_sec": p.cooldownSec("v4", now),
+			"v6_cooldown_sec": p.cooldownSec("v6", now),
 		})
 	}
 	mux.HandleFunc("/mode", func(w http.ResponseWriter, r *http.Request) {
@@ -1091,19 +1477,20 @@ func main() {
 		}
 		now := time.Now()
 		stats := map[string]any{}
-		for fam, s := range p.stats {
+		for fam, s := range p.famStats {
 			s.mu.Lock()
 			stats[fam] = map[string]any{"reqs": s.reqs, "ok": s.ok, "errs": s.errs, "free_limit": s.free}
 			s.mu.Unlock()
 		}
 		writeJSON(w, 200, map[string]any{
-			"status":           "ok",
-			"mode":             p.currentMode(),
-			"v4_cooldown_sec":  p.cooldownSec("v4", now),
-			"v6_cooldown_sec":  p.cooldownSec("v6", now),
-			"upstream":         "https://" + zenHost + zenPath,
-			"uptime_sec":       int(time.Since(p.start).Seconds()),
-			"stats":            stats,
+			"status":          "ok",
+			"mode":            p.currentMode(),
+			"v4_cooldown_sec": p.cooldownSec("v4", now),
+			"v6_cooldown_sec": p.cooldownSec("v6", now),
+			"upstream":        "https://" + zenHost + zenPath,
+			"uptime_sec":      int(time.Since(p.start).Seconds()),
+			"stats":           stats,
+			"models":          p.usage.snapshot(),
 		})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1113,7 +1500,7 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(200)
-		w.Write([]byte("Capture proxy running\n"))
+		w.Write([]byte("Local proxy running\n"))
 	})
 
 	srv := &http.Server{
@@ -1122,8 +1509,8 @@ func main() {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	log.Printf("Capture proxy on %s (mode=%s, forward -> https://%s%s, capture=%v)",
-		*listen, *mode, zenHost, zenPath, cap != nil)
+	log.Printf("Local proxy on %s (mode=%s, forward -> https://%s%s, capture=%v, detect=%v)",
+		*listen, *mode, zenHost, zenPath, cap != nil, *detect)
 	var err error
 	if *cert != "" || *key != "" {
 		if *cert == "" || *key == "" {
