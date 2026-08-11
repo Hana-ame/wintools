@@ -9,6 +9,7 @@
 - 推 tag: `git tag <vX.Y.Z> && git push origin main && git push origin <tag>`;用 `gh run watch <run_id>` 等 CI 通过,`gh release view <tag>` 确认资产。
 - 资产命名:`<cmd>-<os>-<arch>.exe`,例 `local-proxy-windows-amd64.exe`。下载 `gh release download <tag> -p "<name>"`。
 - Go CI 工作流 `go.yml` 也会在 push main 时跑,别忘 commit 干净工作区再推。
+- **伪造时间戳约定(记住!)**:发布时 commit 和 tag 的时间戳要用 `GIT_AUTHOR_DATE` + `GIT_COMMITTER_DATE` 环境变量伪造(GitHub 显示 committer 时间,只设 `git commit --date` 没用)。具体伪造成什么时间,发布时由用户指定,默认取发布时刻前一天内。
 
 ## 项目结构
 - `cmd/*` 为多个独立可执行程序(api-server / ech-proxy / local-proxy / local-proxy-detected / zen-proxy / zen-multi / localdns 等),CI 全部 build。
