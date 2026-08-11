@@ -5,6 +5,9 @@ import (
 	"compress/gzip"
 	"strings"
 	"testing"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestBuildRewriter(t *testing.T) {
@@ -78,5 +81,38 @@ func TestDecompressBody(t *testing.T) {
 	plain, err := decompressBody([]byte("plain"), "")
 	if err != nil || string(plain) != "plain" {
 		t.Errorf("identity: %q %v", plain, err)
+	}
+}
+
+func TestDecompressBodyBrotli(t *testing.T) {
+	var buf bytes.Buffer
+	bw := brotli.NewWriter(&buf)
+	bw.Write([]byte("hello www.pixiv.net br"))
+	bw.Close()
+
+	raw, err := decompressBody(buf.Bytes(), "br")
+	if err != nil {
+		t.Fatalf("decompress br: %v", err)
+	}
+	if string(raw) != "hello www.pixiv.net br" {
+		t.Errorf("br roundtrip = %q", raw)
+	}
+}
+
+func TestDecompressBodyZstd(t *testing.T) {
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		t.Fatalf("zstd writer: %v", err)
+	}
+	zw.Write([]byte("hello www.pixiv.net zstd"))
+	zw.Close()
+
+	raw, err := decompressBody(buf.Bytes(), "zstd")
+	if err != nil {
+		t.Fatalf("decompress zstd: %v", err)
+	}
+	if string(raw) != "hello www.pixiv.net zstd" {
+		t.Errorf("zstd roundtrip = %q", raw)
 	}
 }

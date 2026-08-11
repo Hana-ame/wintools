@@ -21,7 +21,9 @@ import (
 	"time"
 
 	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
+	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 )
 
 // UpstreamConfig 表示一条上游转发规则。
@@ -230,11 +232,6 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		outReq.Host = uc.Host
 		outReq.ContentLength = c.Request.ContentLength
 
-		// 启用域名替换时只接受 gzip/identity，保证响应可解压（br 无标准库支持）。
-		if rewriter != nil {
-			outReq.Header.Set("Accept-Encoding", "gzip")
-		}
-
 		applyCookies(uc.Host, outReq)
 
 		var resp *http.Response
@@ -322,11 +319,20 @@ func isTextContent(ct string) bool {
 		strings.Contains(ct, "x-www-form-urlencoded")
 }
 
-// decompressBody 按 Content-Encoding 解压响应体，仅支持 gzip/identity。
+// decompressBody 按 Content-Encoding 解压响应体，支持 gzip/br/zstd/identity。
 func decompressBody(body []byte, encoding string) ([]byte, error) {
 	switch strings.ToLower(encoding) {
 	case "gzip":
 		r, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	case "br":
+		return io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
+	case "zstd":
+		r, err := zstd.NewReader(bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
