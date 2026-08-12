@@ -47,7 +47,10 @@ const embeddedConfig = `{
             "host": "iwara.tv",
             "rewrites": {
                 "api.iwara.tv": "iwara-api.l.moonchan.xyz",
-                "files.iwara.tv": "iwara-files.l.moonchan.xyz"
+                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
+                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
+                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
             }
         },
         "iwara-api.l.moonchan.xyz": {
@@ -56,6 +59,17 @@ const embeddedConfig = `{
         "iwara-files.l.moonchan.xyz": {
             "host": "files.iwara.tv",
             "mode": "sni"
+        },
+        "iwara-img.l.moonchan.xyz": {
+            "host": "i.iwara.tv",
+            "referer": "https://www.iwara.tv/"
+        },
+        "iwara-service.l.moonchan.xyz": {
+            "host": "service.iwara.tv"
+        },
+        "iwara-news.l.moonchan.xyz": {
+            "host": "news.iwara.tv",
+            "referer": "https://www.iwara.tv/"
         },
         "pixiv.l.moonchan.xyz": {
             "host": "www.pixiv.net",

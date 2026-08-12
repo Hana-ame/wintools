@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
+	"github.com/Hana-ame/wintools/pkg/netdial"
 )
 
 type Option struct {
@@ -24,7 +25,7 @@ func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-site, Accept, X-Requested-With")
 		c.Header("Access-Control-Max-Age", "86400")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(204)
@@ -100,7 +101,7 @@ func Handler(opt Option) gin.HandlerFunc {
 
 		var resp *http.Response
 		if opt.Local {
-			client := &http.Client{Timeout: 120 * time.Second}
+			client := netdial.Client(120 * time.Second)
 			resp, err = client.Do(outReq)
 		} else {
 			resp, err = cloudflare_ech.Do(outReq)
