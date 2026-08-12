@@ -45,6 +45,13 @@ const embeddedConfig = `{
         },
         "iwara.l.moonchan.xyz": {
             "host": "iwara.tv",
+            "referer": "https://www.iwara.tv/",
+            "wildcard": {
+                "prefix": "iwara-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".iwara.tv",
+                "referer": "https://www.iwara.tv/"
+            },
             "rewrites": {
                 "api.iwara.tv": "iwara-api.l.moonchan.xyz",
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
@@ -55,6 +62,7 @@ const embeddedConfig = `{
         },
         "iwara-api.l.moonchan.xyz": {
             "host": "api.iwara.tv",
+            "referer": "https://www.iwara.tv/",
             "rewrites": {
                 "api.iwara.tv": "iwara-api.l.moonchan.xyz",
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
@@ -66,6 +74,7 @@ const embeddedConfig = `{
         "iwara-files.l.moonchan.xyz": {
             "host": "files.iwara.tv",
             "mode": "sni",
+            "referer": "https://www.iwara.tv/",
             "rewrites": {
                 "api.iwara.tv": "iwara-api.l.moonchan.xyz",
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
@@ -87,6 +96,7 @@ const embeddedConfig = `{
         },
         "iwara-service.l.moonchan.xyz": {
             "host": "service.iwara.tv",
+            "referer": "https://www.iwara.tv/",
             "rewrites": {
                 "api.iwara.tv": "iwara-api.l.moonchan.xyz",
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",

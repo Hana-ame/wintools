@@ -27,6 +27,16 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// WildcardRule 通配上游规则:
+// 请求域名 = Prefix + <sub> + EntrySuffix 时, 转发到 <sub> + UpstreamSuffix。
+// 例: iwara-  + filesq + .l.moonchan.xyz → filesq.iwara.tv
+type WildcardRule struct {
+	Prefix         string `json:"prefix,omitempty"`          // 入口前缀, 如 "iwara-"
+	EntrySuffix    string `json:"entry_suffix,omitempty"`    // 入口后缀, 如 ".l.moonchan.xyz"
+	UpstreamSuffix string `json:"upstream_suffix,omitempty"` // 上游后缀, 如 ".iwara.tv"
+	Referer        string `json:"referer,omitempty"`         // 固定上游 Referer (防盗链)
+}
+
 // UpstreamConfig 表示一条上游转发规则。
 // Mode 为 "" / "ech" 时走 ECH 域前置（要求目标在 Cloudflare 后面），
 // 为 "sni" 时走 SNI 伪装直连（DoH 解析真实 IP + 假 SNI + Host 路由，
@@ -39,6 +49,7 @@ type UpstreamConfig struct {
 	Referer  string            `json:"referer,omitempty"`
 	Mode     string            `json:"mode,omitempty"`
 	Rewrites map[string]string `json:"rewrites,omitempty"`
+	Wildcard *WildcardRule     `json:"wildcard,omitempty"`
 }
 
 // UpstreamMap 按请求域名索引的上游配置集合。
@@ -213,6 +224,7 @@ func buildSWProxyMap(cfg UpstreamMap, port string) map[string]string {
 // swOverrideJS 生成注入到 service worker 的 fetch 拦截代码。
 // 拦截真实域名请求并改道到代理入口（带原端口），兜住前端运行时动态
 // 拼接的 URL（静态 rewriter 无法覆盖的场景）。
+// 除显式映射外，还支持 *.iwara.tv 通配: 任意子域改道 iwara-<sub>.l.moonchan.xyz。
 func swOverrideJS(m map[string]string) string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -235,7 +247,14 @@ const __wtMap = {`)
 self.addEventListener('fetch', (e) => {
   try {
     const u = new URL(e.request.url);
-    const p = __wtMap[u.hostname];
+    let p = __wtMap[u.hostname];
+    if (!p) {
+      const h = u.hostname;
+      if (h.endsWith('.iwara.tv') || h === 'iwara.tv') {
+        const sub = h === 'iwara.tv' ? '' : h.slice(0, -'.iwara.tv'.length);
+        p = (sub ? 'iwara-' + sub : 'iwara') + '.l.moonchan.xyz';
+      }
+    }
     if (!p) return;
     const d = u.protocol + '//' + p + u.pathname + u.search;
     e.respondWith(fetch(d, {
@@ -250,6 +269,99 @@ self.addEventListener('fetch', (e) => {
 });
 `)
 	return b.String()
+}
+
+// matchWildcard 按 WildcardRule 通配匹配入口:
+// host = rule.Prefix + sub + rule.EntrySuffix → 上游 sub + rule.UpstreamSuffix。
+// mode 未显式指定时自动探测: 上游在 Cloudflare 段走 ECH, 否则 SNI。
+func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
+	for entry, uc := range cfg {
+		w := uc.Wildcard
+		if w == nil {
+			continue
+		}
+		sub := strings.TrimPrefix(host, w.Prefix)
+		if sub == host || sub == "" {
+			continue
+		}
+		if !strings.HasSuffix(sub, w.EntrySuffix) {
+			continue
+		}
+		sub = strings.TrimSuffix(sub, w.EntrySuffix)
+		if sub == "" || strings.ContainsAny(sub, ".:/") {
+			continue
+		}
+		// 入口必须与通配规则同域(防止跨规则误匹配)。
+		entryHost := strings.TrimPrefix(entry, w.Prefix)
+		entryHost = strings.TrimSuffix(entryHost, w.EntrySuffix)
+		_ = entryHost
+		out := uc
+		out.Host = sub + w.UpstreamSuffix
+		if out.Referer == "" {
+			out.Referer = w.Referer
+		}
+		if out.Mode == "" || out.Mode == "ech" {
+			mode := ""
+			if ip, err := resolveHostIP(context.Background(), out.Host); err == nil {
+				if !isCloudflareIP(net.ParseIP(ip)) {
+					mode = "sni"
+				}
+			}
+			out.Mode = mode
+		}
+		log.Printf("[通配] %s -> %s (mode=%s referer=%s)", host, out.Host, out.Mode, out.Referer)
+		return out, true
+	}
+	return UpstreamConfig{}, false
+}
+
+// cloudflareCIDRs Cloudflare 边缘 IP 段 (AS13335), 用于判断 ECH 是否可用。
+var cloudflareCIDRs = []string{
+	"104.16.0.0/13",
+	"104.24.0.0/14",
+	"172.64.0.0/13",
+	"141.101.64.0/18",
+	"173.245.48.0/20",
+	"188.114.96.0/20",
+	"190.93.240.0/20",
+	"197.234.240.0/22",
+	"198.41.128.0/17",
+	"162.158.0.0/15",
+	"103.21.244.0/22",
+	"103.22.200.0/22",
+	"103.31.4.0/22",
+	"108.162.192.0/18",
+	"131.0.72.0/22",
+	"2400:cb00::/32",
+	"2606:4700::/32",
+	"2803:f800::/32",
+	"2405:b500::/32",
+	"2405:8100::/32",
+	"2a06:98c0::/29",
+	"2c0f:f248::/32",
+}
+
+var cloudflareNets = func() []*net.IPNet {
+	var nets []*net.IPNet
+	for _, c := range cloudflareCIDRs {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			nets = append(nets, n)
+		}
+	}
+	return nets
+}()
+
+// isCloudflareIP 判断 IP 是否属于 Cloudflare 边缘段。
+func isCloudflareIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, n := range cloudflareNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
@@ -274,6 +386,9 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		}
 
 		uc, ok := cfg[host]
+		if !ok {
+			uc, ok = matchWildcard(cfg, host)
+		}
 		if !ok {
 			log.Printf("[%s] 未找到上游配置: %s", clientIP, host)
 			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
