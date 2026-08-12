@@ -187,3 +187,50 @@ func TestURLEncodedDomainRewrite(t *testing.T) {
 		t.Errorf("plain subdomain broken: %s", got2)
 	}
 }
+
+// 回归: dlsite 页面里的被墙第三方域名(Google 字体/jsapi)应从响应剔除,
+// 避免浏览器直连挂起超时。ECH/SNI 都到不了这些域名。
+func TestBlockedThirdPartyHosts(t *testing.T) {
+	rw := buildEntryRewriter(UpstreamConfig{
+		Host: "www.dlsite.com",
+		Rewrites: map[string]string{
+			"www.dlsite.com": "dlsite.l.moonchan.xyz",
+		},
+	})
+	body := []byte(`<head>
+<link href="https://fonts.googleapis.com/css?family=Sawarabi+Gothic" rel="stylesheet">
+<script type="text/javascript" src="https://www.google.com/jsapi"></script>
+<script src="https://ajax.googleapis.com/ajax/libs/jquery/1.10.1/jquery.min.js"></script>
+<link href="https://dlsite.l.moonchan.xyz:8443/css/reset.css" rel="stylesheet">
+</head>`)
+	got := string(rw(body, "8443"))
+	for _, blocked := range []string{"fonts.googleapis.com", "www.google.com/jsapi", "ajax.googleapis.com"} {
+		if strings.Contains(got, blocked) {
+			t.Errorf("blocked host %q still present:\n%s", blocked, got)
+		}
+	}
+	if !strings.Contains(got, "dlsite.l.moonchan.xyz:8443/css/reset.css") {
+		t.Errorf("normal rewrite broken:\n%s", got)
+	}
+}
+
+// 回归: dlsite 页面里的被墙第三方域名(Google 字体/jsapi)应从响应剔除,
+// 避免浏览器直连挂起超时。ECH/SNI 都到不了这些域名。
+func TestBlockedThirdPartyStrip(t *testing.T) {
+	rw := buildEntryRewriter(UpstreamConfig{
+		Host: "www.dlsite.com",
+		Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
+	})
+	body := []byte(`<link href="https://fonts.googleapis.com/css?family=Sawarabi+Gothic" rel="stylesheet">
+<script type="text/javascript" src="https://www.google.com/jsapi"></script>
+<link href="https://dlsite.l.moonchan.xyz:8443/css/reset.css" rel="stylesheet">`)
+	got := string(rw(body, "8443"))
+	for _, b := range []string{"fonts.googleapis.com", "www.google.com/jsapi"} {
+		if strings.Contains(got, b) {
+			t.Errorf("blocked %q still present:\n%s", b, got)
+		}
+	}
+	if !strings.Contains(got, "dlsite.l.moonchan.xyz:8443/css/reset.css") {
+		t.Errorf("normal rewrite broken:\n%s", got)
+	}
+}

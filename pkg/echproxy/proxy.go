@@ -163,7 +163,86 @@ func buildEntryRewriter(uc UpstreamConfig) func([]byte, string) []byte {
 		base := strings.TrimSuffix(w.Prefix, "-")
 		rules[strings.TrimPrefix(w.UpstreamSuffix, ".")] = base + w.EntrySuffix
 	}
-	return buildRewriter(rules)
+	// 直连不可达的第三方域名(被墙): 响应里出现的这些 URL 整段删除,
+	// 浏览器不再发起请求, 避免挂起超时。ECH/SNI 都无法到达这些域名。
+	// 先删整段 URL(专用函数), 再做域名重写。
+	blocked := append([]string(nil), blockedUpstreamHosts...)
+	base := buildRewriter(rules)
+	return func(body []byte, port string) []byte {
+		return base(stripBlockedURLs(body, blocked), port)
+	}
+}
+
+// blockedUpstreamHosts 直连被墙、代理也无法到达的第三方域名。
+// 重写为空串 = 从响应中剔除引用(如 <script src="..."> 变 <script src="">)。
+var blockedUpstreamHosts = []string{
+	"https://fonts.googleapis.com",
+	"https://fonts.gstatic.com",
+	"https://www.google.com/jsapi",
+	"https://ajax.googleapis.com",
+	"https://www.googletagmanager.com",
+}
+
+// stripBlockedURLs 从响应文本中移除被墙第三方域名的完整 URL 值。
+// 处理形如 href="https://fonts.googleapis.com/..." / src="https://.../jsapi"
+// 的整段引用: 把整个 URL(含引号内内容)替换为空串, 浏览器不再发起请求。
+// 与域名重写互补: 重写只换域名, 这里删整段。
+func stripBlockedURLs(body []byte, blocked []string) []byte {
+	out := body
+	for _, b := range blocked {
+		out = stripOneBlockedURL(out, []byte(b))
+	}
+	return out
+}
+
+// stripOneBlockedURL 删除所有包含 blocked 前缀的引号内 URL。
+// 支持 '...' 与 "..." 两种引号; blocked 匹配 URL 开头。
+func stripOneBlockedURL(body, blocked []byte) []byte {
+	var out []byte
+	rest := body
+	for {
+		i := bytes.Index(rest, blocked)
+		if i < 0 {
+			out = append(out, rest...)
+			break
+		}
+		// 向前找 URL 起点: 最近的 ' 或 "。
+		start := i
+		for start > 0 && rest[start-1] != '\'' && rest[start-1] != '"' {
+			start--
+		}
+		if start == 0 {
+			// 没有引号包裹(裸文本), 保守只删匹配前缀本身。
+			out = append(out, rest[:i]...)
+			rest = rest[i+len(blocked):]
+			continue
+		}
+		// 从引号后到匹配起点之间应是 https:// 等协议前缀。
+		between := rest[start:i]
+		if !bytes.HasPrefix(between, []byte("https://")) &&
+			!bytes.HasPrefix(between, []byte("http://")) &&
+			!bytes.HasPrefix(between, []byte("//")) {
+			// 协议前缀不符, 视为普通文本(如 JS 字符串), 只删匹配前缀。
+			out = append(out, rest[:i]...)
+			rest = rest[i+len(blocked):]
+			continue
+		}
+		// 找到右引号。
+		quote := rest[start]
+		j := i
+		for j < len(rest) && rest[j] != quote {
+			j++
+		}
+		if j >= len(rest) {
+			// 未闭合引号, 删到行尾/匹配结尾。
+			out = append(out, rest[:start+1]...)
+			rest = rest[i+len(blocked):]
+			continue
+		}
+		out = append(out, rest[:start+1]...)
+		rest = rest[j:]
+	}
+	return out
 }
 
 // buildRewriter 从重写规则表构造域名替换器。
@@ -378,9 +457,22 @@ const __wtRules = [`)
 	}
 	b.WriteString(`
 ];
+// __wtBlock: 直连不可达的第三方域名(如被墙的 Google 字体/jsapi),
+// 直接在 SW 里拦截返回 204, 避免页面挂起等待。
+const __wtBlock = [
+  "fonts.googleapis.com",
+  "fonts.gstatic.com",
+  "www.google.com/jsapi",
+  "ajax.googleapis.com",
+  "www.googletagmanager.com",
+];
 self.addEventListener('fetch', (e) => {
   try {
     const u = new URL(e.request.url);
+    if (__wtBlock.some((b) => (u.hostname + u.pathname).startsWith(b))) {
+      e.respondWith(new Response('', { status: 204 }));
+      return;
+    }
     let p = __wtMap[u.hostname];
     if (!p) {
       const h = u.hostname;
