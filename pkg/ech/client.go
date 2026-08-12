@@ -350,7 +350,9 @@ func New() (*Client, error) {
 	return &Client{
 		inner: &http.Client{
 			Transport: transport,
-			Timeout:   30 * time.Second,
+			// 不用总 Timeout: 会砍断 >30s 的大文件/视频下载
+			// (浏览器表现为 206 CONTENT_LENGTH_MISMATCH 只传一半)。
+			Timeout: 0,
 		},
 	}, nil
 }
@@ -467,7 +469,9 @@ func rebuildClient(echConfig []byte) (*Client, error) {
 	return &Client{
 		inner: &http.Client{
 			Transport: transport,
-			Timeout:   30 * time.Second,
+			// 不用总 Timeout: 会砍断 >30s 的大文件/视频下载
+			// (浏览器表现为 206 CONTENT_LENGTH_MISMATCH 只传一半)。
+			Timeout: 0,
 		},
 	}, nil
 }
