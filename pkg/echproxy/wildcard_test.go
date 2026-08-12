@@ -83,3 +83,37 @@ func TestSWInjectPrepend(t *testing.T) {
 		t.Errorf("wildcard suffix missing in inject")
 	}
 }
+
+func TestBuildEntryRewriterInherit(t *testing.T) {
+	cfg := UpstreamMap{
+		"iwara.l.moonchan.xyz": {
+			Host: "iwara.tv",
+			Wildcard: &WildcardRule{
+				Prefix:         "iwara-",
+				EntrySuffix:    ".l.moonchan.xyz",
+				UpstreamSuffix: ".iwara.tv",
+				Referer:        "https://www.iwara.tv/",
+			},
+		},
+		"iwara-api.l.moonchan.xyz": {Host: "api.iwara.tv"},
+	}
+	// 子入口无 wildcard, 应继承主入口规则。
+	sub := cfg["iwara-api.l.moonchan.xyz"]
+	sub.Wildcard = inheritWildcard(cfg, "iwara-api.l.moonchan.xyz")
+	if sub.Wildcard == nil {
+		t.Fatal("inheritWildcard returned nil")
+	}
+	rw := buildEntryRewriter(sub)
+	body := []byte(`{"u":"https://filesq.iwara.tv/a.mp4","bare":"https://iwara.tv/"}`)
+	got := string(rw(body, "8443"))
+	for _, want := range []string{"iwara-filesq.l.moonchan.xyz:8443", "iwara.l.moonchan.xyz:8443"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rewrite result missing %q: %s", want, got)
+		}
+	}
+	// 主入口自身也应推导裸域 + 通配。
+	rwMain := buildEntryRewriter(cfg["iwara.l.moonchan.xyz"])
+	if !strings.Contains(string(rwMain([]byte(`https://news.iwara.tv/x`), "")), "iwara-news.l.moonchan.xyz") {
+		t.Error("main entry wildcard rewrite failed")
+	}
+}

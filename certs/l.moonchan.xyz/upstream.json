@@ -35,8 +35,6 @@
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
                 "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
@@ -52,8 +50,6 @@
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
                 "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
@@ -67,8 +63,6 @@
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
                 "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
@@ -81,8 +75,6 @@
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
                 "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
@@ -95,8 +87,6 @@
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
                 "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
@@ -109,8 +99,6 @@
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
                 "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
@@ -124,12 +112,10 @@
             },
             "rewrites": {
                 "www.pixiv.net": "pixiv.l.moonchan.xyz",
-                "pixiv.net": "pixiv.l.moonchan.xyz",
                 "app-api.pixiv.net": "pixiv-api.l.moonchan.xyz",
                 "oauth.secure.pixiv.net": "pixiv-oauth.l.moonchan.xyz",
                 "i.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "s.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "*.pixiv.net": "pixiv-*.l.moonchan.xyz"
+                "s.pximg.net": "pixiv-img.l.moonchan.xyz"
             }
         },
         "pixiv-api.l.moonchan.xyz": {
@@ -137,12 +123,10 @@
             "referer": "https://www.pixiv.net/",
             "rewrites": {
                 "www.pixiv.net": "pixiv.l.moonchan.xyz",
-                "pixiv.net": "pixiv.l.moonchan.xyz",
                 "app-api.pixiv.net": "pixiv-api.l.moonchan.xyz",
                 "oauth.secure.pixiv.net": "pixiv-oauth.l.moonchan.xyz",
                 "i.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "s.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "*.pixiv.net": "pixiv-*.l.moonchan.xyz"
+                "s.pximg.net": "pixiv-img.l.moonchan.xyz"
             }
         },
         "pixiv-oauth.l.moonchan.xyz": {
@@ -150,12 +134,10 @@
             "referer": "https://www.pixiv.net/",
             "rewrites": {
                 "www.pixiv.net": "pixiv.l.moonchan.xyz",
-                "pixiv.net": "pixiv.l.moonchan.xyz",
                 "app-api.pixiv.net": "pixiv-api.l.moonchan.xyz",
                 "oauth.secure.pixiv.net": "pixiv-oauth.l.moonchan.xyz",
                 "i.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "s.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "*.pixiv.net": "pixiv-*.l.moonchan.xyz"
+                "s.pximg.net": "pixiv-img.l.moonchan.xyz"
             }
         },
         "pixiv-img.l.moonchan.xyz": {
@@ -164,12 +146,10 @@
             "referer": "https://www.pixiv.net/",
             "rewrites": {
                 "www.pixiv.net": "pixiv.l.moonchan.xyz",
-                "pixiv.net": "pixiv.l.moonchan.xyz",
                 "app-api.pixiv.net": "pixiv-api.l.moonchan.xyz",
                 "oauth.secure.pixiv.net": "pixiv-oauth.l.moonchan.xyz",
                 "i.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "s.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "*.pixiv.net": "pixiv-*.l.moonchan.xyz"
+                "s.pximg.net": "pixiv-img.l.moonchan.xyz"
             }
         }
     }

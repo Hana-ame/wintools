@@ -140,6 +140,29 @@ func isHopByHop(name string) bool {
 
 // buildRewriter 预排序替换键（长域名优先，避免子串误伤），返回替换函数。
 // port 非空时追加到替换目标末尾（如 pixiv.l.moonchan.xyz:8443）。
+// buildEntryRewriter 从单条 UpstreamConfig 构造响应域名重写器:
+// 精确 rewrites 原样使用; wildcard 非空时自动推导通配条目——
+//   *.iwara.tv  -> iwara-*.l.moonchan.xyz (任意子域)
+//   iwara.tv    -> iwara.l.moonchan.xyz   (裸域)
+// 规则单一来源: 配置只写 wildcard 一次, 响应重写/SW 拦截都从这里推导。
+func buildEntryRewriter(uc UpstreamConfig) func([]byte, string) []byte {
+	rules := make(map[string]string, len(uc.Rewrites)+2)
+	for k, v := range uc.Rewrites {
+		rules[k] = v
+	}
+	if uc.Wildcard != nil {
+		w := uc.Wildcard
+		// 通配: *.iwara.tv -> iwara-*.l.moonchan.xyz
+		rules["*"+w.UpstreamSuffix] = w.Prefix + "*" + w.EntrySuffix
+		// 裸域: iwara.tv -> iwara.l.moonchan.xyz
+		base := strings.TrimSuffix(w.Prefix, "-")
+		rules[strings.TrimPrefix(w.UpstreamSuffix, ".")] = base + w.EntrySuffix
+	}
+	return buildRewriter(rules)
+}
+
+// buildRewriter 从重写规则表构造域名替换器。
+// 精确 key 与通配 key("*.suffix") 并存, 精确优先。
 func buildRewriter(rt map[string]string) func([]byte, string) []byte {
 	var exact, wildcard []string
 	for k := range rt {
@@ -391,18 +414,31 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 			out.Referer = w.Referer
 		}
 		if out.Mode == "" || out.Mode == "ech" {
-			mode := ""
-			if ip, err := resolveHostIP(context.Background(), out.Host); err == nil {
-				if !isCloudflareIP(net.ParseIP(ip)) {
-					mode = "sni"
-				}
-			}
-			out.Mode = mode
+			out.Mode = wildcardMode(context.Background(), out.Host)
 		}
 		log.Printf("[通配] %s -> %s (mode=%s referer=%s)", host, out.Host, out.Mode, out.Referer)
 		return out, true
 	}
 	return UpstreamConfig{}, false
+}
+
+// wildcardModeCache 通配入口的 mode 探测结果缓存 (host -> mode), 避免每次请求 DoH。
+var wildcardModeCache sync.Map
+
+// wildcardMode 判断上游域名应走的通道: Cloudflare 段 ECH, 否则 SNI。
+// 探测一次后缓存, 域名 IP 变动依赖 ipCache 的 TTL 自然失效。
+func wildcardMode(ctx context.Context, host string) string {
+	if v, ok := wildcardModeCache.Load(host); ok {
+		return v.(string)
+	}
+	mode := ""
+	if ip, err := resolveHostIP(ctx, host); err == nil {
+		if !isCloudflareIP(net.ParseIP(ip)) {
+			mode = "sni"
+		}
+	}
+	wildcardModeCache.Store(host, mode)
+	return mode
 }
 
 // cloudflareCIDRs Cloudflare 边缘 IP 段 (AS13335), 用于判断 ECH 是否可用。
@@ -454,6 +490,23 @@ func isCloudflareIP(ip net.IP) bool {
 	return false
 }
 
+// inheritWildcard 从配置中找到所属站族主入口的 wildcard 规则。
+// 子入口(如 iwara-api.l.moonchan.xyz)未显式配置 wildcard 时,
+// 继承主入口(iwara.l.moonchan.xyz)的通配规则, 保证响应重写一致。
+// 判断依据: 入口名以 wildcard.Prefix 开头且共享 EntrySuffix。
+func inheritWildcard(cfg UpstreamMap, entry string) *WildcardRule {
+	for _, uc := range cfg {
+		w := uc.Wildcard
+		if w == nil {
+			continue
+		}
+		if strings.HasPrefix(entry, w.Prefix) && strings.HasSuffix(entry, w.EntrySuffix) {
+			return w
+		}
+	}
+	return nil
+}
+
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
 // 命中规则的 Rewrites 非空时启用响应域名替换。
 //
@@ -485,10 +538,14 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 			return
 		}
 
-		var rewriter func([]byte, string) []byte
-		if len(uc.Rewrites) > 0 {
-			rewriter = buildRewriter(uc.Rewrites)
+		// 响应域名重写器: 精确 rewrites + wildcard 推导的通配条目,
+		// 规则单一来源 (wildcard 字段), 不在此处重复配置。
+		// 子入口未配 wildcard 时继承主入口的通配规则。
+		ucForRewrite := uc
+		if ucForRewrite.Wildcard == nil {
+			ucForRewrite.Wildcard = inheritWildcard(cfg, host)
 		}
+		rewriter := buildEntryRewriter(ucForRewrite)
 
 		// service worker 注入: sw.js/workbox 响应时把 fetch 拦截代码
 		// 插到最前面(保留上游 workbox 原内容), 拦截动态拼接的

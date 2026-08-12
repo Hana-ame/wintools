@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	_ "embed"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -22,154 +21,6 @@ import (
 
 //go:embed static/index.html
 var chatHTML string
-
-const embeddedConfig = `{
-    "upstreams": {
-        "l.moonchan.xyz": {
-            "host": "reminder.moonchan.xyz",
-            "mode": "direct"
-        },
-        "twimg.l.moonchan.xyz": {
-            "host": "video-cf.twimg.com",
-            "referer": "https://x.com"
-        },
-        "ex.l.moonchan.xyz": {
-            "host": "exhentai.org"
-        },
-        "sukebei.l.moonchan.xyz": {
-            "host": "sukebei.nyaa.si",
-            "mode": "sni"
-        },
-        "ao3.l.moonchan.xyz": {
-            "host": "archiveofourown.org"
-        },
-        "iwara.l.moonchan.xyz": {
-            "host": "iwara.tv",
-            "referer": "https://www.iwara.tv/",
-            "wildcard": {
-                "prefix": "iwara-",
-                "entry_suffix": ".l.moonchan.xyz",
-                "upstream_suffix": ".iwara.tv",
-                "referer": "https://www.iwara.tv/"
-            },
-            "rewrites": {
-                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
-                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
-                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
-                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "www.iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
-            }
-        },
-        "iwara-api.l.moonchan.xyz": {
-            "host": "api.iwara.tv",
-            "referer": "https://www.iwara.tv/",
-            "rewrites": {
-                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
-                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
-                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
-                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "www.iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
-            }
-        },
-        "iwara-files.l.moonchan.xyz": {
-            "host": "files.iwara.tv",
-            "mode": "sni",
-            "referer": "https://www.iwara.tv/",
-            "rewrites": {
-                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
-                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
-                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
-                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "www.iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
-            }
-        },
-        "iwara-img.l.moonchan.xyz": {
-            "host": "i.iwara.tv",
-            "referer": "https://www.iwara.tv/",
-            "rewrites": {
-                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
-                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
-                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
-                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "www.iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
-            }
-        },
-        "iwara-service.l.moonchan.xyz": {
-            "host": "service.iwara.tv",
-            "referer": "https://www.iwara.tv/",
-            "rewrites": {
-                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
-                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
-                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
-                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "www.iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
-            }
-        },
-        "iwara-news.l.moonchan.xyz": {
-            "host": "news.iwara.tv",
-            "referer": "https://www.iwara.tv/",
-            "rewrites": {
-                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
-                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
-                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
-                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
-                "iwara.tv": "iwara.l.moonchan.xyz",
-                "www.iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
-            }
-        },
-        "pixiv.l.moonchan.xyz": {
-            "host": "www.pixiv.net",
-            "wildcard": {
-                "prefix": "pixiv-",
-                "entry_suffix": ".l.moonchan.xyz",
-                "upstream_suffix": ".pixiv.net",
-                "referer": "https://www.pixiv.net/"
-            },
-            "rewrites": {
-                "www.pixiv.net": "pixiv.l.moonchan.xyz",
-                "pixiv.net": "pixiv.l.moonchan.xyz",
-                "app-api.pixiv.net": "pixiv-api.l.moonchan.xyz",
-                "oauth.secure.pixiv.net": "pixiv-oauth.l.moonchan.xyz",
-                "i.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "s.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "*.pixiv.net": "pixiv-*.l.moonchan.xyz"
-            }
-        },
-        "pixiv-api.l.moonchan.xyz": {
-            "host": "app-api.pixiv.net",
-            "referer": "https://www.pixiv.net/"
-        },
-        "pixiv-oauth.l.moonchan.xyz": {
-            "host": "oauth.secure.pixiv.net",
-            "referer": "https://www.pixiv.net/"
-        },
-        "pixiv-img.l.moonchan.xyz": {
-            "host": "i.pximg.net",
-            "mode": "sni",
-            "referer": "https://www.pixiv.net/"
-        },
-        "zen.l.moonchan.xyz": {
-            "host": "opencode.ai"
-        }
-    }
-}`
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
@@ -222,29 +73,22 @@ func main() {
 	var upstreamHandler gin.HandlerFunc
 	var tlsCert *tls.Certificate
 
-	if *httpMode {
-		var cfg echproxy.Config
-		if err := json.Unmarshal([]byte(embeddedConfig), &cfg); err != nil {
-			log.Fatalf("解析内置上游配置失败: %v", err)
-		}
-		upstreamCfg = cfg.Upstreams
-		log.Printf("内置上游配置加载成功: %d 条规则", len(upstreamCfg))
-		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
-	} else {
-		// 全部配置每次启动经 proxy.moonchan.xyz 拉取到内存，不落盘。
-		// 证书 URL 与上游路由都写死在 repo 的 upstream.json 配置里，
-		// 证书续期后只需更新该配置指向的 URL。
-		proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
-		upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
+	// 配置单一来源: 无论 TLS 还是 --http 模式, 都从 GitHub 拉取同一份
+	// upstream.json (避免 embeddedConfig 与仓库配置双份漂移)。
+	proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
+	upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
 
-		log.Printf("正在加载上游配置: %s", upstreamConfigURL)
-		cfg, err := echproxy.LoadConfig(upstreamConfigURL)
-		if err != nil {
-			log.Fatalf("加载上游配置失败: %v", err)
-		}
-		upstreamCfg = cfg.Upstreams
-		log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
+	log.Printf("正在加载上游配置: %s", upstreamConfigURL)
+	cfg, err := echproxy.LoadConfig(upstreamConfigURL)
+	if err != nil {
+		log.Fatalf("加载上游配置失败: %v", err)
+	}
+	upstreamCfg = cfg.Upstreams
+	log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
 
+	if !*httpMode {
+		// TLS 模式额外拉取证书: 证书 URL 与上游路由都写死在 repo 的
+		// upstream.json 配置里, 证书续期后只需更新该配置指向的 URL。
 		log.Printf("正在拉取证书: %s", cfg.CertPath)
 		certPEM, err := echproxy.FetchBytes(cfg.CertPath)
 		if err != nil {

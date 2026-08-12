@@ -137,12 +137,12 @@ func TestProxyHandlerSNIMode(t *testing.T) {
 	}
 
 	var cfg echproxy.Config
-	if err := json.Unmarshal([]byte(embeddedConfig), &cfg); err != nil {
-		t.Fatalf("解析 embeddedConfig 失败: %v", err)
+	cfg.Upstreams = echproxy.UpstreamMap{
+		"sukebei.l.moonchan.xyz": {Host: "sukebei.nyaa.si", Mode: "sni"},
 	}
 	uc, ok := cfg.Upstreams["sukebei.l.moonchan.xyz"]
 	if !ok {
-		t.Fatal("embeddedConfig 缺少 sukebei.l.moonchan.xyz")
+		t.Fatal("配置缺少 sukebei.l.moonchan.xyz")
 	}
 	if uc.Mode != "sni" {
 		t.Errorf("sukebei mode = %q, want \"sni\"", uc.Mode)
