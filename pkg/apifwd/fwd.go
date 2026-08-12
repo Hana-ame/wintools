@@ -25,7 +25,12 @@ func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-site, Accept, X-Requested-With")
+		// 回显前端预检声明的请求头, 无论带什么自定义头都放行。
+		if h := c.GetHeader("Access-Control-Request-Headers"); h != "" {
+			c.Header("Access-Control-Allow-Headers", h)
+		} else {
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Origin, X-Requested-With, Cache-Control, User-Agent")
+		}
 		c.Header("Access-Control-Max-Age", "86400")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(204)
