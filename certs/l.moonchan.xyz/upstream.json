@@ -101,6 +101,19 @@
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
+        },
+        "dlsite.l.moonchan.xyz": {
+            "host": "www.dlsite.com",
+            "referer": "https://www.dlsite.com/",
+            "wildcard": {
+                "prefix": "dlsite-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".dlsite.com",
+                "referer": "https://www.dlsite.com/"
+            },
+            "rewrites": {
+                "www.dlsite.com": "dlsite.l.moonchan.xyz"
+            }
         }
     }
 }
