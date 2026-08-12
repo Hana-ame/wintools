@@ -35,8 +35,9 @@ jobs:
                go build -trimpath -ldflags="-s -w" \
                -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
           done
-          # scripts/*.go 单文件工具（capture-proxy 等）
+          # scripts/*.go 单文件工具（无 .go 时跳过, 目录可能已清空）
           for script in scripts/*.go; do
+            [ -f "$script" ] || continue
             name=$(basename "$script" .go)
             ext=""
             [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
