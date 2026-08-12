@@ -47,6 +47,11 @@ type WildcardRule struct {
 type UpstreamConfig struct {
 	Host     string            `json:"host"`
 	Referer  string            `json:"referer,omitempty"`
+	// Cookie 固定注入上游请求 (初始化 cookie overrider):
+	// 在 upstream.json 里直接写死需要携带的 Cookie 头原文,
+	// 适用于 exhentai 等需要登录态/特殊 cookie 的站点, 不依赖浏览器。
+	// 优先级: 此固定 cookie > 内存 jar > 客户端 cookie。
+	Cookie   string            `json:"cookie,omitempty"`
 	Mode     string            `json:"mode,omitempty"`
 	Rewrites map[string]string `json:"rewrites,omitempty"`
 	Wildcard *WildcardRule     `json:"wildcard,omitempty"`
@@ -413,10 +418,14 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 		if out.Referer == "" {
 			out.Referer = w.Referer
 		}
+		// 通配入口继承主入口固定 cookie (如整站需要同一登录态)。
+		if out.Cookie == "" {
+			out.Cookie = uc.Cookie
+		}
 		if out.Mode == "" || out.Mode == "ech" {
 			out.Mode = wildcardMode(context.Background(), out.Host)
 		}
-		log.Printf("[通配] %s -> %s (mode=%s referer=%s)", host, out.Host, out.Mode, out.Referer)
+		log.Printf("[通配] %s -> %s (mode=%s referer=%s cookie=%v)", host, out.Host, out.Mode, out.Referer, out.Cookie != "")
 		return out, true
 	}
 	return UpstreamConfig{}, false
@@ -590,6 +599,11 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		outReq.ContentLength = c.Request.ContentLength
 
 		applyCookies(uc.Host, outReq)
+		// 固定 cookie overrider: upstream.json 里配置的 Cookie 原样覆盖,
+		// 覆盖内存 jar 与客户端 cookie (登录态/特殊 cookie 不依赖浏览器)。
+		if uc.Cookie != "" {
+			outReq.Header.Set("Cookie", uc.Cookie)
+		}
 
 		resp, err := proxyRoundTrip(outReq, uc.Mode)
 		if err != nil {
