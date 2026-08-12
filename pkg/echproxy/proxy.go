@@ -212,6 +212,13 @@ func replaceWildcardDomain(body []byte, suffix, target string) []byte {
 		// 从后缀前回溯域名主体 (子域部分)。
 		start := i
 		for start > 0 && isDomainChar(rest[start-1]) {
+			// 跳过 URL 编码 %XX: %2F 里的十六进制字符(F/2)不是子域,
+			// 否则 https%3A%2F%2Fwww.dlsite.com 会被错拼成
+			// dlsite-2Fwww.l.moonchan.xyz, 破坏 login 等带编码链接。
+			if start >= 3 && rest[start-3] == '%' &&
+				isHexDigit(rest[start-2]) && isHexDigit(rest[start-1]) {
+				break
+			}
 			start--
 		}
 		sub := string(rest[start:i])
@@ -236,7 +243,12 @@ func replaceWildcardDomain(body []byte, suffix, target string) []byte {
 		if j < len(rest) {
 			right = rest[j]
 		}
-		if !isDomainChar(left) && !isDomainChar(right) {
+		// left 是 %XX 的最后一个 hex 时(如 %2F 的 F)不算域名残留。
+		leftOK := !isDomainChar(left)
+		if start >= 3 && rest[start-3] == '%' && isHexDigit(rest[start-2]) && isHexDigit(left) {
+			leftOK = true
+		}
+		if leftOK && !isDomainChar(right) {
 			out = append(out, rest[:start]...)
 			out = append(out, strings.ReplaceAll(target, "*", sub)...)
 			rest = rest[j:]
@@ -269,14 +281,20 @@ func replaceDomainBounded(body []byte, from, to string) []byte {
 		if i+len(fromB) < len(rest) {
 			right = rest[i+len(fromB)]
 		}
-		if isDomainChar(left) || isDomainChar(right) {
-			out = append(out, rest[:i+1]...)
-			rest = rest[i+1:]
+		// left 是 %XX 的最后一个 hex 时(如 %2F 的 F)不算域名残留,
+		// 否则 URL 编码链接里的域名不会被替换。
+		leftOK := !isDomainChar(left)
+		if i >= 3 && rest[i-3] == '%' && isHexDigit(rest[i-2]) && isHexDigit(left) {
+			leftOK = true
+		}
+		if leftOK && !isDomainChar(right) {
+			out = append(out, rest[:i]...)
+			out = append(out, toB...)
+			rest = rest[i+len(fromB):]
 			continue
 		}
-		out = append(out, rest[:i]...)
-		out = append(out, toB...)
-		rest = rest[i+len(fromB):]
+		out = append(out, rest[:i+1]...)
+		rest = rest[i+1:]
 	}
 	return out
 }
@@ -284,6 +302,11 @@ func replaceDomainBounded(body []byte, from, to string) []byte {
 func isDomainChar(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
 		c >= '0' && c <= '9' || c == '-' || c == '.'
+}
+
+// isHexDigit 判断是否为 URL 编码 %XX 中的十六进制字符。
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 // isServiceWorkerPath 判断请求是否为 service worker 脚本 (sw.js / workbox-*.js)。
@@ -387,6 +410,12 @@ self.addEventListener('fetch', (e) => {
 });
 `)
 	return b.String()
+}
+
+// MatchWildcardForTest 导出通配匹配判断, 供 main 路由分发确认
+// 请求是否命中通配入口(未匹配到精确配置时)。
+func MatchWildcardForTest(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
+	return matchWildcard(cfg, host)
 }
 
 // matchWildcard 按 WildcardRule 通配匹配入口:

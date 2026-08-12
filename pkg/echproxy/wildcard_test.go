@@ -166,3 +166,24 @@ func TestFixedCookieOverride(t *testing.T) {
 		t.Errorf("wildcard cookie inherit: got %q", uc.Cookie)
 	}
 }
+
+// 回归: dlsite login 链接里域名前是 URL 编码 %2F,
+// 十六进制字符 F/2 不能被当成子域, 也不能被当域名残留拒绝替换。
+func TestURLEncodedDomainRewrite(t *testing.T) {
+	rw := buildRewriter(map[string]string{
+		"www.dlsite.com": "dlsite.l.moonchan.xyz",
+		"*.dlsite.com":   "dlsite-*.l.moonchan.xyz",
+	})
+	body := []byte(`<a href="/home/login/=/skip_register/1/_query/https%3A%2F%2Fwww.dlsite.com%2Fhome%2Fmypage">login</a>`)
+	got := string(rw(body, "8443"))
+	want := `<a href="/home/login/=/skip_register/1/_query/https%3A%2F%2Fdlsite.l.moonchan.xyz:8443%2Fhome%2Fmypage">login</a>`
+	if got != want {
+		t.Errorf("got:  %s\nwant: %s", got, want)
+	}
+	// 普通子域不受影响
+	body2 := []byte(`{"u":"https://ch.dlsite.com/x"}`)
+	got2 := string(rw(body2, "8443"))
+	if !strings.Contains(got2, "dlsite-ch.l.moonchan.xyz:8443") {
+		t.Errorf("plain subdomain broken: %s", got2)
+	}
+}
