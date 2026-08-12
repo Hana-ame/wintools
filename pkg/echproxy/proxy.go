@@ -21,6 +21,7 @@ import (
 	"time"
 
 	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
+	"github.com/Hana-ame/wintools/pkg/netdial"
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
@@ -54,7 +55,7 @@ type Config struct {
 
 // FetchBytes 从 URL 拉取内容到内存（不落盘），请求失败或状态非 200 时报错。
 func FetchBytes(rawURL string) ([]byte, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := netdial.Client(30 * time.Second)
 	resp, err := client.Get(rawURL)
 	if err != nil {
 		return nil, err
@@ -70,7 +71,7 @@ func FetchBytes(rawURL string) ([]byte, error) {
 
 // LoadConfig 从远程 URL 加载上游配置 JSON（证书 URL + 路由规则）。
 func LoadConfig(rawURL string) (*Config, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := netdial.Client(30 * time.Second)
 	resp, err := client.Get(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch upstream config: %w", err)
@@ -107,7 +108,8 @@ var hopByHopHeaders = []string{
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		l := strings.ToLower(k)
-		if isHopByHop(k) || strings.HasPrefix(l, "access-control-") {
+		if isHopByHop(k) || strings.HasPrefix(l, "access-control-") ||
+			strings.HasPrefix(l, "content-security-policy") {
 			continue
 		}
 		for _, v := range vs {
@@ -183,6 +185,73 @@ func isDomainChar(c byte) bool {
 		c >= '0' && c <= '9' || c == '-' || c == '.'
 }
 
+// isServiceWorkerPath 判断请求是否为 service worker 脚本 (sw.js / workbox-*.js)。
+func isServiceWorkerPath(p string) bool {
+	base := p[strings.LastIndex(p, "/")+1:]
+	return base == "sw.js" ||
+		strings.HasPrefix(base, "service-worker") ||
+		(strings.HasPrefix(base, "workbox-") && strings.HasSuffix(base, ".js"))
+}
+
+// buildSWProxyMap 收集「真实上游域名 → 代理入口域名[:端口]」映射，
+// 供 service worker 注入使用: 前端动态请求上游域名时改道到代理。
+func buildSWProxyMap(cfg UpstreamMap, port string) map[string]string {
+	m := make(map[string]string)
+	for entry, uc := range cfg {
+		if uc.Host == "" || strings.Contains(uc.Host, "moonchan.xyz") {
+			continue
+		}
+		target := entry
+		if port != "" {
+			target += ":" + port
+		}
+		m[uc.Host] = target
+	}
+	return m
+}
+
+// swOverrideJS 生成注入到 service worker 的 fetch 拦截代码。
+// 拦截真实域名请求并改道到代理入口（带原端口），兜住前端运行时动态
+// 拼接的 URL（静态 rewriter 无法覆盖的场景）。
+func swOverrideJS(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteString(`self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+const __wtMap = {`)
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "\n  %q: %q", k, m[k])
+	}
+	b.WriteString(`
+};
+self.addEventListener('fetch', (e) => {
+  try {
+    const u = new URL(e.request.url);
+    const p = __wtMap[u.hostname];
+    if (!p) return;
+    const d = u.protocol + '//' + p + u.pathname + u.search;
+    e.respondWith(fetch(d, {
+      method: e.request.method,
+      headers: e.request.headers,
+      body: e.request.body,
+      mode: e.request.mode,
+      credentials: e.request.credentials,
+      redirect: e.request.redirect,
+    }));
+  } catch (err) {}
+});
+`)
+	return b.String()
+}
+
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
 // 命中规则的 Rewrites 非空时启用响应域名替换。
 //
@@ -214,6 +283,24 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		var rewriter func([]byte, string) []byte
 		if len(uc.Rewrites) > 0 {
 			rewriter = buildRewriter(uc.Rewrites)
+		}
+
+		// service worker 注入: sw.js/workbox 响应前插 fetch 拦截,
+		// 把动态出现的 *.iwara.tv 等真实域名请求改道到代理入口,
+		// 兜住 JS 运行时拼接的 URL(rewriter 改不到)。
+		if isServiceWorkerPath(rawPath) {
+			port := ""
+			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+				port = p
+			}
+			swProxyMap := buildSWProxyMap(cfg, port)
+			if len(swProxyMap) > 0 {
+				c.Header("Content-Type", "application/javascript")
+				c.Status(http.StatusOK)
+				c.Writer.Write([]byte(swOverrideJS(swProxyMap)))
+				log.Printf("[%s] %s %s -> SW override 注入 %d 条规则", clientIP, method, rawPath, len(swProxyMap))
+				return
+			}
 		}
 
 		targetURL := &url.URL{
@@ -328,7 +415,7 @@ func proxyRoundTrip(req *http.Request, mode string) (*http.Response, error) {
 	switch mode {
 	case "direct":
 		req.Host = ""
-		return (&http.Client{Timeout: 0}).Do(req)
+		return (netdial.Client(0)).Do(req)
 	case "sni":
 		log.Printf("-> SNI 伪装: %s %s (Host: %s)", req.Method, req.URL.String(), req.Host)
 		return sniFrontDo(req)
@@ -406,7 +493,7 @@ func resolveHostIP(ctx context.Context, host string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/dns-json")
-	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	resp, err := (netdial.Client(8 * time.Second)).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("DoH %s: %w", host, err)
 	}
@@ -567,8 +654,7 @@ func isCookieAlive(c *http.Cookie, now time.Time) bool {
 
 // applyCookies 把内存 jar 中该上游域名的 cookie 合并进请求。
 // jar 中同名 cookie 优先（服务端最近下发的为准），并顺带清理过期项。
-func applyCookies(host string, req *http.Request) {
-	cookieMu.Lock()
+func applyCookies(host string, req *http.Request) {	cookieMu.Lock()
 	defer cookieMu.Unlock()
 
 	now := time.Now()

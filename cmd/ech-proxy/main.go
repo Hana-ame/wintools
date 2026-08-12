@@ -54,22 +54,57 @@ const embeddedConfig = `{
             }
         },
         "iwara-api.l.moonchan.xyz": {
-            "host": "api.iwara.tv"
+            "host": "api.iwara.tv",
+            "rewrites": {
+                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
+                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
+                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
+                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+            }
         },
         "iwara-files.l.moonchan.xyz": {
             "host": "files.iwara.tv",
-            "mode": "sni"
+            "mode": "sni",
+            "rewrites": {
+                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
+                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
+                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
+                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+            }
         },
         "iwara-img.l.moonchan.xyz": {
             "host": "i.iwara.tv",
-            "referer": "https://www.iwara.tv/"
+            "referer": "https://www.iwara.tv/",
+            "rewrites": {
+                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
+                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
+                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
+                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+            }
         },
         "iwara-service.l.moonchan.xyz": {
-            "host": "service.iwara.tv"
+            "host": "service.iwara.tv",
+            "rewrites": {
+                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
+                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
+                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
+                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+            }
         },
         "iwara-news.l.moonchan.xyz": {
             "host": "news.iwara.tv",
-            "referer": "https://www.iwara.tv/"
+            "referer": "https://www.iwara.tv/",
+            "rewrites": {
+                "api.iwara.tv": "iwara-api.l.moonchan.xyz",
+                "files.iwara.tv": "iwara-files.l.moonchan.xyz",
+                "i.iwara.tv": "iwara-img.l.moonchan.xyz",
+                "service.iwara.tv": "iwara-service.l.moonchan.xyz",
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+            }
         },
         "pixiv.l.moonchan.xyz": {
             "host": "www.pixiv.net",
