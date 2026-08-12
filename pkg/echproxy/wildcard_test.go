@@ -57,3 +57,29 @@ func TestReplaceWildcardDomain(t *testing.T) {
 		t.Errorf("got:  %s\nwant: %s", got, want)
 	}
 }
+
+func TestSWInjectPrepend(t *testing.T) {
+	cfg := UpstreamMap{
+		"iwara.l.moonchan.xyz": {
+			Host: "iwara.tv",
+			Wildcard: &WildcardRule{
+				Prefix:         "iwara-",
+				EntrySuffix:    ".l.moonchan.xyz",
+				UpstreamSuffix: ".iwara.tv",
+				Referer:        "https://www.iwara.tv/",
+			},
+		},
+		"iwara-api.l.moonchan.xyz": {Host: "api.iwara.tv"},
+	}
+	inject := swOverrideJS(buildSWProxyMap(cfg, "8443"), collectWildcardRules(cfg))
+	// 注入代码必须是合法 JS: 有 install/activate/fetch 监听。
+	for _, want := range []string{"install", "activate", "fetch", "__wtMap", "__wtRules", "iwara-", ".l.moonchan.xyz", "iwara-api.l.moonchan.xyz:8443"} {
+		if !strings.Contains(inject, want) {
+			t.Errorf("inject missing %q", want)
+		}
+	}
+	// 通配规则包含 iwara
+	if !strings.Contains(inject, "iwara.tv") {
+		t.Errorf("wildcard suffix missing in inject")
+	}
+}

@@ -490,9 +490,11 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 			rewriter = buildRewriter(uc.Rewrites)
 		}
 
-		// service worker 注入: sw.js/workbox 响应前插 fetch 拦截,
-		// 把动态出现的 *.iwara.tv 等真实域名请求改道到代理入口,
-		// 兜住 JS 运行时拼接的 URL(rewriter 改不到)。
+		// service worker 注入: sw.js/workbox 响应时把 fetch 拦截代码
+		// 插到最前面(保留上游 workbox 原内容), 拦截动态拼接的
+		// *.iwara.tv 等真实域名请求改道到代理入口。
+		// fetch 监听器按注册顺序先到先得, 我们的逻辑先注册先响应。
+		swInject := ""
 		if isServiceWorkerPath(rawPath) {
 			port := ""
 			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
@@ -501,11 +503,8 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 			swProxyMap := buildSWProxyMap(cfg, port)
 			swRules := collectWildcardRules(cfg)
 			if len(swProxyMap) > 0 {
-				c.Header("Content-Type", "application/javascript")
-				c.Status(http.StatusOK)
-				c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules)))
-				log.Printf("[%s] %s %s -> SW override 注入 %d 条规则 %d 条通配", clientIP, method, rawPath, len(swProxyMap), len(swRules))
-				return
+				swInject = swOverrideJS(swProxyMap, swRules)
+				log.Printf("[%s] %s %s -> SW 注入前缀 %d 条规则 %d 条通配", clientIP, method, rawPath, len(swProxyMap), len(swRules))
 			}
 		}
 
@@ -568,6 +567,10 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 				(resp.ContentLength <= 0 || resp.ContentLength <= 8<<20) {
 				if body, err := io.ReadAll(resp.Body); err == nil {
 					if body, err = decompressBody(body, resp.Header.Get("Content-Encoding")); err == nil {
+						if swInject != "" {
+							// SW 脚本: 拦截代码插最前, 保留上游 workbox 功能。
+							body = append([]byte(swInject), body...)
+						}
 						body = rewriter(body, port)
 						c.Writer.Header().Del("Content-Encoding")
 						c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
