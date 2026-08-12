@@ -83,7 +83,7 @@ WebRTC 使用 DTLS 对数据通道进行加密，确保通信安全。所有数�
 ## 本项目中的实现
 
 本项目的 WebRTC 演示位于 `examples/webrtc-demo`，基于 [pion/webrtc](https://github.com/pion/webrtc)，
-信令通过本项目自己的 KV 存储 API（`cmd/api-server` + `pkg/kv`）完成，无需额外信令服务。
+信令通过本项目自己的 KV 存储 API（`cmd/kv-store` + `pkg/kv`）完成，无需额外信令服务。
 
 ```go
 // 创建 PeerConnection + DataChannel

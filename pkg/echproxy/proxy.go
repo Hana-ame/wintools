@@ -35,7 +35,6 @@ import (
 // 使页面内所有指向真实域名的绝对 URL 都改走代理入口，形成闭环。
 type UpstreamConfig struct {
 	Host     string            `json:"host"`
-	Target   string            `json:"target,omitempty"`
 	Referer  string            `json:"referer,omitempty"`
 	Mode     string            `json:"mode,omitempty"`
 	Rewrites map[string]string `json:"rewrites,omitempty"`
@@ -182,8 +181,14 @@ func isDomainChar(c byte) bool {
 		c >= '0' && c <= '9' || c == '-' || c == '.'
 }
 
-// ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并通过 ECH 转发。
+// ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
 // 命中规则的 Rewrites 非空时启用响应域名替换。
+//
+// Mode 决定出网方式:
+//
+//	"" / ech  — ECH 域前置（目标须在 Cloudflare 后）
+//	sni       — SNI 伪装直连（DoH 解析真实 IP + 假 SNI + Host 路由）
+//	direct    — 普通 HTTPS 直连（目标可直连时）
 func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -201,13 +206,6 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		if !ok {
 			log.Printf("[%s] 未找到上游配置: %s", clientIP, host)
 			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
-			return
-		}
-
-		// Target 为完整 URL 时做普通反向代理（不经过 ECH/SNI 伪装），
-		// 请求路径/查询拼到 target 后面，保留请求流式转发与 cookie。
-		if uc.Target != "" {
-			echproxyPlainForward(c, uc, rawPath, rawQuery, clientIP)
 			return
 		}
 
@@ -242,14 +240,7 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 
 		applyCookies(uc.Host, outReq)
 
-		var resp *http.Response
-		if uc.Mode == "sni" {
-			log.Printf("[%s] -> SNI 伪装: %s %s (Host: %s)", clientIP, method, urlStr, outReq.Host)
-			resp, err = sniFrontDo(outReq)
-		} else {
-			log.Printf("[%s] -> ECH Do: %s %s (Host: %s)", clientIP, method, urlStr, outReq.Host)
-			resp, err = cloudflare_ech.Do(outReq)
-		}
+		resp, err := proxyRoundTrip(outReq, uc.Mode)
 		if err != nil {
 			log.Printf("[%s] 上游请求失败: %v (耗时: %v)", clientIP, err, time.Since(start))
 			c.String(http.StatusBadGateway, "upstream: %v", err)
@@ -312,67 +303,37 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 	}
 }
 
-// ---- 响应域名替换 ----
+// ---- 出网分发 ----
 
-// echproxyPlainForward 是 Target 完整 URL 的普通反向代理转发：
-// 请求拼到 target 后缀 → 直接出网（普通 TLS，无 ECH/SNI 伪装），
-// 流式返回，透传 cookie 与响应头。
-func echproxyPlainForward(c *gin.Context, uc UpstreamConfig, rawPath, rawQuery, clientIP string) {
-	start := time.Now()
-	method := c.Request.Method
-
-	targetBase := strings.TrimRight(uc.Target, "/")
-	urlStr := targetBase + rawPath
-	if rawQuery != "" {
-		urlStr += "?" + rawQuery
+// ModeName 返回模式的中文描述，用于启动 banner。
+func ModeName(mode string) string {
+	switch mode {
+	case "sni":
+		return "SNI 伪装"
+	case "direct":
+		return "直接"
+	default:
+		return "ECH"
 	}
-	log.Printf("[%s] %s %s -> %s", clientIP, method, rawPath, urlStr)
+}
 
-	outReq, err := http.NewRequest(method, urlStr, c.Request.Body)
-	if err != nil {
-		log.Printf("[%s] 创建请求失败: %v", clientIP, err)
-		c.String(http.StatusInternalServerError, "create request: %v", err)
-		return
+// proxyRoundTrip 按 mode 分发请求到对应出网通道:
+//
+//	direct — 普通 HTTPS 直连（标准 DNS + TLS）
+//	sni    — SNI 伪装直连（DoH 解析真实 IP + 假 SNI）
+//	其他   — ECH 域前置
+func proxyRoundTrip(req *http.Request, mode string) (*http.Response, error) {
+	switch mode {
+	case "direct":
+		req.Host = ""
+		return (&http.Client{Timeout: 0}).Do(req)
+	case "sni":
+		log.Printf("-> SNI 伪装: %s %s (Host: %s)", req.Method, req.URL.String(), req.Host)
+		return sniFrontDo(req)
+	default:
+		log.Printf("-> ECH Do: %s %s (Host: %s)", req.Method, req.URL.String(), req.Host)
+		return cloudflare_ech.Do(req)
 	}
-	copyHeaders(outReq.Header, c.Request.Header)
-	if uc.Referer != "" {
-		outReq.Header.Set("Referer", uc.Referer)
-	}
-	outReq.ContentLength = c.Request.ContentLength
-
-	u, _ := url.Parse(urlStr)
-	applyCookies(u.Host, outReq)
-
-	resp, err := (&http.Client{Timeout: 0}).Do(outReq)
-	if err != nil {
-		log.Printf("[%s] 上游请求失败: %v (耗时: %v)", clientIP, err, time.Since(start))
-		c.String(http.StatusBadGateway, "upstream: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	u2, _ := url.Parse(urlStr)
-	saveCookies(u2.Host, resp)
-
-	copyHeaders(c.Writer.Header(), resp.Header)
-	c.Status(resp.StatusCode)
-
-	buf := make([]byte, 32*1024)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
-				break
-			}
-			if f, ok := c.Writer.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-		if rerr != nil {
-			break
-		}
-	}
-	log.Printf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
 }
 
 // maxRewriteSize 超过该字节数的文本响应不做替换（直接流式透传）。

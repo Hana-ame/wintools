@@ -26,7 +26,8 @@ var chatHTML string
 const embeddedConfig = `{
     "upstreams": {
         "l.moonchan.xyz": {
-            "target": "https://reminder.moonchan.xyz/"
+            "host": "reminder.moonchan.xyz",
+            "mode": "direct"
         },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
@@ -199,20 +200,32 @@ func main() {
 			log.Fatalf("解析证书密钥失败: %v", err)
 		}
 		tlsCert = &cert
-
-		upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
 	}
 
-	r.GET("/", func(c *gin.Context) {
-		host := c.Request.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
+	upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
+	zenHost := "zen.l.moonchan.xyz"
+	zenProxyHandler := func(c *gin.Context) {
+		if c.GetHeader("Authorization") == "" {
+			c.Request.Header.Set("Authorization", "Bearer "+zenAPIKey)
 		}
-		if host == "zen.l.moonchan.xyz" {
-			zenHandler(c)
+		zenHandler(c)
+	}
+
+	hostOf := func(c *gin.Context) string {
+		h := c.Request.Host
+		if hh, _, err := net.SplitHostPort(h); err == nil {
+			h = hh
+		}
+		return h
+	}
+	isZen := func(c *gin.Context) bool { return hostOf(c) == zenHost }
+
+	r.GET("/", func(c *gin.Context) {
+		if isZen(c) {
+			zenProxyHandler(c)
 			return
 		}
-		if _, ok := upstreamCfg[host]; ok {
+		if _, ok := upstreamCfg[hostOf(c)]; ok {
 			upstreamHandler(c)
 			return
 		}
@@ -221,15 +234,8 @@ func main() {
 	})
 
 	r.NoRoute(func(c *gin.Context) {
-		host := c.Request.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		if host == "zen.l.moonchan.xyz" {
-			if c.GetHeader("Authorization") == "" {
-				c.Request.Header.Set("Authorization", "Bearer "+zenAPIKey)
-			}
-			zenHandler(c)
+		if isZen(c) {
+			zenProxyHandler(c)
 		} else {
 			upstreamHandler(c)
 		}
@@ -251,11 +257,7 @@ func main() {
 			fmt.Printf("  域名: %s -> opencode.ai (Zen API 直连)\n", d)
 		} else {
 			uc := upstreamCfg[d]
-			mode := "ECH"
-			if uc.Mode == "sni" {
-				mode = "SNI 伪装"
-			}
-			fmt.Printf("  域名: %s -> %s (%s)", d, uc.Host, mode)
+			fmt.Printf("  域名: %s -> %s (%s)", d, uc.Host, echproxy.ModeName(uc.Mode))
 			if uc.Referer != "" {
 				fmt.Printf(" (referer: %s)", uc.Referer)
 			}

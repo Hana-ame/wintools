@@ -8,7 +8,7 @@ Go 网络工具集：ECH 域前置反向代理、本地 DoH DNS 解析器、KV �
 |------|------|------|
 | ech-proxy | `cmd/ech-proxy` | 基于 ECH (Encrypted Client Hello) 域前置的反向代理 |
 | localdns | `cmd/localdns` | 本地 DNS 服务器，转发到 DoH 端点 |
-| api-server | `cmd/api-server` | KV 存储 HTTP API（Gin） |
+| kv-store | `cmd/kv-store` | KV 存储 HTTP API（Gin） |
 | zen-proxy / zen-multi / local-proxy | `cmd/zen-proxy` 等 | opencode.ai 免费 zen 端点代理栈 |
 | ech 客户端库 | `pkg/ech` | 可直接使用的 ECH 域前置 HTTP 客户端 |
 | echproxy | `pkg/echproxy` | ech-proxy 的上游配置加载 / 证书下载 / 代理 handler |
@@ -92,10 +92,10 @@ go run ./cmd/localdns -doh https://moonchan.xyz/doh -port 5353
 ./run_localdns.sh
 ```
 
-## api-server
+## kv-store
 
 ```bash
-go run ./cmd/api-server -port 8080 -ttl 0 -tick 30s
+go run ./cmd/kv-store -port 8080 -ttl 0 -tick 30s
 ```
 
 `-ttl 0` 表示永不过期。接口详见 `docs/api.md`。

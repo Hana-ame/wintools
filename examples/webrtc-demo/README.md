@@ -1,6 +1,6 @@
 # WebRTC Demo
 
-This minimal example demonstrates a **WebRTC Peer‑to‑Peer** data channel using the existing **KV signalling server** (`cmd/api-server`).
+This minimal example demonstrates a **WebRTC Peer‑to‑Peer** data channel using the existing **KV signalling server** (`cmd/kv-store`).
 
 ## How it works
 
@@ -46,7 +46,7 @@ The demo talks to the KV server that is already running at:
 ```
 http://bwh.moonchan.xyz:8080
 ```
-If you run a local `cmd/api-server`, change the `-server` flag accordingly:
+If you run a local `cmd/kv-store`, change the `-server` flag accordingly:
 ```bash
 ./webrtc-demo -server http://localhost:8080 -mode p1
 ```

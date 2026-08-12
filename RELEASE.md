@@ -12,7 +12,7 @@ ECH 域前置 + SNI 伪装反向代理。两种模式:
 - TLS 远端模式:证书/密钥/上游配置每次启动经 proxy.moonchan.xyz 拉到内存,不落盘
 - 内置内存 cookie jar:上游 Set-Cookie 自动保存并随后续请求回传
 
-### api-server
+### kv-store
 内存键值存储 HTTP API(默认 :8080)。`/kv/*` 读写,支持 TTL 过期(0=不过期),带 `/healthz`。
 
 ### localdns

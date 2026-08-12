@@ -1,6 +1,6 @@
 # API 文档
 
-本项目提供基于 **Gin** 的 KV 存储 HTTP API，所有接口均位于 `/kv` 路由组下（在 `cmd/api-server/main.go` 中通过 `router.Group("/kv")` 挂载）。以下是每个端点的详细说明。
+本项目提供基于 **Gin** 的 KV 存储 HTTP API，所有接口均位于 `/kv` 路由组下（在 `cmd/kv-store/main.go` 中通过 `router.Group("/kv")` 挂载）。以下是每个端点的详细说明。
 
 ## 基本路径
 ```
@@ -93,7 +93,7 @@ curl -X DELETE http://localhost:8080/kv/example
 ## 代码实现位置
 - 路由注册：`pkg/api/handler.go` 中的 `Handler.RegisterRoutes`。
 - 业务逻辑：`pkg/kv/store.go` 提供线程安全的 `Get`、`Peek`、`Set`、`ShallowMerge`、`DeepMerge`、`Delete` 等方法。
-- 服务器入口：`cmd/api-server/main.go`。
+- 服务器入口：`cmd/kv-store/main.go`。
 
 ---
 
