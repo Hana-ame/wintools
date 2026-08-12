@@ -35,6 +35,7 @@ import (
 // 使页面内所有指向真实域名的绝对 URL 都改走代理入口，形成闭环。
 type UpstreamConfig struct {
 	Host     string            `json:"host"`
+	Target   string            `json:"target,omitempty"`
 	Referer  string            `json:"referer,omitempty"`
 	Mode     string            `json:"mode,omitempty"`
 	Rewrites map[string]string `json:"rewrites,omitempty"`
@@ -203,6 +204,13 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 			return
 		}
 
+		// Target 为完整 URL 时做普通反向代理（不经过 ECH/SNI 伪装），
+		// 请求路径/查询拼到 target 后面，保留请求流式转发与 cookie。
+		if uc.Target != "" {
+			echproxyPlainForward(c, uc, rawPath, rawQuery, clientIP)
+			return
+		}
+
 		var rewriter func([]byte, string) []byte
 		if len(uc.Rewrites) > 0 {
 			rewriter = buildRewriter(uc.Rewrites)
@@ -305,6 +313,67 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 }
 
 // ---- 响应域名替换 ----
+
+// echproxyPlainForward 是 Target 完整 URL 的普通反向代理转发：
+// 请求拼到 target 后缀 → 直接出网（普通 TLS，无 ECH/SNI 伪装），
+// 流式返回，透传 cookie 与响应头。
+func echproxyPlainForward(c *gin.Context, uc UpstreamConfig, rawPath, rawQuery, clientIP string) {
+	start := time.Now()
+	method := c.Request.Method
+
+	targetBase := strings.TrimRight(uc.Target, "/")
+	urlStr := targetBase + rawPath
+	if rawQuery != "" {
+		urlStr += "?" + rawQuery
+	}
+	log.Printf("[%s] %s %s -> %s", clientIP, method, rawPath, urlStr)
+
+	outReq, err := http.NewRequest(method, urlStr, c.Request.Body)
+	if err != nil {
+		log.Printf("[%s] 创建请求失败: %v", clientIP, err)
+		c.String(http.StatusInternalServerError, "create request: %v", err)
+		return
+	}
+	copyHeaders(outReq.Header, c.Request.Header)
+	if uc.Referer != "" {
+		outReq.Header.Set("Referer", uc.Referer)
+	}
+	outReq.ContentLength = c.Request.ContentLength
+
+	u, _ := url.Parse(urlStr)
+	applyCookies(u.Host, outReq)
+
+	resp, err := (&http.Client{Timeout: 0}).Do(outReq)
+	if err != nil {
+		log.Printf("[%s] 上游请求失败: %v (耗时: %v)", clientIP, err, time.Since(start))
+		c.String(http.StatusBadGateway, "upstream: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	u2, _ := url.Parse(urlStr)
+	saveCookies(u2.Host, resp)
+
+	copyHeaders(c.Writer.Header(), resp.Header)
+	c.Status(resp.StatusCode)
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
+				break
+			}
+			if f, ok := c.Writer.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	log.Printf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
+}
 
 // maxRewriteSize 超过该字节数的文本响应不做替换（直接流式透传）。
 const maxRewriteSize = 8 << 20

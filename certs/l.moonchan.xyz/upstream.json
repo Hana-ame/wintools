@@ -3,8 +3,8 @@
     "key_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/privkey.pem?proxy_host=raw.githubusercontent.com",
     "upstreams": {
         "l.moonchan.xyz": {
-            "host": "video-cf.twimg.com",
-            "referer": "https://x.com"
+            "target": "https://reminder.moonchan.xyz/",
+            "referer": ""
         },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",

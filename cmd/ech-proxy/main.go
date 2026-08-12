@@ -26,8 +26,7 @@ var chatHTML string
 const embeddedConfig = `{
     "upstreams": {
         "l.moonchan.xyz": {
-            "host": "video-cf.twimg.com",
-            "referer": "https://x.com"
+            "target": "https://reminder.moonchan.xyz/"
         },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
