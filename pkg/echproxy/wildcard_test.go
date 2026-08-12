@@ -42,3 +42,18 @@ func TestMatchWildcard(t *testing.T) {
 		t.Error("non-wildcard host should not match")
 	}
 }
+
+func TestReplaceWildcardDomain(t *testing.T) {
+	rw := buildRewriter(map[string]string{
+		"iwara.tv":     "iwara.l.moonchan.xyz",
+		"www.pixiv.net": "pixiv.l.moonchan.xyz",
+		"*.iwara.tv":   "iwara-*.l.moonchan.xyz",
+		"*.pixiv.net":  "pixiv-*.l.moonchan.xyz",
+	})
+	body := []byte(`{"url":"https://filesq.iwara.tv/file/abc.mp4","img":"https://i.iwara.tv/x.jpg","api":"https://api.iwara.tv/trending","bare":"https://iwara.tv/","dl":"https://dl.pixiv.net/zip/a.zip","www":"https://www.pixiv.net/a"}`)
+	got := string(rw(body, "8443"))
+	want := `{"url":"https://iwara-filesq.l.moonchan.xyz:8443/file/abc.mp4","img":"https://iwara-i.l.moonchan.xyz:8443/x.jpg","api":"https://iwara-api.l.moonchan.xyz:8443/trending","bare":"https://iwara.l.moonchan.xyz:8443/","dl":"https://pixiv-dl.l.moonchan.xyz:8443/zip/a.zip","www":"https://pixiv.l.moonchan.xyz:8443/a"}`
+	if got != want {
+		t.Errorf("got:  %s\nwant: %s", got, want)
+	}
+}

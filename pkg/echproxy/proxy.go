@@ -141,21 +141,83 @@ func isHopByHop(name string) bool {
 // buildRewriter 预排序替换键（长域名优先，避免子串误伤），返回替换函数。
 // port 非空时追加到替换目标末尾（如 pixiv.l.moonchan.xyz:8443）。
 func buildRewriter(rt map[string]string) func([]byte, string) []byte {
-	keys := make([]string, 0, len(rt))
+	var exact, wildcard []string
 	for k := range rt {
-		keys = append(keys, k)
+		if strings.HasPrefix(k, "*.") {
+			wildcard = append(wildcard, k)
+		} else {
+			exact = append(exact, k)
+		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
+	sort.Slice(exact, func(i, j int) bool { return len(exact[i]) > len(exact[j]) })
+	sort.Slice(wildcard, func(i, j int) bool { return len(wildcard[i]) > len(wildcard[j]) })
+	keys := append(exact, wildcard...)
 	return func(body []byte, port string) []byte {
 		for _, k := range keys {
 			target := rt[k]
 			if port != "" && !strings.Contains(target, ":") {
 				target += ":" + port
 			}
+			if strings.HasPrefix(k, "*.") {
+				body = replaceWildcardDomain(body, k[2:], target)
+				continue
+			}
 			body = replaceDomainBounded(body, k, target)
 		}
 		return body
 	}
+}
+
+// replaceWildcardDomain 把 <任意子域>+suffix 替换为 target 中的 "*" 部分,
+// 例: "*.iwara.tv" -> "iwara-*.l.moonchan.xyz" 会把 filesq.iwara.tv 替换为
+// iwara-filesq.l.moonchan.xyz (带端口由调用方拼入 target)。
+// 裸 suffix (如 iwara.tv 无子域) 不在此处理, 由精确规则负责。
+func replaceWildcardDomain(body []byte, suffix, target string) []byte {
+	var out []byte
+	rest := body
+	for {
+		i := bytes.Index(rest, []byte(suffix))
+		if i < 0 {
+			out = append(out, rest...)
+			break
+		}
+		// 从后缀前回溯域名主体 (子域部分)。
+		start := i
+		for start > 0 && isDomainChar(rest[start-1]) {
+			start--
+		}
+		sub := string(rest[start:i])
+		if sub == "" {
+			// 裸后缀(无子域): 跳过, 交给精确规则。
+			out = append(out, rest[:i+len(suffix)]...)
+			rest = rest[i+len(suffix):]
+			continue
+		}
+		sub = strings.TrimSuffix(sub, ".")
+		if sub == "" {
+			out = append(out, rest[:i+len(suffix)]...)
+			rest = rest[i+len(suffix):]
+			continue
+		}
+		// 检查边界: 前缀和完整域名前后不能有域名残留。
+		var left, right byte
+		if start > 0 {
+			left = rest[start-1]
+		}
+		j := i + len(suffix)
+		if j < len(rest) {
+			right = rest[j]
+		}
+		if !isDomainChar(left) && !isDomainChar(right) {
+			out = append(out, rest[:start]...)
+			out = append(out, strings.ReplaceAll(target, "*", sub)...)
+			rest = rest[j:]
+		} else {
+			out = append(out, rest[:j]...)
+			rest = rest[j:]
+		}
+	}
+	return out
 }
 
 // replaceDomainBounded 把 from 域名替换为 to，要求匹配位置前后都不是
@@ -221,11 +283,23 @@ func buildSWProxyMap(cfg UpstreamMap, port string) map[string]string {
 	return m
 }
 
+// collectWildcardRules 收集配置中所有通配规则供 SW 注入使用。
+func collectWildcardRules(cfg UpstreamMap) []WildcardRule {
+	var rules []WildcardRule
+	for _, uc := range cfg {
+		if uc.Wildcard != nil {
+			rules = append(rules, *uc.Wildcard)
+		}
+	}
+	return rules
+}
+
 // swOverrideJS 生成注入到 service worker 的 fetch 拦截代码。
 // 拦截真实域名请求并改道到代理入口（带原端口），兜住前端运行时动态
 // 拼接的 URL（静态 rewriter 无法覆盖的场景）。
-// 除显式映射外，还支持 *.iwara.tv 通配: 任意子域改道 iwara-<sub>.l.moonchan.xyz。
-func swOverrideJS(m map[string]string) string {
+// 除显式映射外，还支持通配规则: 任意 <sub>+upstream_suffix 改道
+// prefix+<sub>+entry_suffix。
+func swOverrideJS(m map[string]string, rules []WildcardRule) string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -244,15 +318,31 @@ const __wtMap = {`)
 	}
 	b.WriteString(`
 };
+const __wtRules = [`)
+	for i, r := range rules {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "\n  {p:%q, es:%q, us:%q}", r.Prefix, r.EntrySuffix, r.UpstreamSuffix)
+	}
+	b.WriteString(`
+];
 self.addEventListener('fetch', (e) => {
   try {
     const u = new URL(e.request.url);
     let p = __wtMap[u.hostname];
     if (!p) {
       const h = u.hostname;
-      if (h.endsWith('.iwara.tv') || h === 'iwara.tv') {
-        const sub = h === 'iwara.tv' ? '' : h.slice(0, -'.iwara.tv'.length);
-        p = (sub ? 'iwara-' + sub : 'iwara') + '.l.moonchan.xyz';
+      for (const r of __wtRules) {
+        if (h === r.us.slice(1)) {
+          p = r.p.slice(0, -1) + r.es;
+          break;
+        }
+        if (h.endsWith(r.us)) {
+          const sub = h.slice(0, -r.us.length);
+          p = r.p + sub + r.es;
+          break;
+        }
       }
     }
     if (!p) return;
@@ -409,11 +499,12 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 				port = p
 			}
 			swProxyMap := buildSWProxyMap(cfg, port)
+			swRules := collectWildcardRules(cfg)
 			if len(swProxyMap) > 0 {
 				c.Header("Content-Type", "application/javascript")
 				c.Status(http.StatusOK)
-				c.Writer.Write([]byte(swOverrideJS(swProxyMap)))
-				log.Printf("[%s] %s %s -> SW override 注入 %d 条规则", clientIP, method, rawPath, len(swProxyMap))
+				c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules)))
+				log.Printf("[%s] %s %s -> SW override 注入 %d 条规则 %d 条通配", clientIP, method, rawPath, len(swProxyMap), len(swRules))
 				return
 			}
 		}

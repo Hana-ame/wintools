@@ -57,7 +57,9 @@ const embeddedConfig = `{
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
+                "iwara.tv": "iwara.l.moonchan.xyz",
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
         "iwara-api.l.moonchan.xyz": {
@@ -68,7 +70,9 @@ const embeddedConfig = `{
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
+                "iwara.tv": "iwara.l.moonchan.xyz",
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
         "iwara-files.l.moonchan.xyz": {
@@ -80,7 +84,9 @@ const embeddedConfig = `{
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
+                "iwara.tv": "iwara.l.moonchan.xyz",
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
         "iwara-img.l.moonchan.xyz": {
@@ -91,7 +97,9 @@ const embeddedConfig = `{
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
+                "iwara.tv": "iwara.l.moonchan.xyz",
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
         "iwara-service.l.moonchan.xyz": {
@@ -102,7 +110,9 @@ const embeddedConfig = `{
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
+                "iwara.tv": "iwara.l.moonchan.xyz",
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
         "iwara-news.l.moonchan.xyz": {
@@ -113,25 +123,36 @@ const embeddedConfig = `{
                 "files.iwara.tv": "iwara-files.l.moonchan.xyz",
                 "i.iwara.tv": "iwara-img.l.moonchan.xyz",
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
-                "news.iwara.tv": "iwara-news.l.moonchan.xyz"
+                "news.iwara.tv": "iwara-news.l.moonchan.xyz",
+                "iwara.tv": "iwara.l.moonchan.xyz",
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
         "pixiv.l.moonchan.xyz": {
             "host": "www.pixiv.net",
+            "wildcard": {
+                "prefix": "pixiv-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".pixiv.net",
+                "referer": "https://www.pixiv.net/"
+            },
             "rewrites": {
                 "www.pixiv.net": "pixiv.l.moonchan.xyz",
                 "pixiv.net": "pixiv.l.moonchan.xyz",
                 "app-api.pixiv.net": "pixiv-api.l.moonchan.xyz",
                 "oauth.secure.pixiv.net": "pixiv-oauth.l.moonchan.xyz",
                 "i.pximg.net": "pixiv-img.l.moonchan.xyz",
-                "s.pximg.net": "pixiv-img.l.moonchan.xyz"
+                "s.pximg.net": "pixiv-img.l.moonchan.xyz",
+                "*.pixiv.net": "pixiv-*.l.moonchan.xyz"
             }
         },
         "pixiv-api.l.moonchan.xyz": {
-            "host": "app-api.pixiv.net"
+            "host": "app-api.pixiv.net",
+            "referer": "https://www.pixiv.net/"
         },
         "pixiv-oauth.l.moonchan.xyz": {
-            "host": "oauth.secure.pixiv.net"
+            "host": "oauth.secure.pixiv.net",
+            "referer": "https://www.pixiv.net/"
         },
         "pixiv-img.l.moonchan.xyz": {
             "host": "i.pximg.net",
