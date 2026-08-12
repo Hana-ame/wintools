@@ -59,6 +59,7 @@ const embeddedConfig = `{
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz",
                 "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
@@ -72,6 +73,7 @@ const embeddedConfig = `{
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz",
                 "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
@@ -86,6 +88,7 @@ const embeddedConfig = `{
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz",
                 "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
@@ -99,6 +102,7 @@ const embeddedConfig = `{
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz",
                 "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
@@ -112,6 +116,7 @@ const embeddedConfig = `{
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz",
                 "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },
@@ -125,6 +130,7 @@ const embeddedConfig = `{
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz",
                 "*.iwara.tv": "iwara-*.l.moonchan.xyz"
             }
         },

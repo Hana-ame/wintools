@@ -36,7 +36,8 @@
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
         "zen.l.moonchan.xyz": {
@@ -52,7 +53,8 @@
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
         "iwara-files.l.moonchan.xyz": {
@@ -66,7 +68,8 @@
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
         "iwara-img.l.moonchan.xyz": {
@@ -79,7 +82,8 @@
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
         "iwara-service.l.moonchan.xyz": {
@@ -92,7 +96,8 @@
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
         "iwara-news.l.moonchan.xyz": {
@@ -105,7 +110,8 @@
                 "service.iwara.tv": "iwara-service.l.moonchan.xyz",
                 "news.iwara.tv": "iwara-news.l.moonchan.xyz",
                 "iwara.tv": "iwara.l.moonchan.xyz",
-                "*.iwara.tv": "iwara-*.l.moonchan.xyz"
+                "*.iwara.tv": "iwara-*.l.moonchan.xyz",
+                "www.iwara.tv": "iwara.l.moonchan.xyz"
             }
         },
         "pixiv.l.moonchan.xyz": {

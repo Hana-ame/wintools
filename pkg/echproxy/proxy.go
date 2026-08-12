@@ -785,7 +785,9 @@ func sniFrontDo(req *http.Request) (*http.Response, error) {
 		outReq.Host = host
 
 		tr := newSNIFrontTransport(ip)
-		resp, err := (&http.Client{Transport: tr, Timeout: 30 * time.Second}).Do(outReq)
+		// 不用总 Timeout(会砍掉大文件下载), 只等响应头最多 30s。
+		tr.ResponseHeaderTimeout = 30 * time.Second
+		resp, err := (&http.Client{Transport: tr}).Do(outReq)
 		if err == nil {
 			return resp, nil
 		}
