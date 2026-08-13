@@ -72,6 +72,13 @@ type Config struct {
 	// 响应中出现的这些 URL 整段剔除, 浏览器不再发起请求避免挂起超时。
 	// 用于 Google 字体/jsapi 等被墙资源、无法代理的 CDN (如 media.dlsite.com)。
 	BlockedHosts []string `json:"blocked_hosts,omitempty"`
+	// SWPaths service worker 脚本路径匹配后缀 (文件名), 命中时注入 fetch
+	// 拦截代码。默认 sw.js / workbox-*.js / service-worker*。
+	SWPaths []string `json:"sw_paths,omitempty"`
+	// ProxySuffix 代理入口域名后缀 (如 ".l.moonchan.xyz"):
+	// 用于判断哪些入口是代理自身域名 (SW 映射/SW 拦截时跳过,
+	// 避免把代理入口当上游), 为空时禁用。
+	ProxySuffix string `json:"proxy_suffix,omitempty"`
 }
 
 // FetchBytes 从 URL 拉取内容到内存（不落盘），请求失败或状态非 200 时报错。
@@ -430,8 +437,27 @@ func isHexDigit(c byte) bool {
 }
 
 // isServiceWorkerPath 判断请求是否为 service worker 脚本 (sw.js / workbox-*.js)。
-func isServiceWorkerPath(p string) bool {
+// isServiceWorkerPath 判断请求是否为 service worker 脚本。
+// 匹配 Config.SWPaths (文件名后缀, 支持前缀), 空时用默认:
+// sw.js / service-worker* / workbox-*.js。
+func isServiceWorkerPath(p string, swPaths []string) bool {
 	base := p[strings.LastIndex(p, "/")+1:]
+	if len(swPaths) > 0 {
+		for _, s := range swPaths {
+			if strings.HasPrefix(s, "*") {
+				// "*workbox-*.js" 之类: 前缀+后缀都匹配。
+				trim := strings.TrimPrefix(s, "*")
+				if strings.HasSuffix(base, trim) {
+					return true
+				}
+				continue
+			}
+			if base == s || strings.HasPrefix(base, s) {
+				return true
+			}
+		}
+		return false
+	}
 	return base == "sw.js" ||
 		strings.HasPrefix(base, "service-worker") ||
 		(strings.HasPrefix(base, "workbox-") && strings.HasSuffix(base, ".js"))
@@ -439,10 +465,21 @@ func isServiceWorkerPath(p string) bool {
 
 // buildSWProxyMap 收集「真实上游域名 → 代理入口域名[:端口]」映射，
 // 供 service worker 注入使用: 前端动态请求上游域名时改道到代理。
-func buildSWProxyMap(cfg UpstreamMap, port string) map[string]string {
+// proxySuffix (Config.ProxySuffix, 如 ".l.moonchan.xyz") 用于跳过
+// 代理自身域名, 避免把代理入口当上游; 为空时用 host 包含 moonchan.xyz 兜底。
+func buildSWProxyMap(cfg UpstreamMap, port, proxySuffix string) map[string]string {
 	m := make(map[string]string)
 	for entry, uc := range cfg {
-		if uc.Host == "" || strings.Contains(uc.Host, "moonchan.xyz") {
+		if uc.Host == "" {
+			continue
+		}
+		// 跳过上游也是代理自身的域名 (如 reminder.moonchan.xyz),
+		// 避免 SW 把代理入口当上游改道。
+		if proxySuffix != "" {
+			if strings.HasSuffix(uc.Host, proxySuffix) {
+				continue
+			}
+		} else if strings.Contains(uc.Host, "moonchan.xyz") {
 			continue
 		}
 		target := entry
@@ -691,14 +728,15 @@ func inheritWildcard(cfg UpstreamMap, entry string) *WildcardRule {
 
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
 // 命中规则的 Rewrites 非空时启用响应域名替换。
-// blockedHosts 为 Config.BlockedHosts (upstream.json 可配的剔除域名列表)。
+// blockedHosts 为 Config.BlockedHosts, swPaths 为 Config.SWPaths,
+// proxySuffix 为 Config.ProxySuffix (upstream.json 可配)。
 //
 // Mode 决定出网方式:
 //
 //	"" / ech  — ECH 域前置（目标须在 Cloudflare 后）
 //	sni       — SNI 伪装直连（DoH 解析真实 IP + 假 SNI + Host 路由）
 //	direct    — 普通 HTTPS 直连（目标可直连时）
-func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
+func ProxyHandler(cfg UpstreamMap, blockedHosts, swPaths []string, proxySuffix string) gin.HandlerFunc {
 	blocked := append([]string(nil), blockedHosts...)
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -736,12 +774,12 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		// *.iwara.tv 等真实域名请求改道到代理入口。
 		// fetch 监听器按注册顺序先到先得, 我们的逻辑先注册先响应。
 		swInject := ""
-		if isServiceWorkerPath(rawPath) {
+		if isServiceWorkerPath(rawPath, swPaths) {
 			port := ""
 			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
 				port = p
 			}
-			swProxyMap := buildSWProxyMap(cfg, port)
+			swProxyMap := buildSWProxyMap(cfg, port, proxySuffix)
 			swRules := collectWildcardRules(cfg)
 			if len(swProxyMap) > 0 {
 				swInject = swOverrideJS(swProxyMap, swRules, blocked)
