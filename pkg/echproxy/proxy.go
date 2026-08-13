@@ -218,6 +218,9 @@ var blockedUpstreamHosts = []string{
 	"https://www.google.com/jsapi",
 	"https://ajax.googleapis.com",
 	"https://www.googletagmanager.com",
+	// media.dlsite.com 是 AWS CloudFront: ECH 530 / SNI 假域名握手失败
+	// / 真 SNI 被 RST, 三条路都不通, 剔除 banner 图引用。
+	"https://media.dlsite.com",
 }
 
 // stripBlockedURLs 从响应文本中移除被墙第三方域名的完整 URL 值。
