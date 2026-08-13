@@ -13,8 +13,8 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"regexp"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +26,8 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // WildcardRule 通配上游规则:
@@ -1062,29 +1064,38 @@ func resolveHostIP(ctx context.Context, host string) (string, error) {
 // transport：TCP 直连目标真实 IP，SNI 使用不敏感域名。
 // 源站证书为自签（CN=localhost 之类），故 InsecureSkipVerify；
 // 如需更严格可改为固定证书公钥。
-func newSNIFrontTransport(ip string) *http.Transport {
-	return &http.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			d := &net.Dialer{Timeout: 8 * time.Second}
-			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
-			if err != nil {
-				return nil, err
-			}
-			tc := tls.Client(conn, &tls.Config{
-				ServerName:         fakeSNI,
-				InsecureSkipVerify: true,
-				NextProtos:         []string{"http/1.1"},
-			})
-			if err := tc.HandshakeContext(ctx); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("SNI 伪装握手: %w", err)
-			}
-			return tc, nil
+// newSNIFrontTransport 返回 SNI 伪装直连的 transport (HTTP/2):
+// uTLS 模拟 Chrome TLS 指纹 → ALPN 协商 h2 → http2.Transport 发请求。
+// Go http.Transport 对自定义 DialTLSContext 不自动启用 h2
+// (TLSNextProto 只在标准 TLSClientConfig 路径注册), 必须直接用
+// http2.Transport 承接 h2 帧, 否则收到 SETTINGS 帧报 malformed。
+func newSNIFrontTransport(ip string) http.RoundTripper {
+	dial := func(ctx context.Context) (net.Conn, error) {
+		d := &net.Dialer{Timeout: 8 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
+		if err != nil {
+			return nil, err
+		}
+		// uTLS 模拟 Chrome TLS 指纹 (Ja3): Go crypto/tls 的 ClientHello
+		// 特征明显, Cloudflare bot 检测一眼识别; 伪装浏览器指纹
+		// 大幅降低被判定为 bot 的概率。SNI 仍用不敏感假域名
+		// (GFW 对敏感域名 SNI 概率性 RST)。
+		uconn := utls.UClient(conn, &utls.Config{
+			ServerName:         fakeSNI,
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2", "http/1.1"},
+		}, utls.HelloChrome_Auto)
+		if err := uconn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("SNI 伪装握手: %w", err)
+		}
+		return uconn, nil
+	}
+	return &http2.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return dial(ctx)
 		},
-		ForceAttemptHTTP2:   false,
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout: 90 * time.Second,
 	}
 }
 
@@ -1107,14 +1118,14 @@ func sniFrontDo(req *http.Request) (*http.Response, error) {
 		outReq.Host = host
 
 		tr := newSNIFrontTransport(ip)
-		// 不用总 Timeout(会砍掉大文件下载), 只等响应头最多 30s。
-		tr.ResponseHeaderTimeout = 30 * time.Second
+		// 不用总 Timeout(会砍掉大文件下载), 握手超时由 http2.Transport
+		// 内部 TLS 握手控制。
 		resp, err := (&http.Client{Transport: tr}).Do(outReq)
 		if err == nil {
 			return resp, nil
 		}
 		lastErr = err
-		tr.CloseIdleConnections()
+		tr.(*http2.Transport).CloseIdleConnections()
 		ipCacheMu.Lock()
 		delete(ipCache, host)
 		ipCacheMu.Unlock()
