@@ -44,6 +44,20 @@ var (
 	dayCount int
 )
 
+// ---- 请求统计 (/status) ----
+
+var (
+	statsMu        sync.Mutex
+	statsTotal     int64 // 收到校验通过的 POST 总数
+	statsOK        int64 // 上游 2xx
+	statsErr       int64 // 上游非 2xx
+	statsUpstream  int64 // 上游连接失败 (502)
+	statsRejected  int64 // 认证/限流/配额/model 拒绝
+	statsStart     = time.Now()
+	dayOK          int64
+	dayUpstreamErr int64
+)
+
 // allowDay 检查并占用一次全局每日配额,跨天自动重置。
 func allowDay() bool {
 	dayMu.Lock()
@@ -147,9 +161,15 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	allowed := origin == allowedOrigin
 	setCORS(w, allowedOrigin)
+	reject := func() {
+		statsMu.Lock()
+		statsRejected++
+		statsMu.Unlock()
+	}
 
 	if r.Method == http.MethodOptions {
 		if !allowed {
+			reject()
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -164,17 +184,20 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !allowed {
+		reject()
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}
 
 	// Referer 必须存在且来自 aichat.moonchan.xyz,拒绝空 Referer。
 	if ref := r.Header.Get("Referer"); ref == "" || !strings.HasPrefix(ref, allowedOrigin) {
+		reject()
 		http.Error(w, "referer not allowed", http.StatusForbidden)
 		return
 	}
 
 	if !limiterFor(clientIP(r)).Allow() {
+		reject()
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "rate limit exceeded: 10 requests per minute", http.StatusTooManyRequests)
 		return
@@ -182,6 +205,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 	// 全局每日配额 (1000 条/天)。
 	if !allowDay() {
+		reject()
 		w.Header().Set("Retry-After", "3600")
 		http.Error(w, "daily limit exceeded", http.StatusTooManyRequests)
 		return
@@ -206,9 +230,16 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if reqBody.Model != allowedModel {
+		statsMu.Lock()
+		statsRejected++
+		statsMu.Unlock()
 		http.Error(w, "model not allowed", http.StatusForbidden)
 		return
 	}
+
+	statsMu.Lock()
+	statsTotal++
+	statsMu.Unlock()
 
 	req, err := http.NewRequest(http.MethodPost, upstream, strings.NewReader(string(body)))
 	if err != nil {
@@ -226,14 +257,71 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("upstream error: %v", err)
+		statsMu.Lock()
+		statsUpstream++
+		statsMu.Unlock()
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		statsMu.Lock()
+		statsOK++
+		dayOK++
+		statsMu.Unlock()
+	} else {
+		statsMu.Lock()
+		statsErr++
+		dayUpstreamErr++
+		statsMu.Unlock()
+	}
+
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// statusHandler 只读状态端点: 配额使用、请求统计、活跃 IP 数。
+// 不需要 Origin/Referer 校验 (无敏感信息, 不暴露 key)。
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	statsMu.Lock()
+	dayCountNow := dayCount
+	dayOKNow := dayOK
+	dayErrNow := dayUpstreamErr
+	sTotal, sOK, sErr, sUp, sRej := statsTotal, statsOK, statsErr, statsUpstream, statsRejected
+	statsMu.Unlock()
+
+	limitersMu.Lock()
+	activeIPs := len(limiters)
+	limitersMu.Unlock()
+
+	dayMu.Lock()
+	dayDateNow := dayDate
+	dayMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": "ok",
+		"uptime_sec": int(time.Since(statsStart).Seconds()),
+		"upstream": upstream,
+		"daily": map[string]any{
+			"date":          dayDateNow,
+			"used":          dayCountNow,
+			"limit":         dayLimit,
+			"remaining":     remainingDay(),
+			"ok":            dayOKNow,
+			"upstream_errs": dayErrNow,
+		},
+		"requests": map[string]int64{
+			"total":       sTotal,
+			"ok":          sOK,
+			"upstream_err": sUp,
+			"upstream_4xx_5xx": sErr,
+			"rejected":    sRej,
+		},
+		"active_ips": activeIPs,
+	})
 }
 
 func main() {
@@ -246,6 +334,7 @@ func main() {
 
 	http.HandleFunc("/chat/completion", handle)
 	http.HandleFunc("/chat/completions", handle)
+	http.HandleFunc("/status", statusHandler)
 	go cleanupLimiters()
 	log.Printf("opencode-proxy listening on %s -> %s (CORS: %s, rate limit: 10/min per IP, daily: %d)", *addr, upstream, allowedOrigin, dayLimit)
 	log.Fatal(http.ListenAndServe(*addr, nil))
