@@ -196,7 +196,7 @@ func TestBlockedThirdPartyHosts(t *testing.T) {
 		Rewrites: map[string]string{
 			"www.dlsite.com": "dlsite.l.moonchan.xyz",
 		},
-	}, nil)
+	}, testBlockedHosts)
 	body := []byte(`<head>
 <link href="https://fonts.googleapis.com/css?family=Sawarabi+Gothic" rel="stylesheet">
 <script type="text/javascript" src="https://www.google.com/jsapi"></script>
@@ -220,7 +220,7 @@ func TestBlockedThirdPartyStrip(t *testing.T) {
 	rw := buildEntryRewriter(UpstreamConfig{
 		Host: "www.dlsite.com",
 		Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
-	}, nil)
+	}, testBlockedHosts)
 	body := []byte(`<link href="https://fonts.googleapis.com/css?family=Sawarabi+Gothic" rel="stylesheet">
 <script type="text/javascript" src="https://www.google.com/jsapi"></script>
 <link href="https://dlsite.l.moonchan.xyz:8443/css/reset.css" rel="stylesheet">`)
@@ -284,4 +284,14 @@ func TestJSDomainCookieRewrite(t *testing.T) {
 	if !strings.Contains(got, "dlsite.l.moonchan.xyz:8443/x") {
 		t.Errorf("location rewrite broken: %s", got)
 	}
+}
+
+// testBlockedHosts 测试用 blocked 列表 (对应 Config.BlockedHosts)。
+var testBlockedHosts = []string{
+	"https://fonts.googleapis.com",
+	"https://fonts.gstatic.com",
+	"https://www.google.com/jsapi",
+	"https://ajax.googleapis.com",
+	"https://www.googletagmanager.com",
+	"https://media.dlsite.com",
 }
