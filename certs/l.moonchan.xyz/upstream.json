@@ -58,5 +58,11 @@
         "https://ajax.googleapis.com",
         "https://www.googletagmanager.com",
         "https://media.dlsite.com"
+    ],
+    "sw_override": true,
+    "sw_paths": [
+        "sw.js",
+        "workbox-",
+        "service-worker"
     ]
 }

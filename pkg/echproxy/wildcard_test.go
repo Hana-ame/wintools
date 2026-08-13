@@ -75,7 +75,7 @@ func TestSWInjectPrepend(t *testing.T) {
 		},
 		"iwara-api.l.moonchan.xyz": {Host: "api.iwara.tv"},
 	}
-	inject := swOverrideJS(buildSWProxyMap(cfg, "8443", ".l.moonchan.xyz"), collectWildcardRules(cfg), nil)
+	inject := swOverrideJS(buildSWProxyMap(cfg, "8443"), collectWildcardRules(cfg), nil)
 	// 注入代码必须是合法 JS: 有 install/activate/fetch 监听。
 	for _, want := range []string{"install", "activate", "fetch", "__wtMap", "__wtRules", "iwara-", ".l.moonchan.xyz", "iwara-api.l.moonchan.xyz:8443"} {
 		if !strings.Contains(inject, want) {
@@ -142,7 +142,7 @@ func TestFixedCookieOverride(t *testing.T) {
 	// 精确入口: 固定 cookie 覆盖内存 jar + 客户端 cookie。
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.NoRoute(ProxyHandler(cfg, nil, nil, ".l.moonchan.xyz"))
+	r.NoRoute(ProxyHandler(cfg, nil, false, nil))
 	ts := httptest.NewServer(r)
 	defer ts.Close()
 
