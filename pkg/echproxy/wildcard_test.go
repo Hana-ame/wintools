@@ -259,3 +259,29 @@ func TestSetCookieNormalize(t *testing.T) {
 	}
 }
 
+
+// 回归: 前端 JS 用 document.cookie 设置语言/状态 cookie 时带
+// Domain=.dlsite.com, 必须重写为代理域且不带端口
+// (cookie Domain 属性不允许端口, 带端口浏览器拒绝 → 语言弹窗无限循环)。
+func TestJSDomainCookieRewrite(t *testing.T) {
+	rw := buildEntryRewriter(UpstreamConfig{
+		Host: "www.dlsite.com",
+		Wildcard: &WildcardRule{
+			Prefix:         "dlsite-",
+			EntrySuffix:    ".l.moonchan.xyz",
+			UpstreamSuffix: ".dlsite.com",
+		},
+		Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
+	})
+	body := []byte(`document.cookie = 'display_language=zh_cn; path=/; Domain=.dlsite.com';location='https://www.dlsite.com/x'`)
+	got := string(rw(body, "8443"))
+	if !strings.Contains(got, "Domain=dlsite.l.moonchan.xyz") {
+		t.Errorf("cookie Domain not rewritten to proxy host: %s", got)
+	}
+	if strings.Contains(got, "Domain=dlsite.l.moonchan.xyz:8443") {
+		t.Errorf("cookie Domain must not contain port: %s", got)
+	}
+	if !strings.Contains(got, "dlsite.l.moonchan.xyz:8443/x") {
+		t.Errorf("location rewrite broken: %s", got)
+	}
+}

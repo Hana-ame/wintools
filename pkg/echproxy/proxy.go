@@ -193,7 +193,12 @@ func buildEntryRewriter(uc UpstreamConfig) func([]byte, string) []byte {
 		rules["*"+w.UpstreamSuffix] = w.Prefix + "*" + w.EntrySuffix
 		// 裸域: iwara.tv -> iwara.l.moonchan.xyz
 		base := strings.TrimSuffix(w.Prefix, "-")
-		rules[strings.TrimPrefix(w.UpstreamSuffix, ".")] = base + w.EntrySuffix
+		bare := strings.TrimPrefix(w.UpstreamSuffix, ".")
+		rules[bare] = base + w.EntrySuffix
+		// 带点前缀: .iwara.tv -> iwara.l.moonchan.xyz
+		// 前端 JS 常写 document.cookie='...; Domain=.iwara.tv',
+		// 通配回溯会把单点 trim 成空当裸域跳过, 这里显式补规则。
+		rules["."+bare] = base + w.EntrySuffix
 	}
 	// 直连不可达的第三方域名(被墙): 响应里出现的这些 URL 整段删除,
 	// 浏览器不再发起请求, 避免挂起超时。ECH/SNI 都无法到达这些域名。
@@ -296,7 +301,9 @@ func buildRewriter(rt map[string]string) func([]byte, string) []byte {
 	return func(body []byte, port string) []byte {
 		for _, k := range keys {
 			target := rt[k]
-			if port != "" && !strings.Contains(target, ":") {
+			// 带点 key (如 .dlsite.com) 是 cookie Domain 专用:
+			// Domain 属性不允许带端口, 不加 port; 其他 key 照常追加。
+			if port != "" && !strings.HasPrefix(k, ".") && !strings.Contains(target, ":") {
 				target += ":" + port
 			}
 			if strings.HasPrefix(k, "*.") {
