@@ -11,7 +11,8 @@
             "referer": "https://x.com"
         },
         "ex.l.moonchan.xyz": {
-            "host": "exhentai.org"
+            "host": "exhentai.org",
+            "cookie": "ipb_member_id=xxx; ipb_pass_hash=yyy; igneous=zzz"
         },
         "sukebei.l.moonchan.xyz": {
             "host": "sukebei.nyaa.si",
