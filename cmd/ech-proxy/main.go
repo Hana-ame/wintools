@@ -4,13 +4,18 @@ import (
 	"context"
 	"crypto/tls"
 	_ "embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"sort"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -22,10 +27,47 @@ import (
 //go:embed static/index.html
 var chatHTML string
 
+// cacheDir 返回配置/证书/cookie 的本地缓存目录 (环境变量可覆盖)。
+// 默认 ~/.echproxy-cache: 远程拉取失败时回退这些缓存, 进程仍能启动。
+func cacheDir() string {
+	if d := os.Getenv("ECHPROXY_CACHE_DIR"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(os.TempDir(), "echproxy-cache")
+	}
+	return filepath.Join(home, ".echproxy-cache")
+}
+
+// fetchWithCache 拉取远程内容并落盘缓存; 远程失败时回退本地缓存,
+// 避免 GitHub/镜像不可达时进程直接起不来 (远程部署的稳定性保障)。
+// 成功内容每次覆盖缓存, 保证缓存与线上一致。
+func fetchWithCache(rawURL, cachePath string) ([]byte, error) {
+	data, err := echproxy.FetchBytes(rawURL)
+	if err == nil {
+		if mkerr := os.MkdirAll(filepath.Dir(cachePath), 0700); mkerr == nil {
+			os.WriteFile(cachePath, data, 0600)
+		}
+		return data, nil
+	}
+	if c, cerr := os.ReadFile(cachePath); cerr == nil {
+		log.Printf("远程拉取失败 (%v), 使用本地缓存: %s", err, cachePath)
+		return c, nil
+	}
+	return nil, err
+}
+
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
+	verbose := flag.Bool("v", false, "verbose per-request logging")
 	flag.Parse()
+
+	// 每请求日志开关: 远程部署默认静默, 排查问题时 -v 打开。
+	echproxy.Debug = *verbose
+	cache := cacheDir()
+	log.Printf("本地缓存目录: %s", cache)
 
 	localIP := os.Getenv("LOCALIP")
 	if localIP != "" {
@@ -73,23 +115,36 @@ func main() {
 	upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
 
 	log.Printf("正在加载上游配置: %s", upstreamConfigURL)
-	cfg, err := echproxy.LoadConfig(upstreamConfigURL)
+	cfgBytes, err := fetchWithCache(upstreamConfigURL, filepath.Join(cache, "upstream.json"))
 	if err != nil {
 		log.Fatalf("加载上游配置失败: %v", err)
+	}
+	var cfg echproxy.Config
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		log.Fatalf("解析上游配置失败: %v", err)
+	}
+	if len(cfg.Upstreams) == 0 {
+		log.Fatalf("上游配置没有规则")
 	}
 	upstreamCfg = cfg.Upstreams
 	log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
 
+	// cookie jar 持久化: 重启后登录态不丢。
+	if err := echproxy.SetCookieStore(filepath.Join(cache, "cookies.json")); err != nil {
+		log.Printf("cookie 持久化初始化失败: %v", err)
+	}
+
 	if !*httpMode {
 		// TLS 模式额外拉取证书: 证书 URL 与上游路由都写死在 repo 的
 		// upstream.json 配置里, 证书续期后只需更新该配置指向的 URL。
+		// 证书同样走本地缓存降级。
 		log.Printf("正在拉取证书: %s", cfg.CertPath)
-		certPEM, err := echproxy.FetchBytes(cfg.CertPath)
+		certPEM, err := fetchWithCache(cfg.CertPath, filepath.Join(cache, "cert.pem"))
 		if err != nil {
 			log.Fatalf("拉取证书失败: %v", err)
 		}
 		log.Printf("正在拉取密钥: %s", cfg.KeyPath)
-		keyPEM, err := echproxy.FetchBytes(cfg.KeyPath)
+		keyPEM, err := fetchWithCache(cfg.KeyPath, filepath.Join(cache, "key.pem"))
 		if err != nil {
 			log.Fatalf("拉取密钥失败: %v", err)
 		}
@@ -154,27 +209,41 @@ func main() {
 	}
 	fmt.Printf("=================\n")
 
-	if *httpMode {
-		if err := r.Run(*addr); err != nil {
-			log.Fatalf("启动失败: %v", err)
-		}
-		return
+	// 优雅关闭: Ctrl+C / SIGTERM 时先停接新连接, 在途请求最多等 5s。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := &http.Server{
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second, // 防慢客户端占住连接头不读
+		IdleTimeout:       120 * time.Second,
 	}
+	go func() {
+		<-ctx.Done()
+		log.Printf("收到退出信号, 正在优雅关闭 (最多等 5s)...")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(shutCtx)
+	}()
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("监听失败: %v", err)
 	}
-	srv := &http.Server{
-		Addr:    *addr,
-		Handler: r,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{*tlsCert},
-			MinVersion:   tls.VersionTLS12,
-		},
+
+	if *httpMode {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("启动失败: %v", err)
+		}
+		return
+	}
+
+	srv.TLSConfig = &tls.Config{
+		Certificates: []tls.Certificate{*tlsCert},
+		MinVersion:   tls.VersionTLS12,
 	}
 	tlsLn := tls.NewListener(ln, srv.TLSConfig)
-	if err := srv.Serve(tlsLn); err != nil {
+	if err := srv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("启动失败: %v", err)
 	}
 }

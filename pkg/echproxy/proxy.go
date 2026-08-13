@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -48,13 +49,13 @@ type WildcardRule struct {
 // 替换应用到响应头（Location/Refresh）与文本 body（html/js/json/xml），
 // 使页面内所有指向真实域名的绝对 URL 都改走代理入口，形成闭环。
 type UpstreamConfig struct {
-	Host     string            `json:"host"`
-	Referer  string            `json:"referer,omitempty"`
+	Host    string `json:"host"`
+	Referer string `json:"referer,omitempty"`
 	// Cookie 固定注入上游请求 (初始化 cookie overrider):
 	// 在 upstream.json 里直接写死需要携带的 Cookie 头原文,
 	// 适用于 exhentai 等需要登录态/特殊 cookie 的站点, 不依赖浏览器。
 	// 优先级: 此固定 cookie > 内存 jar > 客户端 cookie。
-	Cookie   string            `json:"cookie,omitempty"`
+	Cookie string `json:"cookie,omitempty"`
 	// SWInject 为无 service worker 的站点注入代理拦截 SW:
 	// HTML 页面自动注册 /wt-sw.js, 代理对该路径返回生成的 fetch 拦截
 	// 脚本, 兜住前端运行时动态拼接的 URL (响应重写覆盖不到)。
@@ -147,11 +148,20 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
+// rewriteSetCookieDomains 用的正则: 每请求都要执行, 提为包级变量避免热路径
+// 反复编译 (regexp.MustCompile 有一次性分配成本)。
+var (
+	setCookieHasDomainRE = regexp.MustCompile(`(?i);\s*Domain=`)
+	setCookieReplaceRE   = regexp.MustCompile(`(?i);\s*Domain=[^;]*`)
+	setCookieSecureRE    = regexp.MustCompile(`(?i);\s*Secure`)
+)
+
 // rewriteSetCookieDomains 把响应 Set-Cookie 头规范化, 让浏览器能正常存储:
 //  1. Domain=.dlsite.com 等上游域 → 改写为当前代理域 (dlsite.l.moonchan.xyz),
 //     否则浏览器因域不匹配拒绝存储 → 前端 JS 读不到 cookie → 弹窗无限循环。
 //  2. Secure 标志: 上游 https 下发 Secure cookie, 若代理跑在 http 模式
 //     浏览器不会存 (Secure cookie 只能经 https 传输), 需移除。
+//
 // 内存 jar (按上游域名分组) 管代理→上游的认证 cookie, 与此无关;
 // 这里只保证浏览器端能存下前端状态 cookie (语言/成人确认等)。
 func rewriteSetCookieDomains(h http.Header, proxyHost string, httpMode bool) {
@@ -164,9 +174,9 @@ func rewriteSetCookieDomains(h http.Header, proxyHost string, httpMode bool) {
 	if hh, _, err := net.SplitHostPort(proxyHost); err == nil {
 		domain = hh
 	}
-	hasDomain := regexp.MustCompile(`(?i);\s*Domain=`)
-	replaceDomain := regexp.MustCompile(`(?i);\s*Domain=[^;]*`)
-	secureRE := regexp.MustCompile(`(?i);\s*Secure`)
+	hasDomain := setCookieHasDomainRE
+	replaceDomain := setCookieReplaceRE
+	secureRE := setCookieSecureRE
 	for _, s := range scs {
 		if hasDomain.MatchString(s) {
 			s = replaceDomain.ReplaceAllString(s, "; Domain="+domain)
@@ -191,8 +201,10 @@ func isHopByHop(name string) bool {
 // port 非空时追加到替换目标末尾（如 pixiv.l.moonchan.xyz:8443）。
 // buildEntryRewriter 从单条 UpstreamConfig 构造响应域名重写器:
 // 精确 rewrites 原样使用; wildcard 非空时自动推导通配条目——
-//   *.iwara.tv  -> iwara-*.l.moonchan.xyz (任意子域)
-//   iwara.tv    -> iwara.l.moonchan.xyz   (裸域)
+//
+//	*.iwara.tv  -> iwara-*.l.moonchan.xyz (任意子域)
+//	iwara.tv    -> iwara.l.moonchan.xyz   (裸域)
+//
 // 规则单一来源: 配置只写 wildcard 一次, 响应重写/SW 拦截都从这里推导。
 // blocked 为全局剔除域名列表 (Config.BlockedHosts, upstream.json 可配)。
 func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string) []byte {
@@ -579,7 +591,7 @@ func MatchWildcardForTest(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 // host = rule.Prefix + sub + rule.EntrySuffix → 上游 sub + rule.UpstreamSuffix。
 // mode 未显式指定时自动探测: 上游在 Cloudflare 段走 ECH, 否则 SNI。
 func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
-	for entry, uc := range cfg {
+	for _, uc := range cfg {
 		w := uc.Wildcard
 		if w == nil {
 			continue
@@ -592,13 +604,11 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 			continue
 		}
 		sub = strings.TrimSuffix(sub, w.EntrySuffix)
-		if sub == "" || strings.ContainsAny(sub, ".:/") {
+		// 子域为空或含端口/路径分隔符时视为非法; 含点 (多级子域) 合法,
+		// 由 C13 放开 (此前误拒 files.q.iwara.tv 这类多级子域)。
+		if sub == "" || strings.ContainsAny(sub, ":/") {
 			continue
 		}
-		// 入口必须与通配规则同域(防止跨规则误匹配)。
-		entryHost := strings.TrimPrefix(entry, w.Prefix)
-		entryHost = strings.TrimSuffix(entryHost, w.EntrySuffix)
-		_ = entryHost
 		out := uc
 		out.Host = sub + w.UpstreamSuffix
 		if out.Referer == "" {
@@ -615,20 +625,33 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 		if out.Mode == "" || out.Mode == "ech" {
 			out.Mode = wildcardMode(context.Background(), out.Host)
 		}
-		log.Printf("[通配] %s -> %s (mode=%s referer=%s cookie=%v)", host, out.Host, out.Mode, out.Referer, out.Cookie != "")
+		debugLogf("[通配] %s -> %s (mode=%s referer=%s cookie=%v)", host, out.Host, out.Mode, out.Referer, out.Cookie != "")
 		return out, true
 	}
 	return UpstreamConfig{}, false
 }
 
-// wildcardModeCache 通配入口的 mode 探测结果缓存 (host -> mode), 避免每次请求 DoH。
+// wildcardModeCache 通配入口的 mode 探测结果缓存 (host -> entry)。
+// 带 TTL (wildcardModeTTL), 上游域名从 Cloudflare 迁走后 mode 不会永远错误;
+// 过期后下次请求重新探测。TTL 取 10 分钟, 兼顾探测成本与 IP 变动时效。
 var wildcardModeCache sync.Map
 
+// modeCacheEntry 缓存条目: mode 探测结果 + 过期时间。
+type modeCacheEntry struct {
+	mode   string
+	expiry time.Time
+}
+
+const wildcardModeTTL = 10 * time.Minute
+
 // wildcardMode 判断上游域名应走的通道: Cloudflare 段 ECH, 否则 SNI。
-// 探测一次后缓存, 域名 IP 变动依赖 ipCache 的 TTL 自然失效。
+// 探测一次后缓存 wildcardModeTTL 时长, 过期自动重查。
 func wildcardMode(ctx context.Context, host string) string {
 	if v, ok := wildcardModeCache.Load(host); ok {
-		return v.(string)
+		e := v.(modeCacheEntry)
+		if time.Now().Before(e.expiry) {
+			return e.mode
+		}
 	}
 	mode := ""
 	if ip, err := resolveHostIP(ctx, host); err == nil {
@@ -636,7 +659,7 @@ func wildcardMode(ctx context.Context, host string) string {
 			mode = "sni"
 		}
 	}
-	wildcardModeCache.Store(host, mode)
+	wildcardModeCache.Store(host, modeCacheEntry{mode: mode, expiry: time.Now().Add(wildcardModeTTL)})
 	return mode
 }
 
@@ -706,6 +729,18 @@ func inheritWildcard(cfg UpstreamMap, entry string) *WildcardRule {
 	return nil
 }
 
+// Debug 控制详细请求日志 (每请求的转发/响应行)。默认关闭;
+// 错误日志与启动日志不受影响, 始终输出。
+// 由 main 通过 -v flag 或环境变量开启, 远程部署日志量大时默认静默。
+var Debug bool
+
+// debugLogf 仅在 Debug 开启时输出, 用于每请求的转发日志。
+func debugLogf(format string, args ...interface{}) {
+	if Debug {
+		log.Printf(format, args...)
+	}
+}
+
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
 // 命中规则的 Rewrites 非空时启用响应域名替换。
 // blockedHosts 为 Config.BlockedHosts。
@@ -762,7 +797,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 		urlStr := targetURL.String()
 
-		log.Printf("[%s] %s %s -> %s", clientIP, method, rawPath, urlStr)
+		debugLogf("[%s] %s %s -> %s", clientIP, method, rawPath, urlStr)
 
 		outReq, err := http.NewRequest(method, urlStr, c.Request.Body)
 		if err != nil {
@@ -772,6 +807,18 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 
 		copyHeaders(outReq.Header, c.Request.Header)
+		// X-Forwarded-For/Proto 透传: 不设置的话上游看到的全是代理 IP,
+		// 防盗链/地域限制会误伤。追加而非覆盖已有链 (客户端可能经多层代理)。
+		if xff := c.Request.Header.Get("X-Forwarded-For"); xff != "" {
+			outReq.Header.Set("X-Forwarded-For", xff+", "+clientIP)
+		} else {
+			outReq.Header.Set("X-Forwarded-For", clientIP)
+		}
+		proto := "http"
+		if c.Request.TLS != nil {
+			proto = "https"
+		}
+		outReq.Header.Set("X-Forwarded-Proto", proto)
 		if uc.Referer != "" {
 			outReq.Header.Set("Referer", uc.Referer)
 		}
@@ -795,7 +842,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 
 		saveCookies(uc.Host, resp)
 
-		log.Printf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
+		debugLogf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
 
 		copyHeaders(c.Writer.Header(), resp.Header)
 		// Set-Cookie 规范化: Domain 改写为当前代理域 + http 模式去 Secure,
@@ -820,11 +867,14 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			c.Writer.Header().Set("Content-Type", "application/javascript")
 			c.Writer.WriteHeader(200)
 			c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules, blocked)))
-			log.Printf("[%s] %s %s -> SW 兜底生成 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
+			debugLogf("[%s] %s %s -> SW 兜底生成 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
 			return
 		}
 
 		c.Status(resp.StatusCode)
+
+		// 写超时防护: 所有响应写出都经过 deadline (见 setWriteDeadline)。
+		rc := http.NewResponseController(c.Writer)
 
 		if rewriter != nil {
 			port := ""
@@ -840,41 +890,69 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 
 			// 文本响应整体读入 → 解压 → 域名替换 → 原文输出（去掉 Content-Encoding）。
 			// 已知大响应（>8MB）跳过替换，保持流式。
+			// 未知长度（chunked / 无 Content-Length）同样限读 maxRewriteSize+1:
+			// 超限放弃重写, 已读部分先写出, 剩余走流式 — 避免无限缓冲 OOM,
+			// 也避免 SSE (text/event-stream 命中 isTextContent) 被整体缓存破坏实时性。
 			if isTextContent(resp.Header.Get("Content-Type")) &&
-				(resp.ContentLength <= 0 || resp.ContentLength <= 8<<20) {
-				if body, err := io.ReadAll(resp.Body); err == nil {
-					if body, err = decompressBody(body, resp.Header.Get("Content-Encoding")); err == nil {
-						body = rewriter(body, port)
-						// HTML 页面注入 SW 自动注册 (该入口配了 SWInject 时):
-						// 无 SW 的站点 (dlsite) 需要主动注册才能拦截动态请求,
-						// 注册脚本插在 </head> 前, 页面加载即生效。
-						// 只注入没有 SW 迹象的页面 (含 'serviceWorker' 的
-						// 页面已有注册逻辑, 注入会冲突)。
-						if swWant && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
-							!bytes.Contains(body, []byte("serviceWorker")) {
-							reg := []byte(`<script>navigator.serviceWorker.register('/wt-sw.js').catch(function(){})</script>`)
-							if idx := bytes.Index(body, []byte("</head>")); idx >= 0 {
-								body = append(body[:idx], append(reg, body[idx:]...)...)
-							} else {
-								body = append(body, reg...)
-							}
-							log.Printf("[%s] %s -> HTML 注入 SW 注册", clientIP, rawPath)
-						}
-						c.Writer.Header().Del("Content-Encoding")
-						c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
-						if _, werr := c.Writer.Write(body); werr == nil {
-							return
-						}
+				(resp.ContentLength <= 0 || resp.ContentLength <= maxRewriteSize) {
+				body, err := io.ReadAll(io.LimitReader(resp.Body, maxRewriteSize+1))
+				if err != nil {
+					// 读失败: 上游连接已坏, 写出已读部分后结束, 不再继续流式。
+					if len(body) > 0 {
+						setWriteDeadline(rc)
+						c.Writer.Write(body)
 					}
+					return
+				}
+				if len(body) > maxRewriteSize {
+					// 超限: 已读部分原样写出 (Content-Encoding 头保留,
+					// 客户端按原编码解压), 剩余数据由下方流式转发继续。
+					if len(body) > 0 {
+						setWriteDeadline(rc)
+						c.Writer.Write(body)
+					}
+				} else if body, err = decompressBody(body, resp.Header.Get("Content-Encoding")); err == nil {
+					body = rewriter(body, port)
+					// HTML 页面注入 SW 自动注册 (该入口配了 SWInject 时):
+					// 无 SW 的站点 (dlsite) 需要主动注册才能拦截动态请求,
+					// 注册脚本插在 </head> 前, 页面加载即生效。
+					// 只注入没有 SW 迹象的页面 (含 'serviceWorker' 的
+					// 页面已有注册逻辑, 注入会冲突)。
+					if swWant && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
+						!bytes.Contains(body, []byte("serviceWorker")) {
+						reg := []byte(`<script>navigator.serviceWorker.register('/wt-sw.js').catch(function(){})</script>`)
+						if idx := bytes.Index(body, []byte("</head>")); idx >= 0 {
+							body = append(body[:idx], append(reg, body[idx:]...)...)
+						} else {
+							body = append(body, reg...)
+						}
+						debugLogf("[%s] %s -> HTML 注入 SW 注册", clientIP, rawPath)
+					}
+					c.Writer.Header().Del("Content-Encoding")
+					c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+					setWriteDeadline(rc)
+					if _, werr := c.Writer.Write(body); werr == nil {
+						return
+					}
+				} else {
+					// 解压失败: 原样输出压缩体 (保留 Content-Encoding),
+					// 客户端自行解压; 不再走流式 (body 已读尽, 流式只会写出空响应)。
+					if len(body) > 0 {
+						setWriteDeadline(rc)
+						c.Writer.Write(body)
+					}
+					return
 				}
 			}
 		}
 
 		// 流式转发（SSE 等）：边读边写并 flush，避免缓冲导致的首字节延迟。
+		// 每次写前重设 deadline: 正常 SSE 每 chunk 刷新, 挂死客户端 60s 断开。
 		buf := make([]byte, 32*1024)
 		for {
 			n, rerr := resp.Body.Read(buf)
 			if n > 0 {
+				setWriteDeadline(rc)
 				if _, werr := c.Writer.Write(buf[:n]); werr != nil {
 					break
 				}
@@ -914,16 +992,26 @@ func proxyRoundTrip(req *http.Request, mode string) (*http.Response, error) {
 		req.Host = ""
 		return (netdial.Client(0)).Do(req)
 	case "sni":
-		log.Printf("-> SNI 伪装: %s %s (Host: %s)", req.Method, req.URL.String(), req.Host)
+		debugLogf("-> SNI 伪装: %s %s (Host: %s)", req.Method, req.URL.String(), req.Host)
 		return sniFrontDo(req)
 	default:
-		log.Printf("-> ECH Do: %s %s (Host: %s)", req.Method, req.URL.String(), req.Host)
+		debugLogf("-> ECH Do: %s %s (Host: %s)", req.Method, req.URL.String(), req.Host)
 		return cloudflare_ech.Do(req)
 	}
 }
 
 // maxRewriteSize 超过该字节数的文本响应不做替换（直接流式透传）。
 const maxRewriteSize = 8 << 20
+
+// writeTimeout 单次写入的截止时间: 慢客户端 (不消费响应) 超时后断开,
+// 防止连接/goroutine 无限堆积。SSE 等长连接每 chunk 都重设, 不受影响。
+const writeTimeout = 60 * time.Second
+
+// setWriteDeadline 为当前连接设置写截止时间 (每次写前重设)。
+// 底层连接不支持 deadline 时 (如测试用内存 writer) 忽略错误。
+func setWriteDeadline(rc *http.ResponseController) {
+	rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+}
 
 // isTextContent 判断 Content-Type 是否为可替换的文本类型。
 func isTextContent(ct string) bool {
@@ -935,7 +1023,25 @@ func isTextContent(ct string) bool {
 		strings.Contains(ct, "x-www-form-urlencoded")
 }
 
+// readDecompressed 限长读取解压流: 输入虽被 LimitReader 限制在 maxRewriteSize,
+// 但压缩比可达数百倍, 8MB 压缩体可炸出 GB 级内存 (压缩炸弹)。
+// 解压超过 maxRewriteSize+1 即报错, 调用方回退为原样透传压缩体。
+func readDecompressed(r io.Reader) ([]byte, error) {
+	const limit = maxRewriteSize + 1
+	out, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(out)) >= limit {
+		return nil, fmt.Errorf("decompressed body exceeds %d bytes", limit)
+	}
+	return out, nil
+}
+
 // decompressBody 按 Content-Encoding 解压响应体，支持 gzip/br/zstd/identity。
+// 解压结果限制在 maxRewriteSize 内 (readDecompressed), 超限报错让调用方
+// 原样透传压缩体, 防止压缩炸弹 OOM。
+// gzip/zstd reader 必须 Close (释放并发解压的 goroutine 与内存)。
 func decompressBody(body []byte, encoding string) ([]byte, error) {
 	switch strings.ToLower(encoding) {
 	case "gzip":
@@ -944,16 +1050,17 @@ func decompressBody(body []byte, encoding string) ([]byte, error) {
 			return nil, err
 		}
 		defer r.Close()
-		return io.ReadAll(r)
+		return readDecompressed(r)
 	case "br":
-		return io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
+		// brotli.Reader 无 Close 方法 (纯内存解压, 无外部资源), 无需释放。
+		return readDecompressed(brotli.NewReader(bytes.NewReader(body)))
 	case "zstd":
 		r, err := zstd.NewReader(bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		defer r.Close()
-		return io.ReadAll(r)
+		return readDecompressed(r)
 	default:
 		return body, nil
 	}
@@ -966,7 +1073,7 @@ func decompressBody(body []byte, encoding string) ([]byte, error) {
 const fakeSNI = "cloudflare-ech.com"
 
 type ipCacheEntry struct {
-	ip     string
+	ips    []string
 	expiry time.Time
 }
 
@@ -976,27 +1083,40 @@ var (
 )
 
 // resolveHostIP 通过 DoH 解析域名真实 IP（绕过被污染的本地 DNS），带 TTL 缓存。
+// 返回第一个可用 A 记录，供 mode 探测等只需单 IP 的场景使用。
 func resolveHostIP(ctx context.Context, host string) (string, error) {
+	ips, err := resolveHostIPs(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	return ips[0], nil
+}
+
+// resolveHostIPs 返回 DoH 解析出的全部 A 记录（去重），带 TTL 缓存。
+// 只取第一个 A 记录的问题: CDN 多 IP 时可能固定连到坏 IP 或已被墙的 IP,
+// 失败重试也只会拿到同一个; 全量候选让 sniFrontDo 能按序逐个尝试。
+// TTL 取各记录最小值 (保守, IP 变动时尽早重查)。
+func resolveHostIPs(ctx context.Context, host string) ([]string, error) {
 	ipCacheMu.Lock()
 	if e, ok := ipCache[host]; ok && time.Now().Before(e.expiry) {
 		ipCacheMu.Unlock()
-		return e.ip, nil
+		return e.ips, nil
 	}
 	ipCacheMu.Unlock()
 
 	u := fmt.Sprintf("https://moonchan.xyz/doh?name=%s&type=1", url.QueryEscape(host))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
 	resp, err := (netdial.Client(8 * time.Second)).Do(req)
 	if err != nil {
-		return "", fmt.Errorf("DoH %s: %w", host, err)
+		return nil, fmt.Errorf("DoH %s: %w", host, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("DoH %s status %d", host, resp.StatusCode)
+		return nil, fmt.Errorf("DoH %s status %d", host, resp.StatusCode)
 	}
 	var d struct {
 		Answer []struct {
@@ -1006,25 +1126,65 @@ func resolveHostIP(ctx context.Context, host string) (string, error) {
 		} `json:"Answer"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-		return "", err
+		return nil, err
 	}
+	ttl := 300
+	seen := make(map[string]bool)
+	var ips []string
 	for _, ans := range d.Answer {
 		if ans.Type != 1 || net.ParseIP(ans.Data) == nil {
 			continue
 		}
-		ttl := ans.TTL
-		if ttl <= 0 {
-			ttl = 300
+		if seen[ans.Data] {
+			continue
 		}
-		if ttl > 86400 {
-			ttl = 86400
+		seen[ans.Data] = true
+		ips = append(ips, ans.Data)
+		if ans.TTL > 0 && ans.TTL < ttl {
+			ttl = ans.TTL
 		}
-		ipCacheMu.Lock()
-		ipCache[host] = ipCacheEntry{ip: ans.Data, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
-		ipCacheMu.Unlock()
-		return ans.Data, nil
 	}
-	return "", fmt.Errorf("no A record for %s", host)
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no A record for %s", host)
+	}
+	if ttl > 86400 {
+		ttl = 86400
+	}
+	ipCacheMu.Lock()
+	ipCache[host] = ipCacheEntry{ips: ips, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
+	ipCacheMu.Unlock()
+	return ips, nil
+}
+
+// sniTransportPool 按目标 IP 复用的 http2.Transport 池:
+// 每个 IP 一个 transport, http2.Transport 内部会复用该 IP 的空闲连接,
+// 避免每次请求都重新 TCP+TLS 握手 (SNI 伪装握手开销大)。
+// IP 集合有限 (代理配置的站点数量级), 不做逐 IP 过期回收;
+// 超过 maxSNITransports 时整体重置, 防异常情况下无限增长。
+const maxSNITransports = 64
+
+var (
+	sniTransportMu sync.Mutex
+	sniTransports  = map[string]*http2.Transport{}
+)
+
+// getSNITransport 返回复用池中该 IP 的 transport, 不存在则新建。
+func getSNITransport(ip string) *http2.Transport {
+	sniTransportMu.Lock()
+	defer sniTransportMu.Unlock()
+	if tr, ok := sniTransports[ip]; ok {
+		return tr
+	}
+	if len(sniTransports) >= maxSNITransports {
+		// 超限整体重建: 旧连接由 IdleConnTimeout 自然回收。
+		for _, tr := range sniTransports {
+			tr.CloseIdleConnections()
+		}
+		sniTransports = map[string]*http2.Transport{}
+	}
+	tr := newSNIFrontTransport(ip)
+	sniTransports[ip] = tr
+	return tr
 }
 
 // newSNIFrontTransport 返回一个 TLS ClientHello 只声明 http/1.1 ALPN 的
@@ -1036,7 +1196,7 @@ func resolveHostIP(ctx context.Context, host string) (string, error) {
 // Go http.Transport 对自定义 DialTLSContext 不自动启用 h2
 // (TLSNextProto 只在标准 TLSClientConfig 路径注册), 必须直接用
 // http2.Transport 承接 h2 帧, 否则收到 SETTINGS 帧报 malformed。
-func newSNIFrontTransport(ip string) http.RoundTripper {
+func newSNIFrontTransport(ip string) *http2.Transport {
 	dial := func(ctx context.Context) (net.Conn, error) {
 		d := &net.Dialer{Timeout: 8 * time.Second}
 		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
@@ -1067,37 +1227,71 @@ func newSNIFrontTransport(ip string) http.RoundTripper {
 }
 
 // sniFrontDo 通过 SNI 伪装直连 req.Host 指向的站点：
-// DoH 解析真实 IP → TCP 直连 → TLS 假 SNI → HTTP Host 填真实域名。
-// GFW 对 TLS 的 RST 是概率性的，失败时清缓存重试一次。
+// DoH 解析全部真实 IP → 逐个 TCP 直连 → TLS 假 SNI → HTTP Host 填真实域名。
+// GFW 对 TLS 的 RST 是概率性的：所有 IP 都失败时清缓存重查一轮再试。
+// body 先读入内存并设置 GetBody：Clone 共享原 body，若失败发生在发送
+// 中段，重试会发空请求体；GetBody 让每轮尝试都用重建的独立 body。
+// 内存成本: SNI 站点以浏览/下载为主, 请求体都很小, 个人代理可接受。
 func sniFrontDo(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 	host := req.Host
 
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		ip, err := resolveHostIP(ctx, host)
+	if req.Body != nil && req.Body != http.NoBody {
+		bodyBytes, err := io.ReadAll(req.Body)
 		if err != nil {
 			return nil, err
 		}
-		outReq := req.Clone(ctx)
-		outReq.URL.Scheme = "https"
-		outReq.URL.Host = ip
-		outReq.Host = host
-
-		tr := newSNIFrontTransport(ip)
-		// 不用总 Timeout(会砍掉大文件下载), 握手超时由 http2.Transport
-		// 内部 TLS 握手控制。
-		resp, err := (&http.Client{Transport: tr}).Do(outReq)
-		if err == nil {
-			return resp, nil
+		req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
 		}
-		lastErr = err
-		tr.(*http2.Transport).CloseIdleConnections()
-		ipCacheMu.Lock()
-		delete(ipCache, host)
-		ipCacheMu.Unlock()
+	}
+
+	ips, err := resolveHostIPs(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		for _, ip := range ips {
+			outReq := req.Clone(ctx)
+			outReq.URL.Scheme = "https"
+			outReq.URL.Host = ip
+			outReq.Host = host
+			// 每轮用 GetBody 重建独立 body, 保证可重试。
+			if outReq.GetBody != nil {
+				if b, berr := outReq.GetBody(); berr == nil {
+					outReq.Body = b
+				}
+			}
+
+			// 复用按 IP 的 transport 池, 避免每次请求重做 TLS 握手。
+			// 不用总 Timeout(会砍掉大文件下载), 握手超时由 http2.Transport
+			// 内部 TLS 握手控制。
+			resp, err := (&http.Client{Transport: getSNITransport(ip)}).Do(outReq)
+			if err == nil {
+				return resp, nil
+			}
+			lastErr = err
+		}
+		// 一轮全失败: 清 IP 缓存重查 (IP 可能已变/已被墙)。
+		clearIPCache(host)
+		ips, err = resolveHostIPs(ctx, host)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return nil, lastErr
+}
+
+// clearIPCache 删除指定主机的 IP 缓存, 强制下次 DoH 重查。
+func clearIPCache(host string) {
+	ipCacheMu.Lock()
+	delete(ipCache, host)
+	ipCacheMu.Unlock()
 }
 
 // ---- 代理内存 Cookie 存储 ----
@@ -1105,7 +1299,48 @@ func sniFrontDo(req *http.Request) (*http.Response, error) {
 var (
 	cookieMu  sync.Mutex
 	cookieJar = map[string][]*http.Cookie{} // 按上游域名分组
+	// cookieStorePath 非空时启用持久化: jar 每次变更后写盘,
+	// 重启后登录态不丢 (浏览器侧 cookie 在代理这层, 重启代理即丢)。
+	cookieStorePath string
 )
+
+// SetCookieStore 启用 cookie jar 文件持久化: 启动时加载已有文件,
+// 之后每次变更自动写盘。路径不存在时静默跳过 (首次启动)。
+func SetCookieStore(path string) error {
+	cookieStorePath = path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil // 首次启动: 无历史文件, 不算错误
+	}
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	if err := json.Unmarshal(data, &cookieJar); err != nil {
+		// 文件损坏: 丢弃, 重新积累 (不阻塞启动)。
+		cookieJar = map[string][]*http.Cookie{}
+		log.Printf("cookie 持久化文件损坏, 已重置: %v", err)
+	}
+	return nil
+}
+
+// persistCookies 把 jar 序列化写盘 (调用方持锁时不可调用)。
+// jar 数据量很小 (按上游域名分组的少量 cookie), 同步写盘成本可忽略。
+func persistCookies() {
+	if cookieStorePath == "" {
+		return
+	}
+	cookieMu.Lock()
+	data, err := json.Marshal(cookieJar)
+	cookieMu.Unlock()
+	if err != nil {
+		return
+	}
+	// 写临时文件再改名, 避免写一半崩溃留下损坏文件。
+	tmp := cookieStorePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	os.Rename(tmp, cookieStorePath)
+}
 
 // saveCookies 把响应的 Set-Cookie 存入内存 jar（按上游域名分组，同名覆盖）。
 func saveCookies(host string, resp *http.Response) {
@@ -1114,7 +1349,11 @@ func saveCookies(host string, resp *http.Response) {
 		return
 	}
 	cookieMu.Lock()
-	defer cookieMu.Unlock()
+	// 锁释放后落盘: 任何变更 (新增/覆盖/删除) 都持久化。
+	defer func() {
+		cookieMu.Unlock()
+		persistCookies()
+	}()
 
 	jar := cookieJar[host]
 	keep := make(map[string]*http.Cookie, len(jar)+len(sc))
@@ -1162,7 +1401,8 @@ func isCookieAlive(c *http.Cookie, now time.Time) bool {
 
 // applyCookies 把内存 jar 中该上游域名的 cookie 合并进请求。
 // jar 中同名 cookie 优先（服务端最近下发的为准），并顺带清理过期项。
-func applyCookies(host string, req *http.Request) {	cookieMu.Lock()
+func applyCookies(host string, req *http.Request) {
+	cookieMu.Lock()
 	defer cookieMu.Unlock()
 
 	now := time.Now()
