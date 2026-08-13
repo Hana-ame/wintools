@@ -135,12 +135,14 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
-// rewriteSetCookieDomains 把响应 Set-Cookie 头的 Domain 属性改写为代理域名。
-// 上游 Set-Cookie 常带 Domain=.dlsite.com / .iwara.tv, 浏览器在
-// dlsite.l.moonchan.xyz 域下收到会因域不匹配拒绝存储 → 前端 JS 读不到
-// cookie → 语言/成人确认弹窗无限循环。Domain 改写成当前代理 host
-// (去掉端口), 只影响浏览器存储; 内存 jar(按上游域名分组)不受影响。
-func rewriteSetCookieDomains(h http.Header, proxyHost string) {
+// rewriteSetCookieDomains 把响应 Set-Cookie 头规范化, 让浏览器能正常存储:
+//  1. Domain=.dlsite.com 等上游域 → 改写为当前代理域 (dlsite.l.moonchan.xyz),
+//     否则浏览器因域不匹配拒绝存储 → 前端 JS 读不到 cookie → 弹窗无限循环。
+//  2. Secure 标志: 上游 https 下发 Secure cookie, 若代理跑在 http 模式
+//     浏览器不会存 (Secure cookie 只能经 https 传输), 需移除。
+// 内存 jar (按上游域名分组) 管代理→上游的认证 cookie, 与此无关;
+// 这里只保证浏览器端能存下前端状态 cookie (语言/成人确认等)。
+func rewriteSetCookieDomains(h http.Header, proxyHost string, httpMode bool) {
 	scs := h.Values("Set-Cookie")
 	if len(scs) == 0 {
 		return
@@ -152,9 +154,13 @@ func rewriteSetCookieDomains(h http.Header, proxyHost string) {
 	}
 	hasDomain := regexp.MustCompile(`(?i);\s*Domain=`)
 	replaceDomain := regexp.MustCompile(`(?i);\s*Domain=[^;]*`)
+	secureRE := regexp.MustCompile(`(?i);\s*Secure`)
 	for _, s := range scs {
 		if hasDomain.MatchString(s) {
 			s = replaceDomain.ReplaceAllString(s, "; Domain="+domain)
+		}
+		if httpMode {
+			s = secureRE.ReplaceAllString(s, "")
 		}
 		h.Add("Set-Cookie", s)
 	}
@@ -767,12 +773,10 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		log.Printf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
 
 		copyHeaders(c.Writer.Header(), resp.Header)
-		// Set-Cookie 的 Domain 重写为当前代理域:
-		// 上游返回 Domain=.dlsite.com 等, 浏览器从 dlsite.l.moonchan.xyz
-		// 收到后会拒绝存储(域不匹配), 导致前端 JS 读不到 cookie
-		// (dlsite 语言选择/成人确认弹窗无限循环)。
-		// 内存 jar 管上游认证, 但前端状态 cookie 必须能落浏览器。
-		rewriteSetCookieDomains(c.Writer.Header(), host)
+		// Set-Cookie 规范化: Domain 改写为当前代理域 + http 模式去 Secure,
+		// 保证浏览器能存下前端状态 cookie(语言/成人确认等), 不再弹窗循环。
+		// 内存 jar 管代理→上游的认证 cookie, 与此无关。
+		rewriteSetCookieDomains(c.Writer.Header(), host, c.Request.TLS == nil)
 		c.Status(resp.StatusCode)
 
 		if rewriter != nil {

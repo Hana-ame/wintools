@@ -235,14 +235,15 @@ func TestBlockedThirdPartyStrip(t *testing.T) {
 	}
 }
 
-// 回归: 上游 Set-Cookie 带 Domain=.dlsite.com 时, 浏览器在代理域下
-// 拒绝存储 → 前端 JS 读不到 cookie → 语言选择弹窗无限循环。
-// Domain 必须改写为当前代理域名(去端口)。
-func TestRewriteSetCookieDomain(t *testing.T) {
+// 回归: 上游 Set-Cookie 规范化 —— Domain 改写为代理域,
+// http 模式下去掉 Secure 标志, 浏览器才能正常存储前端状态 cookie
+// (dlsite 语言/成人确认弹窗无限循环的根因)。
+func TestSetCookieNormalize(t *testing.T) {
 	h := http.Header{}
-	h.Add("Set-Cookie", "display_language=zh_cn; expires=Wed, 13 Aug 2027 00:00:00 GMT; Max-Age=31536000; path=/; Domain=.dlsite.com")
+	h.Add("Set-Cookie", "display_language=zh_cn; expires=Wed, 13 Aug 2027 00:00:00 GMT; Max-Age=31536000; path=/; Domain=.dlsite.com; Secure")
 	h.Add("Set-Cookie", "host_only=1; path=/")
-	rewriteSetCookieDomains(h, "dlsite.l.moonchan.xyz:8443")
+	// http 模式 (TLS==nil): 去 Secure + 改 Domain
+	rewriteSetCookieDomains(h, "dlsite.l.moonchan.xyz:8443", true)
 	got := h.Values("Set-Cookie")
 	if len(got) != 2 {
 		t.Fatalf("Set-Cookie count = %d", len(got))
@@ -250,10 +251,11 @@ func TestRewriteSetCookieDomain(t *testing.T) {
 	if !strings.Contains(got[0], "Domain=dlsite.l.moonchan.xyz") {
 		t.Errorf("domain not rewritten: %s", got[0])
 	}
-	if strings.Contains(got[0], "dlsite.com") {
-		t.Errorf("old domain still present: %s", got[0])
+	if strings.Contains(got[0], "dlsite.com") || strings.Contains(got[0], "Secure") {
+		t.Errorf("old domain or Secure still present: %s", got[0])
 	}
-	if !strings.Contains(got[1], "host_only=1") || strings.Contains(got[1], "Domain=") {
-		t.Errorf("host-only cookie should be untouched: %s", got[1])
+	if !strings.Contains(got[1], "host_only=1") {
+		t.Errorf("host-only cookie broken: %s", got[1])
 	}
 }
+
