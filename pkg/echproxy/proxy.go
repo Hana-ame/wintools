@@ -219,10 +219,15 @@ func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string
 // 处理形如 href="https://fonts.googleapis.com/..." / src="https://.../jsapi"
 // 的整段引用: 把整个 URL(含引号内内容)替换为空串, 浏览器不再发起请求。
 // 与域名重写互补: 重写只换域名, 这里删整段。
+// 同时匹配 https://host 与 //host (协议相对) 两种形式。
 func stripBlockedURLs(body []byte, blocked []string) []byte {
 	out := body
 	for _, b := range blocked {
 		out = stripOneBlockedURL(out, []byte(b))
+		// 协议相对形式: https://media.dlsite.com -> //media.dlsite.com
+		if strings.HasPrefix(b, "https://") {
+			out = stripOneBlockedURL(out, []byte("//"+b[len("https://"):]))
+		}
 	}
 	return out
 }
