@@ -9,7 +9,9 @@
 - 推 tag: `git tag <vX.Y.Z> && git push origin main && git push origin <tag>`;用 `gh run watch <run_id>` 等 CI 通过,`gh release view <tag>` 确认资产。
 - 资产命名:`<cmd>-<os>-<arch>.exe`,例 `local-proxy-windows-amd64.exe`。下载 `gh release download <tag> -p "<name>"`。
 - Go CI 工作流 `go.yml` 也会在 push main 时跑,别忘 commit 干净工作区再推。
+- **push 前先 `git fetch` 看远端有没有新提交**:远端 main 常有别人(其他会话/任务)的提交,直接 push 会 rejected(fetch first)。先 `git fetch && git log --oneline origin/main -3` 对比,再 `git merge origin/main` 合并后推。本次踩过:ech-shared streaming fetch API(51ce50a)。
 - **伪造时间戳约定(记住!)**:发布时 commit 和 tag 的时间戳要用 `GIT_AUTHOR_DATE` + `GIT_COMMITTER_DATE` 环境变量伪造(GitHub 显示 committer 时间,只设 `git commit --date` 没用)。具体伪造成什么时间,发布时由用户指定,默认取发布时刻前一天内。
+- **ech-proxy 保持纯内存无状态(用户明确要求,记住!)**:不要给 ech-proxy 加任何磁盘落盘/缓存/持久化(配置、证书、cookie jar 都只放内存)。曾加的 `~/.echproxy-cache` 本地缓存降级 + cookie 文件持久化被用户否决回滚("为了兼容性考虑,一切都在内存中")。启动拉配置/证书失败就 Fatalf,不落盘兜底。
 - **v2.0 孤儿分支重置计划(用户已确认,待执行)**:旧 main 最后一个 commit 打 tag `v1.8.x`(发布含 zen 合并的最新版) + push(兜住旧历史);然后 `git checkout --orphan main` 把当前全部文件作为根 commit 建无历史新主线(时间戳伪造,时刻待定),打 tag `v2.0.0` + force push main + push tag(触发 release CI 发布 v2.0.0)。
 - **v2.2.2 已完成: zen 从 ech-proxy 独立回 cmd/capture-proxy**。旧 v2.0.0 把 zen 家族并进 ech-proxy(`zen_provider.go`)被用户否决,现在:
   - `cmd/capture-proxy`:zen 家族三重整合单入口(旧 zen-proxy + local-proxy-detected + local-proxy + scripts/capture_proxy.go 合体),只保留 provider 角色(multi 角色已删)。CLI 独立可跑:`--listen` `--mode auto|v4|v6` `--out 抓包目录` `--detect` `--cert/--key` `--ban`;抓包 / /mode 切换 / /status / /stats API / ?stack= / gzip 请求体 / 3 次递进冷却全部保留。从 v1.9.0 tag 恢复,逻辑与 v2.0.0 zen_provider.go 一致(后者只是库化,无新改进)。
