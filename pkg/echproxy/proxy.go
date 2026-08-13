@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"regexp"
 	"net/url"
 	"sort"
 	"strconv"
@@ -134,6 +135,31 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
+// rewriteSetCookieDomains 把响应 Set-Cookie 头的 Domain 属性改写为代理域名。
+// 上游 Set-Cookie 常带 Domain=.dlsite.com / .iwara.tv, 浏览器在
+// dlsite.l.moonchan.xyz 域下收到会因域不匹配拒绝存储 → 前端 JS 读不到
+// cookie → 语言/成人确认弹窗无限循环。Domain 改写成当前代理 host
+// (去掉端口), 只影响浏览器存储; 内存 jar(按上游域名分组)不受影响。
+func rewriteSetCookieDomains(h http.Header, proxyHost string) {
+	scs := h.Values("Set-Cookie")
+	if len(scs) == 0 {
+		return
+	}
+	h.Del("Set-Cookie")
+	domain := proxyHost
+	if hh, _, err := net.SplitHostPort(proxyHost); err == nil {
+		domain = hh
+	}
+	hasDomain := regexp.MustCompile(`(?i);\s*Domain=`)
+	replaceDomain := regexp.MustCompile(`(?i);\s*Domain=[^;]*`)
+	for _, s := range scs {
+		if hasDomain.MatchString(s) {
+			s = replaceDomain.ReplaceAllString(s, "; Domain="+domain)
+		}
+		h.Add("Set-Cookie", s)
+	}
+}
+
 func isHopByHop(name string) bool {
 	for _, h := range hopByHopHeaders {
 		if http.CanonicalHeaderKey(name) == h {
@@ -218,28 +244,30 @@ func stripOneBlockedURL(body, blocked []byte) []byte {
 			continue
 		}
 		// 从引号后到匹配起点之间应是 https:// 等协议前缀。
+		// between 为空说明引号紧贴匹配点(URL 以 blocked 开头), 也合法。
 		between := rest[start:i]
 		if !bytes.HasPrefix(between, []byte("https://")) &&
 			!bytes.HasPrefix(between, []byte("http://")) &&
-			!bytes.HasPrefix(between, []byte("//")) {
+			!bytes.HasPrefix(between, []byte("//")) &&
+			len(between) > 0 {
 			// 协议前缀不符, 视为普通文本(如 JS 字符串), 只删匹配前缀。
 			out = append(out, rest[:i]...)
 			rest = rest[i+len(blocked):]
 			continue
 		}
-		// 找到右引号。
-		quote := rest[start]
+		// 找到右引号 (start 指向引号后第一个字符, 引号是 rest[start-1])。
+		quote := rest[start-1]
 		j := i
 		for j < len(rest) && rest[j] != quote {
 			j++
 		}
 		if j >= len(rest) {
-			// 未闭合引号, 删到行尾/匹配结尾。
-			out = append(out, rest[:start+1]...)
+			// 未闭合引号, 删到匹配结尾, 保留引号。
+			out = append(out, rest[:start]...)
 			rest = rest[i+len(blocked):]
 			continue
 		}
-		out = append(out, rest[:start+1]...)
+		out = append(out, rest[:start]...)
 		rest = rest[j:]
 	}
 	return out
@@ -739,6 +767,12 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		log.Printf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
 
 		copyHeaders(c.Writer.Header(), resp.Header)
+		// Set-Cookie 的 Domain 重写为当前代理域:
+		// 上游返回 Domain=.dlsite.com 等, 浏览器从 dlsite.l.moonchan.xyz
+		// 收到后会拒绝存储(域不匹配), 导致前端 JS 读不到 cookie
+		// (dlsite 语言选择/成人确认弹窗无限循环)。
+		// 内存 jar 管上游认证, 但前端状态 cookie 必须能落浏览器。
+		rewriteSetCookieDomains(c.Writer.Header(), host)
 		c.Status(resp.StatusCode)
 
 		if rewriter != nil {
