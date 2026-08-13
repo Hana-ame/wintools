@@ -883,9 +883,12 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 						// HTML 页面注入 SW 自动注册 (SWOverride 开启时):
 						// 无 SW 的站点 (dlsite) 需要主动注册才能拦截动态请求,
 						// 注册脚本插在 </head> 前, 页面加载即生效。
+						// 只注入没有 SW 迹象的页面: 已有 workbox/注册逻辑的
+						// 站点 (iwara 的 JS bundle 里自行注册) 注入会冲突
+						// (两个 SW 互相覆盖, workbox 预缓存失效)。
 						if swWant && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
-							!bytes.Contains(body, []byte("serviceWorker.register")) {
-							reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
+							!bytes.Contains(body, []byte("serviceWorker")) {
+							reg := []byte(`<script>navigator.serviceWorker.register('/wt-sw.js').catch(function(){})</script>`)
 							if idx := bytes.Index(body, []byte("</head>")); idx >= 0 {
 								body = append(body[:idx], append(reg, body[idx:]...)...)
 							} else {

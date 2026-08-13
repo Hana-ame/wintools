@@ -67,6 +67,7 @@
     "sw_override": true,
     "sw_paths": [
         "sw.js",
+        "wt-sw.js",
         "workbox-",
         "service-worker"
     ]
