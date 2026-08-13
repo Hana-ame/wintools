@@ -55,6 +55,12 @@ type UpstreamConfig struct {
 	// 适用于 exhentai 等需要登录态/特殊 cookie 的站点, 不依赖浏览器。
 	// 优先级: 此固定 cookie > 内存 jar > 客户端 cookie。
 	Cookie   string            `json:"cookie,omitempty"`
+	// SWInject 为无 service worker 的站点注入代理拦截 SW:
+	// HTML 页面自动注册 /wt-sw.js, 代理对该路径返回生成的 fetch 拦截
+	// 脚本, 兜住前端运行时动态拼接的 URL (响应重写覆盖不到)。
+	// 仅用于没有自己的 SW 的站点 (如 dlsite); 有 workbox 的站点
+	// (如 iwara) 绝不能开 — 注入会与 workbox 变量冲突/互相覆盖。
+	SWInject bool              `json:"sw_inject,omitempty"`
 	Mode     string            `json:"mode,omitempty"`
 	Rewrites map[string]string `json:"rewrites,omitempty"`
 	Wildcard *WildcardRule     `json:"wildcard,omitempty"`
@@ -74,15 +80,6 @@ type Config struct {
 	// 响应中出现的这些 URL 整段剔除, 浏览器不再发起请求避免挂起超时。
 	// 用于 Google 字体/jsapi 等被墙资源、无法代理的 CDN (如 media.dlsite.com)。
 	BlockedHosts []string `json:"blocked_hosts,omitempty"`
-	// SWOverride service worker 注入总开关: 命中 SWPaths 的脚本响应时,
-	// 把 fetch 拦截代码插到最前 (保留上游 workbox 原内容)。
-	// 拦截动态拼接的 *.站点 域名请求改道代理入口, 兜住响应重写
-	// 覆盖不到的运行时 URL。仅对配置了 SWPaths 的站点开启
-	// (iwara 等前端有 service worker 的站点需要, 其他站点默认关闭)。
-	SWOverride bool `json:"sw_override,omitempty"`
-	// SWPaths service worker 脚本路径匹配后缀 (文件名), 命中时注入 fetch
-	// 拦截代码 (SWOverride 开启时生效)。默认 sw.js / workbox-*.js / service-worker*。
-	SWPaths []string `json:"sw_paths,omitempty"`
 }
 
 // FetchBytes 从 URL 拉取内容到内存（不落盘），请求失败或状态非 200 时报错。
@@ -450,33 +447,6 @@ func isHexDigit(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
-// isServiceWorkerPath 判断请求是否为 service worker 脚本 (sw.js / workbox-*.js)。
-// isServiceWorkerPath 判断请求是否为 service worker 脚本。
-// 匹配 Config.SWPaths (文件名后缀, 支持前缀), 空时用默认:
-// sw.js / service-worker* / workbox-*.js。
-func isServiceWorkerPath(p string, swPaths []string) bool {
-	base := p[strings.LastIndex(p, "/")+1:]
-	if len(swPaths) > 0 {
-		for _, s := range swPaths {
-			if strings.HasPrefix(s, "*") {
-				// "*workbox-*.js" 之类: 前缀+后缀都匹配。
-				trim := strings.TrimPrefix(s, "*")
-				if strings.HasSuffix(base, trim) {
-					return true
-				}
-				continue
-			}
-			if base == s || strings.HasPrefix(base, s) {
-				return true
-			}
-		}
-		return false
-	}
-	return base == "sw.js" ||
-		strings.HasPrefix(base, "service-worker") ||
-		(strings.HasPrefix(base, "workbox-") && strings.HasSuffix(base, ".js"))
-}
-
 // buildSWProxyMap 收集「真实上游域名 → 代理入口域名[:端口]」映射，
 // 供 service worker 注入使用: 前端动态请求上游域名时改道到代理。
 // 本项目与 l.moonchan.xyz 强捆绑, 无需解耦:
@@ -638,6 +608,10 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 		if out.Cookie == "" {
 			out.Cookie = uc.Cookie
 		}
+		// 通配入口继承主入口的 sw_inject (无 SW 站点的 SW 兜底开关)。
+		if !out.SWInject {
+			out.SWInject = uc.SWInject
+		}
 		if out.Mode == "" || out.Mode == "ech" {
 			out.Mode = wildcardMode(context.Background(), out.Host)
 		}
@@ -734,15 +708,14 @@ func inheritWildcard(cfg UpstreamMap, entry string) *WildcardRule {
 
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
 // 命中规则的 Rewrites 非空时启用响应域名替换。
-// blockedHosts 为 Config.BlockedHosts, swOverride/swPaths 为 Config 的
-// SWOverride/SWPaths (upstream.json 可配)。
+// blockedHosts 为 Config.BlockedHosts。
 //
 // Mode 决定出网方式:
 //
 //	"" / ech  — ECH 域前置（目标须在 Cloudflare 后）
 //	sni       — SNI 伪装直连（DoH 解析真实 IP + 假 SNI + Host 路由）
 //	direct    — 普通 HTTPS 直连（目标可直连时）
-func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPaths []string) gin.HandlerFunc {
+func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 	blocked := append([]string(nil), blockedHosts...)
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -775,10 +748,11 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 		}
 		rewriter := buildEntryRewriter(ucForRewrite, blocked)
 
-		// service worker 处理标记: SWOverride 开启且命中 SWPaths。
-		// 分两种: 上游有 JS(workbox 等) → 注入拦截前缀;
-		// 上游无 JS(404/HTML, 如 dlsite) → 整体返回生成的 SW。
-		swWant := swOverride && isServiceWorkerPath(rawPath, swPaths)
+		// service worker 兜底标记: 仅对该入口配置了 SWInject (无 SW 站点
+		// 如 dlsite) 且请求的是代理专用 /wt-sw.js 时生效。
+		// 有 workbox 的站点 (iwara) 不配 SWInject, 代理绝不碰其 SW 文件
+		// (注入会与 workbox 变量冲突, 导致整个 SW 崩溃)。
+		swWant := uc.SWInject && rawPath == "/wt-sw.js"
 
 		targetURL := &url.URL{
 			Scheme:   "https",
@@ -828,12 +802,13 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 		// 保证浏览器能存下前端状态 cookie(语言/成人确认等), 不再弹窗循环。
 		// 内存 jar 管代理→上游的认证 cookie, 与此无关。
 		rewriteSetCookieDomains(c.Writer.Header(), host, c.Request.TLS == nil)
-		c.Status(resp.StatusCode)
 
-		// SW 兜底: 命中 SWPaths 但上游没有 JS 脚本 (404/HTML 等) 时,
-		// 直接返回生成的拦截 SW。用于没有 service worker 的站点
+		// SW 兜底: 该入口配了 SWInject 且请求 /wt-sw.js (上游必然 404)
+		// 时, 直接返回生成的拦截 SW。用于没有 service worker 的站点
 		// (如 dlsite): 前端运行时动态拼接的 img.dlsite.jp 等 URL,
 		// 响应重写覆盖不到, 靠 SW fetch 拦截改道代理入口。
+		// 必须在 c.Status 之前: gin 的 c.Status 立即写响应头,
+		// 之后 WriteHeader(200) 无效 (会返回上游 404)。
 		if swWant && !isJavascriptResponse(resp) {
 			port := ""
 			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
@@ -848,6 +823,8 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 			log.Printf("[%s] %s %s -> SW 兜底生成 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
 			return
 		}
+
+		c.Status(resp.StatusCode)
 
 		if rewriter != nil {
 			port := ""
@@ -867,25 +844,12 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 				(resp.ContentLength <= 0 || resp.ContentLength <= 8<<20) {
 				if body, err := io.ReadAll(resp.Body); err == nil {
 					if body, err = decompressBody(body, resp.Header.Get("Content-Encoding")); err == nil {
-						if swWant && isJavascriptResponse(resp) {
-							// 上游有 workbox: 拦截代码插最前, 保留其功能。
-							// fetch 监听按注册顺序先到先得, 先注册先响应。
-							port := ""
-							if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-								port = p
-							}
-							swProxyMap := buildSWProxyMap(cfg, port)
-							swRules := collectWildcardRules(cfg)
-							body = append([]byte(swOverrideJS(swProxyMap, swRules, blocked)), body...)
-							log.Printf("[%s] %s %s -> SW 注入前缀 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
-						}
 						body = rewriter(body, port)
-						// HTML 页面注入 SW 自动注册 (SWOverride 开启时):
+						// HTML 页面注入 SW 自动注册 (该入口配了 SWInject 时):
 						// 无 SW 的站点 (dlsite) 需要主动注册才能拦截动态请求,
 						// 注册脚本插在 </head> 前, 页面加载即生效。
-						// 只注入没有 SW 迹象的页面: 已有 workbox/注册逻辑的
-						// 站点 (iwara 的 JS bundle 里自行注册) 注入会冲突
-						// (两个 SW 互相覆盖, workbox 预缓存失效)。
+						// 只注入没有 SW 迹象的页面 (含 'serviceWorker' 的
+						// 页面已有注册逻辑, 注入会冲突)。
 						if swWant && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
 							!bytes.Contains(body, []byte("serviceWorker")) {
 							reg := []byte(`<script>navigator.serviceWorker.register('/wt-sw.js').catch(function(){})</script>`)

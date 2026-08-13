@@ -106,7 +106,7 @@ func main() {
 		tlsCert = &cert
 	}
 
-	upstreamHandler = echproxy.ProxyHandler(upstreamCfg, cfg.BlockedHosts, cfg.SWOverride, cfg.SWPaths)
+	upstreamHandler = echproxy.ProxyHandler(upstreamCfg, cfg.BlockedHosts)
 	zenHost := "zen.l.moonchan.xyz"
 	zenProxyHandler := func(c *gin.Context) {
 		if c.GetHeader("Authorization") == "" {

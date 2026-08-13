@@ -49,7 +49,8 @@
             "rewrites": {
                 "www.dlsite.com": "dlsite.l.moonchan.xyz",
                 "img.dlsite.jp": "dlsite-img.l.moonchan.xyz"
-            }
+            },
+            "sw_inject": true
         },
         "dlsite-img.l.moonchan.xyz": {
             "host": "img.dlsite.jp",
@@ -63,12 +64,5 @@
         "https://ajax.googleapis.com",
         "https://www.googletagmanager.com",
         "https://media.dlsite.com"
-    ],
-    "sw_override": true,
-    "sw_paths": [
-        "sw.js",
-        "wt-sw.js",
-        "workbox-",
-        "service-worker"
     ]
 }

@@ -142,7 +142,7 @@ func TestFixedCookieOverride(t *testing.T) {
 	// 精确入口: 固定 cookie 覆盖内存 jar + 客户端 cookie。
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.NoRoute(ProxyHandler(cfg, nil, false, nil))
+	r.NoRoute(ProxyHandler(cfg, nil))
 	ts := httptest.NewServer(r)
 	defer ts.Close()
 
