@@ -224,6 +224,16 @@ func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string
 	}
 }
 
+// isJavascriptResponse 判断上游响应是否为 JS 脚本 (供 SW 处理判断:
+// 是 JS 则注入前缀保留内容, 否则整体替换为生成的 SW)。
+func isJavascriptResponse(resp *http.Response) bool {
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		return strings.HasSuffix(resp.Request.URL.Path, ".js")
+	}
+	return strings.Contains(strings.ToLower(ct), "javascript")
+}
+
 // stripBlockedURLs 从响应文本中移除被墙第三方域名的完整 URL 值。
 // 处理形如 href="https://fonts.googleapis.com/..." / src="https://.../jsapi"
 // 的整段引用: 把整个 URL(含引号内内容)替换为空串, 浏览器不再发起请求。
@@ -763,23 +773,10 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 		}
 		rewriter := buildEntryRewriter(ucForRewrite, blocked)
 
-		// service worker 注入: SWOverride 开启且命中 SWPaths 时,
-		// 把 fetch 拦截代码插到上游 workbox 内容最前 (先注册先响应),
-		// 拦截动态拼接的真实域名请求改道代理入口。
-		// 仅对配置了 SWOverride=true 的站点生效 (iwara 等有 SW 的站点)。
-		swInject := ""
-		if swOverride && isServiceWorkerPath(rawPath, swPaths) {
-			port := ""
-			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-				port = p
-			}
-			swProxyMap := buildSWProxyMap(cfg, port)
-			swRules := collectWildcardRules(cfg)
-			if len(swProxyMap) > 0 {
-				swInject = swOverrideJS(swProxyMap, swRules, blocked)
-				log.Printf("[%s] %s %s -> SW 注入前缀 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
-			}
-		}
+		// service worker 处理标记: SWOverride 开启且命中 SWPaths。
+		// 分两种: 上游有 JS(workbox 等) → 注入拦截前缀;
+		// 上游无 JS(404/HTML, 如 dlsite) → 整体返回生成的 SW。
+		swWant := swOverride && isServiceWorkerPath(rawPath, swPaths)
 
 		targetURL := &url.URL{
 			Scheme:   "https",
@@ -831,6 +828,25 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 		rewriteSetCookieDomains(c.Writer.Header(), host, c.Request.TLS == nil)
 		c.Status(resp.StatusCode)
 
+		// SW 兜底: 命中 SWPaths 但上游没有 JS 脚本 (404/HTML 等) 时,
+		// 直接返回生成的拦截 SW。用于没有 service worker 的站点
+		// (如 dlsite): 前端运行时动态拼接的 img.dlsite.jp 等 URL,
+		// 响应重写覆盖不到, 靠 SW fetch 拦截改道代理入口。
+		if swWant && !isJavascriptResponse(resp) {
+			port := ""
+			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+				port = p
+			}
+			swProxyMap := buildSWProxyMap(cfg, port)
+			swRules := collectWildcardRules(cfg)
+			c.Writer.Header().Del("Content-Length")
+			c.Writer.Header().Set("Content-Type", "application/javascript")
+			c.Writer.WriteHeader(200)
+			c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules, blocked)))
+			log.Printf("[%s] %s %s -> SW 兜底生成 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
+			return
+		}
+
 		if rewriter != nil {
 			port := ""
 			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
@@ -849,11 +865,32 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string, swOverride bool, swPat
 				(resp.ContentLength <= 0 || resp.ContentLength <= 8<<20) {
 				if body, err := io.ReadAll(resp.Body); err == nil {
 					if body, err = decompressBody(body, resp.Header.Get("Content-Encoding")); err == nil {
-						if swInject != "" {
-							// SW 脚本: 拦截代码插最前, 保留上游 workbox 功能。
-							body = append([]byte(swInject), body...)
+						if swWant && isJavascriptResponse(resp) {
+							// 上游有 workbox: 拦截代码插最前, 保留其功能。
+							// fetch 监听按注册顺序先到先得, 先注册先响应。
+							port := ""
+							if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+								port = p
+							}
+							swProxyMap := buildSWProxyMap(cfg, port)
+							swRules := collectWildcardRules(cfg)
+							body = append([]byte(swOverrideJS(swProxyMap, swRules, blocked)), body...)
+							log.Printf("[%s] %s %s -> SW 注入前缀 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
 						}
 						body = rewriter(body, port)
+						// HTML 页面注入 SW 自动注册 (SWOverride 开启时):
+						// 无 SW 的站点 (dlsite) 需要主动注册才能拦截动态请求,
+						// 注册脚本插在 </head> 前, 页面加载即生效。
+						if swWant && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
+							!bytes.Contains(body, []byte("serviceWorker.register")) {
+							reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
+							if idx := bytes.Index(body, []byte("</head>")); idx >= 0 {
+								body = append(body[:idx], append(reg, body[idx:]...)...)
+							} else {
+								body = append(body, reg...)
+							}
+							log.Printf("[%s] %s -> HTML 注入 SW 注册", clientIP, rawPath)
+						}
 						c.Writer.Header().Del("Content-Encoding")
 						c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
 						if _, werr := c.Writer.Write(body); werr == nil {

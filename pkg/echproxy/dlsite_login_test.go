@@ -36,3 +36,28 @@ func TestDlsiteLoginWildcard(t *testing.T) {
 		t.Errorf("login rewrite broken: %s", body)
 	}
 }
+
+// 回归: dlsite 无上游 SW, 请求 /sw.js 时应返回生成的拦截 SW (含
+// img.dlsite.jp -> dlsite-img 映射); HTML 页面应注入 SW 注册脚本。
+func TestDlsiteSWFallback(t *testing.T) {
+	cfg := UpstreamMap{
+		"dlsite.l.moonchan.xyz": {
+			Host: "www.dlsite.com",
+			Wildcard: &WildcardRule{
+				Prefix:         "dlsite-",
+				EntrySuffix:    ".l.moonchan.xyz",
+				UpstreamSuffix: ".dlsite.com",
+			},
+			Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
+		},
+		"dlsite-img.l.moonchan.xyz": {Host: "img.dlsite.jp"},
+	}
+	// SW 生成的映射应包含 img.dlsite.jp (从配置自动收集)
+	sw := swOverrideJS(buildSWProxyMap(cfg, "8443"), collectWildcardRules(cfg), nil)
+	if !strings.Contains(sw, "img.dlsite.jp") {
+		t.Errorf("SW missing img.dlsite.jp mapping:\n%s", sw)
+	}
+	if !strings.Contains(sw, "dlsite-img.l.moonchan.xyz:8443") {
+		t.Errorf("SW missing dlsite-img target:\n%s", sw)
+	}
+}
