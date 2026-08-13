@@ -47,8 +47,13 @@
                 "referer": "https://www.dlsite.com/"
             },
             "rewrites": {
-                "www.dlsite.com": "dlsite.l.moonchan.xyz"
+                "www.dlsite.com": "dlsite.l.moonchan.xyz",
+                "img.dlsite.jp": "dlsite-img.l.moonchan.xyz"
             }
+        },
+        "dlsite-img.l.moonchan.xyz": {
+            "host": "img.dlsite.jp",
+            "referer": "https://www.dlsite.com/"
         }
     },
     "blocked_hosts": [
