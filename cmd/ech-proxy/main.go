@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	_ "embed"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -12,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"syscall"
 	"time"
@@ -27,37 +25,6 @@ import (
 //go:embed static/index.html
 var chatHTML string
 
-// cacheDir 返回配置/证书/cookie 的本地缓存目录 (环境变量可覆盖)。
-// 默认 ~/.echproxy-cache: 远程拉取失败时回退这些缓存, 进程仍能启动。
-func cacheDir() string {
-	if d := os.Getenv("ECHPROXY_CACHE_DIR"); d != "" {
-		return d
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return filepath.Join(os.TempDir(), "echproxy-cache")
-	}
-	return filepath.Join(home, ".echproxy-cache")
-}
-
-// fetchWithCache 拉取远程内容并落盘缓存; 远程失败时回退本地缓存,
-// 避免 GitHub/镜像不可达时进程直接起不来 (远程部署的稳定性保障)。
-// 成功内容每次覆盖缓存, 保证缓存与线上一致。
-func fetchWithCache(rawURL, cachePath string) ([]byte, error) {
-	data, err := echproxy.FetchBytes(rawURL)
-	if err == nil {
-		if mkerr := os.MkdirAll(filepath.Dir(cachePath), 0700); mkerr == nil {
-			os.WriteFile(cachePath, data, 0600)
-		}
-		return data, nil
-	}
-	if c, cerr := os.ReadFile(cachePath); cerr == nil {
-		log.Printf("远程拉取失败 (%v), 使用本地缓存: %s", err, cachePath)
-		return c, nil
-	}
-	return nil, err
-}
-
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
@@ -66,8 +33,6 @@ func main() {
 
 	// 每请求日志开关: 远程部署默认静默, 排查问题时 -v 打开。
 	echproxy.Debug = *verbose
-	cache := cacheDir()
-	log.Printf("本地缓存目录: %s", cache)
 
 	localIP := os.Getenv("LOCALIP")
 	if localIP != "" {
@@ -115,36 +80,23 @@ func main() {
 	upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
 
 	log.Printf("正在加载上游配置: %s", upstreamConfigURL)
-	cfgBytes, err := fetchWithCache(upstreamConfigURL, filepath.Join(cache, "upstream.json"))
+	cfg, err := echproxy.LoadConfig(upstreamConfigURL)
 	if err != nil {
 		log.Fatalf("加载上游配置失败: %v", err)
-	}
-	var cfg echproxy.Config
-	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
-		log.Fatalf("解析上游配置失败: %v", err)
-	}
-	if len(cfg.Upstreams) == 0 {
-		log.Fatalf("上游配置没有规则")
 	}
 	upstreamCfg = cfg.Upstreams
 	log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
 
-	// cookie jar 持久化: 重启后登录态不丢。
-	if err := echproxy.SetCookieStore(filepath.Join(cache, "cookies.json")); err != nil {
-		log.Printf("cookie 持久化初始化失败: %v", err)
-	}
-
 	if !*httpMode {
 		// TLS 模式额外拉取证书: 证书 URL 与上游路由都写死在 repo 的
 		// upstream.json 配置里, 证书续期后只需更新该配置指向的 URL。
-		// 证书同样走本地缓存降级。
 		log.Printf("正在拉取证书: %s", cfg.CertPath)
-		certPEM, err := fetchWithCache(cfg.CertPath, filepath.Join(cache, "cert.pem"))
+		certPEM, err := echproxy.FetchBytes(cfg.CertPath)
 		if err != nil {
 			log.Fatalf("拉取证书失败: %v", err)
 		}
 		log.Printf("正在拉取密钥: %s", cfg.KeyPath)
-		keyPEM, err := fetchWithCache(cfg.KeyPath, filepath.Join(cache, "key.pem"))
+		keyPEM, err := echproxy.FetchBytes(cfg.KeyPath)
 		if err != nil {
 			log.Fatalf("拉取密钥失败: %v", err)
 		}

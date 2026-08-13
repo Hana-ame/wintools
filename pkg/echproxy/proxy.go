@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1299,48 +1298,7 @@ func clearIPCache(host string) {
 var (
 	cookieMu  sync.Mutex
 	cookieJar = map[string][]*http.Cookie{} // 按上游域名分组
-	// cookieStorePath 非空时启用持久化: jar 每次变更后写盘,
-	// 重启后登录态不丢 (浏览器侧 cookie 在代理这层, 重启代理即丢)。
-	cookieStorePath string
 )
-
-// SetCookieStore 启用 cookie jar 文件持久化: 启动时加载已有文件,
-// 之后每次变更自动写盘。路径不存在时静默跳过 (首次启动)。
-func SetCookieStore(path string) error {
-	cookieStorePath = path
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil // 首次启动: 无历史文件, 不算错误
-	}
-	cookieMu.Lock()
-	defer cookieMu.Unlock()
-	if err := json.Unmarshal(data, &cookieJar); err != nil {
-		// 文件损坏: 丢弃, 重新积累 (不阻塞启动)。
-		cookieJar = map[string][]*http.Cookie{}
-		log.Printf("cookie 持久化文件损坏, 已重置: %v", err)
-	}
-	return nil
-}
-
-// persistCookies 把 jar 序列化写盘 (调用方持锁时不可调用)。
-// jar 数据量很小 (按上游域名分组的少量 cookie), 同步写盘成本可忽略。
-func persistCookies() {
-	if cookieStorePath == "" {
-		return
-	}
-	cookieMu.Lock()
-	data, err := json.Marshal(cookieJar)
-	cookieMu.Unlock()
-	if err != nil {
-		return
-	}
-	// 写临时文件再改名, 避免写一半崩溃留下损坏文件。
-	tmp := cookieStorePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return
-	}
-	os.Rename(tmp, cookieStorePath)
-}
 
 // saveCookies 把响应的 Set-Cookie 存入内存 jar（按上游域名分组，同名覆盖）。
 func saveCookies(host string, resp *http.Response) {
@@ -1349,11 +1307,7 @@ func saveCookies(host string, resp *http.Response) {
 		return
 	}
 	cookieMu.Lock()
-	// 锁释放后落盘: 任何变更 (新增/覆盖/删除) 都持久化。
-	defer func() {
-		cookieMu.Unlock()
-		persistCookies()
-	}()
+	defer cookieMu.Unlock()
 
 	jar := cookieJar[host]
 	keep := make(map[string]*http.Cookie, len(jar)+len(sc))

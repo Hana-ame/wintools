@@ -7,10 +7,6 @@ package echproxy
 import (
 	"bytes"
 	"compress/gzip"
-	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -33,51 +29,6 @@ func TestDecompressBodyBombLimit(t *testing.T) {
 	body, err := decompressBody(buf.Bytes(), "gzip")
 	if err == nil {
 		t.Fatalf("解压炸弹应报错, 却返回 %d 字节", len(body))
-	}
-}
-
-// TestCookieStorePersist 验证 cookie jar 文件持久化 roundtrip:
-// 存 cookie → 重置内存 jar → 从文件重新加载 → cookie 仍在。
-// 发现背景: 新增功能 (代理重启后登录态丢失)。
-// 修复: SetCookieStore 启动时加载文件, saveCookies 每次变更后
-// 原子写盘 (tmp+rename, 避免写一半崩溃留下损坏文件)。
-func TestCookieStorePersist(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cookies.json")
-
-	cookieMu.Lock()
-	cookieJar = map[string][]*http.Cookie{}
-	cookieMu.Unlock()
-	defer func() {
-		cookieMu.Lock()
-		cookieJar = map[string][]*http.Cookie{}
-		cookieMu.Unlock()
-		cookieStorePath = ""
-	}()
-
-	if err := SetCookieStore(path); err != nil {
-		t.Fatalf("SetCookieStore: %v", err)
-	}
-
-	resp := &http.Response{Header: http.Header{}}
-	resp.Header.Add("Set-Cookie", "sid=abc123; Path=/; HttpOnly")
-	saveCookies("sukebei.nyaa.si", resp)
-
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("持久化文件未生成: %v", err)
-	}
-
-	// 模拟重启: 清空内存 jar 再从文件加载。
-	cookieMu.Lock()
-	cookieJar = map[string][]*http.Cookie{}
-	cookieMu.Unlock()
-	if err := SetCookieStore(path); err != nil {
-		t.Fatalf("重新加载: %v", err)
-	}
-
-	req, _ := http.NewRequest(http.MethodGet, "https://sukebei.nyaa.si/", nil)
-	applyCookies("sukebei.nyaa.si", req)
-	if got := req.Header.Get("Cookie"); !strings.Contains(got, "sid=abc123") {
-		t.Fatalf("重启后 cookie 丢失: %q", got)
 	}
 }
 
