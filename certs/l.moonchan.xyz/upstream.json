@@ -47,8 +47,7 @@
                 "referer": "https://www.dlsite.com/"
             },
             "rewrites": {
-                "www.dlsite.com": "dlsite.l.moonchan.xyz",
-                "login.dlsite.com": "dlsite.l.moonchan.xyz"
+                "www.dlsite.com": "dlsite.l.moonchan.xyz"
             }
         }
     },
