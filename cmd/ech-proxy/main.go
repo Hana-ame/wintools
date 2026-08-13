@@ -63,12 +63,6 @@ func main() {
 		c.String(200, "ok")
 	})
 
-	zenAPIKey := os.Getenv("ZEN_API_KEY")
-	if zenAPIKey == "" {
-		zenAPIKey = "public"
-	}
-	zenHandler := NewZenProvider()
-
 	var upstreamCfg echproxy.UpstreamMap
 	var upstreamHandler gin.HandlerFunc
 	var tlsCert *tls.Certificate
@@ -107,13 +101,6 @@ func main() {
 	}
 
 	upstreamHandler = echproxy.ProxyHandler(upstreamCfg, cfg.BlockedHosts)
-	zenHost := "zen.l.moonchan.xyz"
-	zenProxyHandler := func(c *gin.Context) {
-		if c.GetHeader("Authorization") == "" {
-			c.Request.Header.Set("Authorization", "Bearer "+zenAPIKey)
-		}
-		zenHandler.ServeHTTP(c.Writer, c.Request)
-	}
 
 	hostOf := func(c *gin.Context) string {
 		h := c.Request.Host
@@ -122,13 +109,8 @@ func main() {
 		}
 		return h
 	}
-	isZen := func(c *gin.Context) bool { return hostOf(c) == zenHost }
 
 	r.GET("/", func(c *gin.Context) {
-		if isZen(c) {
-			zenProxyHandler(c)
-			return
-		}
 		// 精确或通配入口都走代理, 否则返回 chatHTML。
 		h := hostOf(c)
 		if _, ok := upstreamCfg[h]; ok {
@@ -144,11 +126,7 @@ func main() {
 	})
 
 	r.NoRoute(func(c *gin.Context) {
-		if isZen(c) {
-			zenProxyHandler(c)
-		} else {
-			upstreamHandler(c)
-		}
+		upstreamHandler(c)
 	})
 
 	fmt.Printf("=== ECH Proxy ===\n")
@@ -163,20 +141,16 @@ func main() {
 	}
 	sort.Strings(domains)
 	for _, d := range domains {
-		if d == "zen.l.moonchan.xyz" {
-			fmt.Printf("  域名: %s -> opencode.ai (Zen API 直连)\n", d)
-		} else {
-			uc := upstreamCfg[d]
-			fmt.Printf("  域名: %s -> %s (%s)", d, uc.Host, echproxy.ModeName(uc.Mode))
-			if uc.Referer != "" {
-				fmt.Printf(" (referer: %s)", uc.Referer)
-			}
-			// 通配入口一并显示: iwara-* → *.iwara.tv, 让 banner 反映真实覆盖范围。
-			if w := uc.Wildcard; w != nil {
-				fmt.Printf(" [+通配 %s*%s -> *%s]", w.Prefix, w.EntrySuffix, w.UpstreamSuffix)
-			}
-			fmt.Println()
+		uc := upstreamCfg[d]
+		fmt.Printf("  域名: %s -> %s (%s)", d, uc.Host, echproxy.ModeName(uc.Mode))
+		if uc.Referer != "" {
+			fmt.Printf(" (referer: %s)", uc.Referer)
 		}
+		// 通配入口一并显示: iwara-* → *.iwara.tv, 让 banner 反映真实覆盖范围。
+		if w := uc.Wildcard; w != nil {
+			fmt.Printf(" [+通配 %s*%s -> *%s]", w.Prefix, w.EntrySuffix, w.UpstreamSuffix)
+		}
+		fmt.Println()
 	}
 	fmt.Printf("=================\n")
 

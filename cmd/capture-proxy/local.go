@@ -1,10 +1,36 @@
-// zen_provider.go — ech-proxy 的 zen 入口 (zen.l.moonchan.xyz)。
-// 由 cmd/capture-proxy 的 provider 逻辑集成而来:
-// v6/v4 failover (auto 先 v6 再 v4, 请求 ?stack= 可指定栈)、流检测/注入、
-// FreeUsageLimitError 三次递进冷却、usage 计费、ban 限流、gzip 请求体。
+// Local Proxy — Ollama-compatible endpoint relaying to opencode.ai/zen/v1 with
+// dual-stack v6/v4 failover, active stream detection, capture, and mode switch.
 //
-// 用法: NewZenProvider() 返回的 http.Handler 处理 /chat/completions 等请求。
-
+// 合并自 cmd/local-proxy-detected 与 scripts/capture_proxy.go (两者核心转发
+// 逻辑一致): local-proxy-detected 的 usage 计费统计 + vanilla 透传开关 +
+// 双栈监听, capture_proxy 的抓包 / /mode API / 伪装 opencode client / gzip
+// 请求体 / TLS 监听。
+//
+// 设计目标:
+//   - 转发到 opencode.ai/zen/v1 (v6/v4 failover、FreeUsageLimitError cooldown);
+//   - 流检测: 预读等待首 token、token 节奏 stall 检测、180s 工具调用思考窗口、
+//     keep-alive 过滤、EOF/DONE 兜底封流、意外中断注入 "echo 继续" 恢复工具循环;
+//   - 抓包: 每个请求 (method/URL/全部 header/body) 存到 --out 目录;
+//   - 伪装 opencode client: 透传客户端 header, 缺失时补 opencode UA /
+//     x-opencode-* / X-Session-Id, 使上游 (Cloudflare) 视作真实 opencode 客户端;
+//   - gzip 请求体: Content-Encoding: gzip 时先解压再转发;
+//   - 模式开关: v4 / v6 (单栈), 运行中可经 /mode API 切换;
+//   - usage 计费统计: 按模型累计 token/cost, /stats 端点查询;
+//   - vanilla 纯透传 (--detect=false): 不做流检测, 仅转发 + 统计。
+//
+// 用法:
+//
+//	capture-proxy -role provider --listen 127.0.0.1:8000 --mode v4 [--out dir]
+//	capture-proxy -role local --mode v4 --out captured          # 强制 v4
+//	capture-proxy -role local --cert fullchain.cer --key key    # HTTPS 监听
+//	capture-proxy -role local --detect=false                    # vanilla 纯透传
+//
+// 模式 API:
+//
+//	GET  /mode            -> {"mode":"v4","v4_cooldown_sec":..,"v6_cooldown_sec":..}
+//	POST /mode            body {"mode":"v6"}  或 query ?mode=v6  (v4|v6)
+//	GET  /status          -> 同 /mode + 按协议族累计统计
+//	GET  /stats           -> 按模型 usage 计费统计
 package main
 
 import (
@@ -13,14 +39,19 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hana-ame/wintools/pkg/proxyheaders"
@@ -383,6 +414,56 @@ func lengthChunk(model string) []byte {
 	return []byte(fmt.Sprintf("data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", model))
 }
 
+// ---- 抓包 (capture) ----------------------------------------------------------
+
+type capture struct {
+	mu  sync.Mutex
+	seq atomic.Uint64
+	dir string
+}
+
+func (c *capture) save(r *http.Request, body []byte) {
+	if c == nil || c.dir == "" {
+		return
+	}
+	n := c.seq.Add(1)
+	name := filepath.Join(c.dir, fmt.Sprintf("%06d_%s_%s.txt",
+		n, time.Now().Format("20060102-150405"), sanitize(r.URL.Path)))
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s %s %s\n", r.Method, r.URL.String(), r.Proto)
+	fmt.Fprintf(&sb, "remote=%s host=%s\n", r.RemoteAddr, r.Host)
+	var keys []string
+	for k := range r.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		for _, v := range r.Header[k] {
+			fmt.Fprintf(&sb, "%s: %s\n", k, v)
+		}
+	}
+	fmt.Fprintf(&sb, "\n--- BODY (%d bytes) ---\n", len(body))
+	sb.Write(body)
+
+	if err := os.WriteFile(name, []byte(sb.String()), 0o644); err != nil {
+		log.Printf("capture write %s: %v", name, err)
+	}
+	log.Printf("captured[%d] %s %s %dB -> %s", n, r.Method, r.URL.Path, len(body), name)
+}
+
+func sanitize(p string) string {
+	p = strings.ReplaceAll(p, "/", "_")
+	p = strings.ReplaceAll(p, "?", "_")
+	if len(p) > 60 {
+		p = p[:60]
+	}
+	if p == "" || p == "_" {
+		return "root"
+	}
+	return strings.Trim(p, "_")
+}
+
 // ---- proxy 核心 --------------------------------------------------------------
 
 type proxy struct {
@@ -644,7 +725,7 @@ func readBody(r *http.Request) ([]byte, error) {
 
 var errTooLarge = fmt.Errorf("request body too large")
 
-func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
+func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, cap *capture) {
 	clientIP := clientIPOf(r)
 	stackOverride := r.URL.Query().Get("stack")
 	if stackOverride != "" && stackOverride != "v4" && stackOverride != "v6" {
@@ -671,6 +752,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string) {
 		writeJSON(w, status, map[string]any{"error": msg})
 		return
 	}
+	if cap != nil {
+		cap.save(r, body)
+	}
+
 	isStream := false
 	model := defaultModel
 	recoverable := false
@@ -1281,36 +1366,64 @@ func makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-// NewZenProvider 构建 ech-proxy 的 zen 处理器: 转发到 opencode.ai/zen/v1,
-// mode 默认 auto (先 v6 再 v4), 请求 ?stack=v4|v6 可绕过 mode 直走指定栈。
-func NewZenProvider() http.Handler {
-	v4, v6 := resolveOnce(zenHost)
-	if v4 == "" && v6 == "" {
-		log.Fatalf("could not resolve %s via public DNS", zenHost)
+func runProvider(args []string) {
+	fs := flag.NewFlagSet("provider", flag.ExitOnError)
+	listen := fs.String("listen", "127.0.0.1:8000", "监听地址")
+	mode := fs.String("mode", "auto", "转发模式: auto(先 v6 再 v4) | v4 | v6")
+	outDir := fs.String("out", "", "抓包输出目录 (默认不抓包)")
+	cert := fs.String("cert", "", "TLS 证书文件 (提供后以 HTTPS 监听)")
+	key := fs.String("key", "", "TLS 私钥文件")
+	detect := fs.Bool("detect", true, "流检测 (true=detected, false=vanilla 纯透传)")
+	ban := fs.Bool("ban", false, "按 IP 限流 (200 req/10min, zen-proxy 行为)")
+	fs.Parse(args)
+
+	if *mode != "v4" && *mode != "v6" {
+		*mode = "auto"
 	}
+
+	v4, v6 := resolveOnce(zenHost)
+	if *mode == "v4" && v4 == "" || *mode == "v6" && v6 == "" {
+		log.Fatalf("no %s address for %s", *mode, zenHost)
+	}
+
 	p := &proxy{
-		mode:       "auto",
+		mode:       *mode,
 		clientV4:   makeClient(net.JoinHostPort(v4, "443"), zenHost, true),
 		clientV6:   makeClient(net.JoinHostPort(v6, "443"), zenHost, true),
 		clientV4H1: makeClient(net.JoinHostPort(v4, "443"), zenHost, false),
 		clientV6H1: makeClient(net.JoinHostPort(v6, "443"), zenHost, false),
 		v4URL:      "https://" + v4,
 		v6URL:      "https://[" + v6 + "]",
-		detect:     true,
+		detect:     *detect,
 		famStats:   map[string]*famStat{},
 		start:      time.Now(),
 		usage:      newUsageStats(),
 	}
+	if *ban {
+		p.ban = newBanList(maxReqsPerClient, banWindow, banLen)
+	}
+	if v4 == "" && v6 == "" {
+		log.Fatalf("could not resolve %s via public DNS", zenHost)
+	}
+
+	var cap *capture
+	if *outDir != "" {
+		if err := os.MkdirAll(*outDir, 0o755); err != nil {
+			log.Fatalf("mkdir %s: %v", *outDir, err)
+		}
+		cap = &capture{dir: *outDir}
+	}
+
 	mux := http.NewServeMux()
 	chat := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			writeJSON(w, 204, map[string]any{})
 			return
 		}
-		p.handle(w, r, r.Method)
+		p.handle(w, r, r.Method, cap)
 	}
 	models := func(w http.ResponseWriter, r *http.Request) {
-		p.handle(w, r, "GET")
+		p.handle(w, r, "GET", cap)
 	}
 	mux.HandleFunc("/zen/v1/chat/completions", chat)
 	mux.HandleFunc("/v1/chat/completions", chat)
@@ -1318,5 +1431,97 @@ func NewZenProvider() http.Handler {
 	mux.HandleFunc("/zen/v1/models", models)
 	mux.HandleFunc("/v1/models", models)
 	mux.HandleFunc("/models", models)
-	return mux
+
+	// 模式控制 API
+	writeMode := func(w http.ResponseWriter) {
+		now := time.Now()
+		writeJSON(w, 200, map[string]any{
+			"mode":            p.currentMode(),
+			"v4_cooldown_sec": p.cooldownSec("v4", now),
+			"v6_cooldown_sec": p.cooldownSec("v6", now),
+		})
+	}
+	mux.HandleFunc("/mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			writeJSON(w, 204, map[string]any{})
+			return
+		}
+		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+			m := r.URL.Query().Get("mode")
+			if m == "" {
+				if b, err := io.ReadAll(io.LimitReader(r.Body, 4096)); err == nil && len(b) > 0 {
+					var v struct {
+						Mode string `json:"mode"`
+					}
+					if json.Unmarshal(b, &v) == nil {
+						m = v.Mode
+					}
+				}
+			}
+			if m == "" {
+				writeJSON(w, 400, map[string]any{"error": "mode required (v4|v6|auto)"})
+				return
+			}
+			if !p.setMode(m) {
+				writeJSON(w, 400, map[string]any{"error": "mode must be v4|v6|auto"})
+				return
+			}
+			log.Printf("mode switched to %s", m)
+		}
+		writeMode(w)
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			writeJSON(w, 204, map[string]any{})
+			return
+		}
+		now := time.Now()
+		stats := map[string]any{}
+		for fam, s := range p.famStats {
+			s.mu.Lock()
+			stats[fam] = map[string]any{"reqs": s.reqs, "ok": s.ok, "errs": s.errs, "free_limit": s.free}
+			s.mu.Unlock()
+		}
+		writeJSON(w, 200, map[string]any{
+			"status":          "ok",
+			"mode":            p.currentMode(),
+			"v4_cooldown_sec": p.cooldownSec("v4", now),
+			"v6_cooldown_sec": p.cooldownSec("v6", now),
+			"upstream":        "https://" + zenHost + zenPath,
+			"uptime_sec":      int(time.Since(p.start).Seconds()),
+			"stats":           stats,
+			"models":          p.usage.snapshot(),
+		})
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			writeJSON(w, 204, map[string]any{})
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(200)
+		w.Write([]byte("Local proxy running\n"))
+	})
+
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+
+	log.Printf("Local proxy on %s (mode=%s, forward -> https://%s%s, capture=%v, detect=%v)",
+		*listen, *mode, zenHost, zenPath, cap != nil, *detect)
+	var err error
+	if *cert != "" || *key != "" {
+		if *cert == "" || *key == "" {
+			log.Fatal("https mode requires both --cert and --key")
+		}
+		log.Printf("TLS enabled with %s / %s", *cert, *key)
+		err = srv.ListenAndServeTLS(*cert, *key)
+	} else {
+		err = srv.ListenAndServe()
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
 }
