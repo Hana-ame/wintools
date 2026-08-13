@@ -400,20 +400,6 @@ func idleInject(model string) []byte {
 	return toolInject(model, "call_idle", infIdleArg)
 }
 
-// finishToolCall seal 一个被截断的工具调用: finish_reason=tool_calls, 客户端执行残缺
-// tool_call 后循环得以继续。
-func finishToolCall(model string) []byte {
-	finishEvt := fmt.Sprintf(
-		`{"id":"idle","object":"chat.completion.chunk","created":0,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-		model)
-	return []byte("data: " + finishEvt + "\n\ndata: [DONE]\n\n")
-}
-
-// lengthChunk 工具流 stall 截断时补发的终止事件: finish_reason=length + [DONE]。
-func lengthChunk(model string) []byte {
-	return []byte(fmt.Sprintf("data: {\"id\":\"stall\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", model))
-}
-
 // ---- 抓包 (capture) ----------------------------------------------------------
 
 type capture struct {
@@ -998,7 +984,6 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 
 	buf := pre
 	sawTool := false
-	toolClosed := false
 	finished := false
 	doneSent := false
 	injected := false
@@ -1035,8 +1020,9 @@ loop:
 				sawTool = true
 			}
 			if eventHasError(ev) {
-				// 上游 error 事件不转发, 而是注入「echo 继续」恢复工具循环 (recoverable)。
-				if recoverable && !sawTool && !injected {
+				// 上游 error 事件: 流非正常结束。允许 toolcall (recoverable)
+				// 就注入「echo 继续」恢复工具循环; 不允许则丢弃事件不转发。
+				if !finished && recoverable && !injected {
 					log.Printf("%s mid-stream error event -> inject idle (recoverable)", fam)
 					if err := write(idleInject(model)); err != nil {
 						break loop
@@ -1050,13 +1036,9 @@ loop:
 			}
 			if fr := eventFinishReason(ev); fr != nil {
 				finished = true // stop / tool_calls / length 任一都算正常收尾
-				if *fr == "tool_calls" {
-					toolClosed = true
-				}
 			}
 			if bytes.Contains(ev, []byte("data: [DONE]")) {
 				finished = true
-				toolClosed = true
 				doneSent = true
 			}
 			if eventHasContent(ev) {
@@ -1073,23 +1055,19 @@ loop:
 		select {
 		case m, ok := <-ch:
 			if !ok || m.eof {
-				// EOF 出口收敛: 未正常收尾且带 tools 无产出才注入;
-				// 否则 seal 残缺工具调用; 兜底补 [DONE]。
-				if recoverable && !finished && !sawTool && !injected {
+				// EOF 出口: 非正常结束 (没 finish_reason/[DONE]) 且允许
+				// toolcall → 注入「echo 继续」; 不允许 → 跳过注入, 兜底
+				// 补 [DONE] 收尾 (客户端区分「完成」与「截断」)。
+				if !finished && recoverable && !injected {
 					log.Printf("%s EOF without finish -> inject idle (recoverable)", fam)
 					if err := write(idleInject(model)); err != nil {
 						break loop
 					}
 					injected = true
 					doneSent = true
-				} else if sawTool && !toolClosed {
-					log.Printf("%s EOF, tool_call truncated -> seal (saw_tool=%v tool_closed=%v injected=%v)", fam, sawTool, toolClosed, injected)
-					if err := write(finishToolCall(model)); err != nil {
-						break loop
-					}
-					doneSent = true
-				} else if !doneSent {
-					log.Printf("%s EOF, sealing [DONE] (saw_tool=%v tool_closed=%v injected=%v)", fam, sawTool, toolClosed, injected)
+				}
+				if !doneSent {
+					log.Printf("%s EOF, sealing [DONE] (finished=%v injected=%v)", fam, finished, injected)
 					if err := write([]byte("data: [DONE]\n\n")); err != nil {
 						break loop
 					}
@@ -1099,17 +1077,14 @@ loop:
 			}
 			if m.err != nil {
 				log.Printf("%s mid-stream error: %v", fam, m.err)
-				if recoverable && !finished && !sawTool && !injected {
+				if !finished && recoverable && !injected {
 					log.Printf("%s stream error without finish -> inject idle (recoverable)", fam)
 					if err := write(idleInject(model)); err == nil {
 						injected = true
 						doneSent = true
 					}
-				} else if sawTool && !toolClosed {
-					if err := write(finishToolCall(model)); err == nil {
-						doneSent = true
-					}
-				} else if !doneSent {
+				}
+				if !doneSent {
 					if err := write([]byte("data: [DONE]\n\n")); err == nil {
 						doneSent = true
 					}
@@ -1122,7 +1097,7 @@ loop:
 			stall := stallFor(sawTool, thinkGrace)
 			if time.Since(lastReal) >= stall {
 				log.Printf("%s stream stalled (no real data %s, saw_tool=%v), closing", fam, stall.Round(time.Second), sawTool)
-				if recoverable && !finished && !sawTool && !injected {
+				if !finished && recoverable && !injected {
 					log.Printf("%s stall without finish -> inject idle (recoverable)", fam)
 					write(idleInject(model))
 					injected = true
@@ -1130,13 +1105,7 @@ loop:
 					resp.Body.Close()
 					return true, true
 				}
-				if sawTool && !toolClosed {
-					write(lengthChunk(model))
-					doneSent = true
-				} else if injected {
-					write([]byte("data: [DONE]\n\n"))
-					doneSent = true
-				} else if !doneSent {
+				if !doneSent {
 					write([]byte("data: [DONE]\n\n"))
 					doneSent = true
 				}
@@ -1148,7 +1117,7 @@ loop:
 	}
 
 	resp.Body.Close()
-	log.Printf("%s stream done (%d bytes, %.2fs) saw_tool=%v tool_closed=%v injected=%v", fam, total, time.Since(t0).Seconds(), sawTool, toolClosed, injected)
+	log.Printf("%s stream done (%d bytes, %.2fs) saw_tool=%v injected=%v", fam, total, time.Since(t0).Seconds(), sawTool, injected)
 	return true, true
 }
 
