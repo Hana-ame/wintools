@@ -150,7 +150,7 @@ func TestProxyHandlerSNIMode(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.NoRoute(echproxy.ProxyHandler(cfg.Upstreams))
+	r.NoRoute(echproxy.ProxyHandler(cfg.Upstreams, nil))
 	ts := httptest.NewServer(r)
 	defer ts.Close()
 

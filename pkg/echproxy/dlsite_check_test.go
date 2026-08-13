@@ -29,7 +29,7 @@ func TestDlsiteWildcard(t *testing.T) {
 	if uc.Mode != "sni" {
 		t.Errorf("mode = %q, want sni (AWS 非 CF)", uc.Mode)
 	}
-	rw := buildEntryRewriter(uc)
+	rw := buildEntryRewriter(uc, nil)
 	body := rw([]byte(`{"img":"https://home.dlsite.com/a.jpg","www":"https://www.dlsite.com/x","bare":"https://dlsite.com/"}`), "8443")
 	for _, want := range []string{"dlsite-home.l.moonchan.xyz:8443", "dlsite.l.moonchan.xyz:8443"} {
 		if !strings.Contains(string(body), want) {

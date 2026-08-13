@@ -75,7 +75,7 @@ func TestSWInjectPrepend(t *testing.T) {
 		},
 		"iwara-api.l.moonchan.xyz": {Host: "api.iwara.tv"},
 	}
-	inject := swOverrideJS(buildSWProxyMap(cfg, "8443"), collectWildcardRules(cfg))
+	inject := swOverrideJS(buildSWProxyMap(cfg, "8443"), collectWildcardRules(cfg), nil)
 	// 注入代码必须是合法 JS: 有 install/activate/fetch 监听。
 	for _, want := range []string{"install", "activate", "fetch", "__wtMap", "__wtRules", "iwara-", ".l.moonchan.xyz", "iwara-api.l.moonchan.xyz:8443"} {
 		if !strings.Contains(inject, want) {
@@ -107,7 +107,7 @@ func TestBuildEntryRewriterInherit(t *testing.T) {
 	if sub.Wildcard == nil {
 		t.Fatal("inheritWildcard returned nil")
 	}
-	rw := buildEntryRewriter(sub)
+	rw := buildEntryRewriter(sub, nil)
 	body := []byte(`{"u":"https://filesq.iwara.tv/a.mp4","bare":"https://iwara.tv/"}`)
 	got := string(rw(body, "8443"))
 	for _, want := range []string{"iwara-filesq.l.moonchan.xyz:8443", "iwara.l.moonchan.xyz:8443"} {
@@ -116,7 +116,7 @@ func TestBuildEntryRewriterInherit(t *testing.T) {
 		}
 	}
 	// 主入口自身也应推导裸域 + 通配。
-	rwMain := buildEntryRewriter(cfg["iwara.l.moonchan.xyz"])
+	rwMain := buildEntryRewriter(cfg["iwara.l.moonchan.xyz"], nil)
 	if !strings.Contains(string(rwMain([]byte(`https://news.iwara.tv/x`), "")), "iwara-news.l.moonchan.xyz") {
 		t.Error("main entry wildcard rewrite failed")
 	}
@@ -142,7 +142,7 @@ func TestFixedCookieOverride(t *testing.T) {
 	// 精确入口: 固定 cookie 覆盖内存 jar + 客户端 cookie。
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.NoRoute(ProxyHandler(cfg))
+	r.NoRoute(ProxyHandler(cfg, nil))
 	ts := httptest.NewServer(r)
 	defer ts.Close()
 
@@ -196,7 +196,7 @@ func TestBlockedThirdPartyHosts(t *testing.T) {
 		Rewrites: map[string]string{
 			"www.dlsite.com": "dlsite.l.moonchan.xyz",
 		},
-	})
+	}, nil)
 	body := []byte(`<head>
 <link href="https://fonts.googleapis.com/css?family=Sawarabi+Gothic" rel="stylesheet">
 <script type="text/javascript" src="https://www.google.com/jsapi"></script>
@@ -220,7 +220,7 @@ func TestBlockedThirdPartyStrip(t *testing.T) {
 	rw := buildEntryRewriter(UpstreamConfig{
 		Host: "www.dlsite.com",
 		Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
-	})
+	}, nil)
 	body := []byte(`<link href="https://fonts.googleapis.com/css?family=Sawarabi+Gothic" rel="stylesheet">
 <script type="text/javascript" src="https://www.google.com/jsapi"></script>
 <link href="https://dlsite.l.moonchan.xyz:8443/css/reset.css" rel="stylesheet">`)
@@ -272,7 +272,7 @@ func TestJSDomainCookieRewrite(t *testing.T) {
 			UpstreamSuffix: ".dlsite.com",
 		},
 		Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
-	})
+	}, nil)
 	body := []byte(`document.cookie = 'display_language=zh_cn; path=/; Domain=.dlsite.com';location='https://www.dlsite.com/x'`)
 	got := string(rw(body, "8443"))
 	if !strings.Contains(got, "Domain=dlsite.l.moonchan.xyz") {

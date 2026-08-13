@@ -68,6 +68,10 @@ type Config struct {
 	CertPath  string      `json:"cert_path"`
 	KeyPath   string      `json:"key_path"`
 	Upstreams UpstreamMap `json:"upstreams"`
+	// BlockedHosts 直连/代理都无法到达的第三方域名 (完整 https:// 前缀):
+	// 响应中出现的这些 URL 整段剔除, 浏览器不再发起请求避免挂起超时。
+	// 用于 Google 字体/jsapi 等被墙资源、无法代理的 CDN (如 media.dlsite.com)。
+	BlockedHosts []string `json:"blocked_hosts,omitempty"`
 }
 
 // FetchBytes 从 URL 拉取内容到内存（不落盘），请求失败或状态非 200 时报错。
@@ -182,7 +186,8 @@ func isHopByHop(name string) bool {
 //   *.iwara.tv  -> iwara-*.l.moonchan.xyz (任意子域)
 //   iwara.tv    -> iwara.l.moonchan.xyz   (裸域)
 // 规则单一来源: 配置只写 wildcard 一次, 响应重写/SW 拦截都从这里推导。
-func buildEntryRewriter(uc UpstreamConfig) func([]byte, string) []byte {
+// blocked 为全局剔除域名列表 (Config.BlockedHosts, upstream.json 可配)。
+func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string) []byte {
 	rules := make(map[string]string, len(uc.Rewrites)+2)
 	for k, v := range uc.Rewrites {
 		rules[k] = v
@@ -203,24 +208,11 @@ func buildEntryRewriter(uc UpstreamConfig) func([]byte, string) []byte {
 	// 直连不可达的第三方域名(被墙): 响应里出现的这些 URL 整段删除,
 	// 浏览器不再发起请求, 避免挂起超时。ECH/SNI 都无法到达这些域名。
 	// 先删整段 URL(专用函数), 再做域名重写。
-	blocked := append([]string(nil), blockedUpstreamHosts...)
+	// 列表来自 Config.BlockedHosts (upstream.json 可配)。
 	base := buildRewriter(rules)
 	return func(body []byte, port string) []byte {
 		return base(stripBlockedURLs(body, blocked), port)
 	}
-}
-
-// blockedUpstreamHosts 直连被墙、代理也无法到达的第三方域名。
-// 重写为空串 = 从响应中剔除引用(如 <script src="..."> 变 <script src="">)。
-var blockedUpstreamHosts = []string{
-	"https://fonts.googleapis.com",
-	"https://fonts.gstatic.com",
-	"https://www.google.com/jsapi",
-	"https://ajax.googleapis.com",
-	"https://www.googletagmanager.com",
-	// media.dlsite.com 是 AWS CloudFront: ECH 530 / SNI 假域名握手失败
-	// / 真 SNI 被 RST, 三条路都不通, 剔除 banner 图引用。
-	"https://media.dlsite.com",
 }
 
 // stripBlockedURLs 从响应文本中移除被墙第三方域名的完整 URL 值。
@@ -473,12 +465,21 @@ func collectWildcardRules(cfg UpstreamMap) []WildcardRule {
 // 拼接的 URL（静态 rewriter 无法覆盖的场景）。
 // 除显式映射外，还支持通配规则: 任意 <sub>+upstream_suffix 改道
 // prefix+<sub>+entry_suffix。
-func swOverrideJS(m map[string]string, rules []WildcardRule) string {
+// blockedHosts 来自 Config.BlockedHosts: 直连不可达的第三方域名,
+// SW 直接拦截返回 204 (与响应侧 stripBlockedURLs 互补, 覆盖动态请求)。
+func swOverrideJS(m map[string]string, rules []WildcardRule, blockedHosts []string) string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+
+	// SW 里匹配 hostname+path 前缀, 去掉配置里的 https:// 前缀。
+	swBlocked := make([]string, 0, len(blockedHosts))
+	for _, b := range blockedHosts {
+		swBlocked = append(swBlocked, strings.TrimPrefix(b, "https://"))
+	}
+	sort.Strings(swBlocked)
 
 	var b strings.Builder
 	b.WriteString(`self.addEventListener('install', () => self.skipWaiting());
@@ -501,14 +502,16 @@ const __wtRules = [`)
 	}
 	b.WriteString(`
 ];
-// __wtBlock: 直连不可达的第三方域名(如被墙的 Google 字体/jsapi),
+// __wtBlock: 直连不可达的第三方域名(Config.BlockedHosts),
 // 直接在 SW 里拦截返回 204, 避免页面挂起等待。
-const __wtBlock = [
-  "fonts.googleapis.com",
-  "fonts.gstatic.com",
-  "www.google.com/jsapi",
-  "ajax.googleapis.com",
-  "www.googletagmanager.com",
+const __wtBlock = [`)
+	for i, bl := range swBlocked {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "\n  %q", bl)
+	}
+	b.WriteString(`
 ];
 self.addEventListener('fetch', (e) => {
   try {
@@ -683,13 +686,15 @@ func inheritWildcard(cfg UpstreamMap, entry string) *WildcardRule {
 
 // ProxyHandler 返回一个 gin handler，根据请求 Host 匹配上游规则并转发。
 // 命中规则的 Rewrites 非空时启用响应域名替换。
+// blockedHosts 为 Config.BlockedHosts (upstream.json 可配的剔除域名列表)。
 //
 // Mode 决定出网方式:
 //
 //	"" / ech  — ECH 域前置（目标须在 Cloudflare 后）
 //	sni       — SNI 伪装直连（DoH 解析真实 IP + 假 SNI + Host 路由）
 //	direct    — 普通 HTTPS 直连（目标可直连时）
-func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
+func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
+	blocked := append([]string(nil), blockedHosts...)
 	return func(c *gin.Context) {
 		start := time.Now()
 		clientIP := c.ClientIP()
@@ -719,7 +724,7 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 		if ucForRewrite.Wildcard == nil {
 			ucForRewrite.Wildcard = inheritWildcard(cfg, host)
 		}
-		rewriter := buildEntryRewriter(ucForRewrite)
+		rewriter := buildEntryRewriter(ucForRewrite, blocked)
 
 		// service worker 注入: sw.js/workbox 响应时把 fetch 拦截代码
 		// 插到最前面(保留上游 workbox 原内容), 拦截动态拼接的
@@ -734,8 +739,8 @@ func ProxyHandler(cfg UpstreamMap) gin.HandlerFunc {
 			swProxyMap := buildSWProxyMap(cfg, port)
 			swRules := collectWildcardRules(cfg)
 			if len(swProxyMap) > 0 {
-				swInject = swOverrideJS(swProxyMap, swRules)
-				log.Printf("[%s] %s %s -> SW 注入前缀 %d 条规则 %d 条通配", clientIP, method, rawPath, len(swProxyMap), len(swRules))
+				swInject = swOverrideJS(swProxyMap, swRules, blocked)
+				log.Printf("[%s] %s %s -> SW 注入前缀 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
 			}
 		}
 

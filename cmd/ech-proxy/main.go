@@ -106,7 +106,7 @@ func main() {
 		tlsCert = &cert
 	}
 
-	upstreamHandler = echproxy.ProxyHandler(upstreamCfg)
+	upstreamHandler = echproxy.ProxyHandler(upstreamCfg, cfg.BlockedHosts)
 	zenHost := "zen.l.moonchan.xyz"
 	zenProxyHandler := func(c *gin.Context) {
 		if c.GetHeader("Authorization") == "" {
@@ -129,7 +129,13 @@ func main() {
 			zenProxyHandler(c)
 			return
 		}
-		if _, ok := upstreamCfg[hostOf(c)]; ok {
+		// 精确或通配入口都走代理, 否则返回 chatHTML。
+		h := hostOf(c)
+		if _, ok := upstreamCfg[h]; ok {
+			upstreamHandler(c)
+			return
+		}
+		if _, ok := echproxy.MatchWildcardForTest(upstreamCfg, h); ok {
 			upstreamHandler(c)
 			return
 		}
@@ -164,6 +170,10 @@ func main() {
 			fmt.Printf("  域名: %s -> %s (%s)", d, uc.Host, echproxy.ModeName(uc.Mode))
 			if uc.Referer != "" {
 				fmt.Printf(" (referer: %s)", uc.Referer)
+			}
+			// 通配入口一并显示: iwara-* → *.iwara.tv, 让 banner 反映真实覆盖范围。
+			if w := uc.Wildcard; w != nil {
+				fmt.Printf(" [+通配 %s*%s -> *%s]", w.Prefix, w.EntrySuffix, w.UpstreamSuffix)
 			}
 			fmt.Println()
 		}

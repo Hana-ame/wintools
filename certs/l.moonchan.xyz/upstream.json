@@ -49,5 +49,13 @@
                 "www.dlsite.com": "dlsite.l.moonchan.xyz"
             }
         }
-    }
+    },
+    "blocked_hosts": [
+        "https://fonts.googleapis.com",
+        "https://fonts.gstatic.com",
+        "https://www.google.com/jsapi",
+        "https://ajax.googleapis.com",
+        "https://www.googletagmanager.com",
+        "https://media.dlsite.com"
+    ]
 }
