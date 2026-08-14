@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -29,6 +30,9 @@ var dnsServers = []string{
 }
 
 // newResolver 构造固定走公共 DNS 的解析器 (绕过本机 [::1]:53)。
+// 按 Go 解析器要求的 network 参数拨号 (udp/tcp): 收到 TC (截断) 响应时
+// Resolver 会以 tcp 重试, 之前忽略 network 参数总是 UDP, 截断响应
+// 无法 fallback 导致解析失败。
 func newResolver() *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
@@ -37,7 +41,7 @@ func newResolver() *net.Resolver {
 			var err error
 			for _, dns := range dnsServers {
 				var conn net.Conn
-				conn, err = d.DialContext(ctx, "udp", dns)
+				conn, err = d.DialContext(ctx, network, dns)
 				if err == nil {
 					return conn, nil
 				}
@@ -47,12 +51,33 @@ func newResolver() *net.Resolver {
 	}
 }
 
+// resolver 与 rootPool 全局缓存: Dialer()/Transport() 每次调用都新建
+// 解析器/证书池, 证书池加载 (SystemCertPool + 读文件) 在热路径上不便宜,
+// 且它们都是并发安全的, 全局复用一个即可。
+var (
+	resolverOnce sync.Once
+	resolver     *net.Resolver
+
+	rootPoolOnce sync.Once
+	rootPool     *x509.CertPool
+)
+
+func getResolver() *net.Resolver {
+	resolverOnce.Do(func() { resolver = newResolver() })
+	return resolver
+}
+
+func getRootPool() *x509.CertPool {
+	rootPoolOnce.Do(func() { rootPool = rootCAs() })
+	return rootPool
+}
+
 // Dialer 返回使用公共 DNS 的 net.Dialer, 适用于 Termux 等无 resolv.conf 的环境。
 func Dialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Resolver:  newResolver(),
+		Resolver:  getResolver(),
 	}
 }
 
@@ -78,11 +103,12 @@ func rootCAs() *x509.CertPool {
 }
 
 // Transport 返回适用于 Termux 的 http.Transport (公共 DNS + Termux CA)。
+// 证书池全局缓存复用 (SystemCertPool 加载不便宜)。
 func Transport() *http.Transport {
 	return &http.Transport{
 		DialContext: Dialer().DialContext,
 		TLSClientConfig: &tls.Config{
-			RootCAs: rootCAs(),
+			RootCAs: getRootPool(),
 		},
 	}
 }

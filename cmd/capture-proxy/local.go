@@ -1446,11 +1446,16 @@ func runProvider(args []string) {
 		}
 		now := time.Now()
 		stats := map[string]any{}
+		// 必须在 p.mu 下遍历 famStats: statsFor 也在 p.mu 下增删该 map,
+		// 无锁遍历与写并发会触发 "concurrent map iteration and map write"
+		// fatal panic, 整个进程崩溃 (发现背景: 代码审阅)。
+		p.mu.Lock()
 		for fam, s := range p.famStats {
 			s.mu.Lock()
 			stats[fam] = map[string]any{"reqs": s.reqs, "ok": s.ok, "errs": s.errs, "free_limit": s.free}
 			s.mu.Unlock()
 		}
+		p.mu.Unlock()
 		writeJSON(w, 200, map[string]any{
 			"status":          "ok",
 			"mode":            p.currentMode(),

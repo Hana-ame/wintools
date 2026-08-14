@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Hana-ame/wintools/pkg/netdial"
 )
 
 // Client 是一个基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。
@@ -111,7 +113,9 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 	}
 	req.Header.Set("Accept", "application/dns-json")
 
-	tr := &http.Transport{}
+	// 默认用 netdial.Transport (固定公共 DNS + Termux CA): Termux 无
+	// /etc/resolv.conf, 裸 http.Transport 走 [::1]:53 会 connection refused。
+	tr := netdial.Transport()
 	cfg := currentConfig()
 	dialIP := cfg.dialIP
 	if dialIP != "" {
@@ -140,6 +144,16 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 	return dohClient.Do(req)
 }
 
+// fetchECHConfig 用到的正则: 每次 DoH 都执行, 提为包级避免反复编译
+// (refresh 每 5 分钟跑一次)。
+var (
+	echSvcParamRE = regexp.MustCompile(`ech="?([A-Za-z0-9+/=]+)"?`)
+	wsvcWireRE    = regexp.MustCompile(`\\#\s+(\d+)\s+([0-9a-fA-F\s]+)`)
+	nonHexRE      = regexp.MustCompile(`[^0-9a-fA-F]`)
+)
+
+// fetchECHConfig 通过 DoH 获取域名的 ECH 配置 (type=65 SVCB 记录),
+// 带 TTL 缓存。解析优先认 base64 的 ech= SvcParam, 兜底解析 wire 格式。
 func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	if cached := getCachedECH(domain); cached != nil {
 		return cached, nil
@@ -163,8 +177,8 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		return nil, fmt.Errorf("DoH %s decode: %w", dohURL, err)
 	}
 
-	echRe := regexp.MustCompile(`ech="?([A-Za-z0-9+/=]+)"?`)
-	wireRe := regexp.MustCompile(`\\#\s+(\d+)\s+([0-9a-fA-F\s]+)`)
+	echRe := echSvcParamRE
+	wireRe := wsvcWireRE
 
 	for _, ans := range d.Answer {
 		if ans.Type != 65 {
@@ -179,8 +193,7 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		if m := echRe.FindStringSubmatch(ans.Data); len(m) > 1 {
 			cfg, err = base64.StdEncoding.DecodeString(m[1])
 		} else if m := wireRe.FindStringSubmatch(ans.Data); len(m) > 1 {
-			nonHex := regexp.MustCompile(`[^0-9a-fA-F]`)
-			hexData := nonHex.ReplaceAllString(m[2], "")
+			hexData := nonHexRE.ReplaceAllString(m[2], "")
 			var wire []byte
 			wire, err = hex.DecodeString(hexData)
 			if err == nil {
@@ -245,7 +258,7 @@ func resolvePreferredIP(ctx context.Context, host string) (string, error) {
 	if ipMode == "" {
 		return "", nil
 	}
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return "", fmt.Errorf("resolve %s: %w", host, err)
 	}
@@ -260,10 +273,13 @@ func resolvePreferredIP(ctx context.Context, host string) (string, error) {
 	return "", fmt.Errorf("no %s address for %s", ipMode, host)
 }
 
+// dialTCP 按 ipMode 偏好拨号。ipMode 为空(自动)时用 netdial 固定公共
+// DNS 解析, 否则用偏好 IP 直连。Termux 等无 resolv.conf 环境必须走
+// netdial, 裸 net.Dialer 默认解析器会连 [::1]:53 失败。
 func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout}
 	if currentConfig().ipMode == "" {
-		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+		return netdial.Dialer().DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	}
 	ip, err := resolvePreferredIP(ctx, host)
 	if err != nil {
@@ -273,8 +289,9 @@ func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net
 }
 
 // CheckDualStack 检测本地 IPv4/IPv6 连通性。
+// 用 netdial 解析器 (公共 DNS): Termux 上 net.DefaultResolver 不可用。
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, "moonchan.xyz")
+	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, "moonchan.xyz")
 	if err != nil {
 		return false, false
 	}
@@ -304,18 +321,10 @@ func SetDoHConfig(host, bootstrapIP string) {
 	cfgPtr.Store(&nc)
 }
 
-// New 初始化一个 ECH 域前置 HTTP 客户端。
-// 首次调用时会通过 DoH 获取 cloudflare-ech.com 的 ECH 密钥并缓存。
-func New() (*Client, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	echConfig, err := fetchECHConfig(ctx, shellDomain)
-	if err != nil {
-		return nil, fmt.Errorf("fetch ECH config: %w", err)
-	}
-
-	transport := &http.Transport{
+// newTransport 构造 ECH 域前置 transport: DialTLSContext 用 ECH 配置
+// 拨 shellDomain。New 与 refreshLoop 共用, 避免两份重复实现。
+func newTransport(echConfig []byte) *http.Transport {
+	return &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -346,15 +355,32 @@ func New() (*Client, error) {
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
+}
 
+// newClient 构造 ECH 客户端 (New 与 refreshLoop 共用)。
+// 不用总 Timeout: 会砍断 >30s 的大文件/视频下载
+// (浏览器表现为 206 CONTENT_LENGTH_MISMATCH 只传一半)。
+func newClient(echConfig []byte) *Client {
 	return &Client{
 		inner: &http.Client{
-			Transport: transport,
-			// 不用总 Timeout: 会砍断 >30s 的大文件/视频下载
-			// (浏览器表现为 206 CONTENT_LENGTH_MISMATCH 只传一半)。
-			Timeout: 0,
+			Transport: newTransport(echConfig),
+			Timeout:   0,
 		},
-	}, nil
+	}
+}
+
+// New 初始化一个 ECH 域前置 HTTP 客户端。
+// 首次调用时会通过 DoH 获取 cloudflare-ech.com 的 ECH 密钥并缓存。
+func New() (*Client, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	echConfig, err := fetchECHConfig(ctx, shellDomain)
+	if err != nil {
+		return nil, fmt.Errorf("fetch ECH config: %w", err)
+	}
+
+	return newClient(echConfig), nil
 }
 
 // Do 执行 HTTP 请求，请求通过 cloudflare-ech.com ECH 域前置发出。
@@ -425,53 +451,13 @@ func refreshLoop() {
 			continue
 		}
 
-		c, err := rebuildClient(echConfig)
-		if err != nil {
-			continue
+		c := newClient(echConfig)
+		// 替换默认客户端时关掉旧 transport 的空闲连接,
+		// 否则旧连接池占着 TCP 直到 IdleConnTimeout 自然回收。
+		if old := defaultClient.Swap(c); old != nil {
+			if tr, ok := old.inner.Transport.(*http.Transport); ok {
+				tr.CloseIdleConnections()
+			}
 		}
-		defaultClient.Store(c)
 	}
-}
-
-func rebuildClient(echConfig []byte) (*Client, error) {
-	transport := &http.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-
-			rawConn, err := dialTCP(ctx, shellDomain, "443", dialTimeout)
-			if err != nil {
-				return nil, fmt.Errorf("dial shell: %w", err)
-			}
-
-			tlsCfg := &tls.Config{
-				ServerName:                     host,
-				EncryptedClientHelloConfigList: echConfig,
-				MinVersion:                     tls.VersionTLS13,
-				NextProtos:                     []string{"h2", "http/1.1"},
-			}
-
-			tlsConn := tls.Client(rawConn, tlsCfg)
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				rawConn.Close()
-				return nil, fmt.Errorf("TLS handshake: %w", err)
-			}
-			return tlsConn, nil
-		},
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-
-	return &Client{
-		inner: &http.Client{
-			Transport: transport,
-			// 不用总 Timeout: 会砍断 >30s 的大文件/视频下载
-			// (浏览器表现为 206 CONTENT_LENGTH_MISMATCH 只传一半)。
-			Timeout: 0,
-		},
-	}, nil
 }

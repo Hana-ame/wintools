@@ -21,6 +21,14 @@ type Option struct {
 	Modify  func([]byte) ([]byte, error)
 }
 
+// maxBodySize POST/PUT/PATCH body 上限 (64MB): 反代把 body 整体缓存到
+// 内存做 Modify, 不限长会被超大上传打爆 (OOM)。
+const maxBodySize = 64 << 20
+
+// writeTimeout 单次写入截止时间: 慢客户端 (不消费响应) 超时断开,
+// 防止连接/goroutine 无限堆积。SSE 每 chunk 重设不受影响。
+const writeTimeout = 60 * time.Second
+
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
@@ -64,9 +72,14 @@ func Handler(opt Option) gin.HandlerFunc {
 		var body []byte
 		if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch {
 			var err error
-			body, err = io.ReadAll(c.Request.Body)
+			// body 限长读入: 反代无脑缓存整个 body 到内存, 超大上传会 OOM。
+			body, err = io.ReadAll(io.LimitReader(c.Request.Body, maxBodySize+1))
 			if err != nil {
 				c.JSON(500, gin.H{"error": "read body: " + err.Error()})
+				return
+			}
+			if len(body) > maxBodySize {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "body too large"})
 				return
 			}
 			if opt.Modify != nil {
@@ -125,25 +138,24 @@ func Handler(opt Option) gin.HandlerFunc {
 		}
 		c.Status(resp.StatusCode)
 
-		if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
-			flusher, _ := c.Writer.(http.Flusher)
-			buf := make([]byte, 4096)
-			for {
-				n, readErr := resp.Body.Read(buf)
-				if n > 0 {
-					if _, writeErr := c.Writer.Write(buf[:n]); writeErr != nil {
-						break
-					}
-					if flusher != nil {
-						flusher.Flush()
-					}
-				}
-				if readErr != nil {
+		// 统一循环转发 (SSE 与非 SSE 同路): 每次写前设 deadline 防慢客户端,
+		// 边读边写边 flush, 避免整体缓冲破坏 SSE 实时性。
+		rc := http.NewResponseController(c.Writer)
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+				if _, writeErr := c.Writer.Write(buf[:n]); writeErr != nil {
 					break
 				}
+				if f, ok := c.Writer.(http.Flusher); ok {
+					f.Flush()
+				}
 			}
-		} else {
-			io.Copy(c.Writer, resp.Body)
+			if readErr != nil {
+				break
+			}
 		}
 	}
 }

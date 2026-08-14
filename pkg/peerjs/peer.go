@@ -5,11 +5,11 @@ package peerjs
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -114,9 +114,15 @@ func (p *Peer) Debugf(format string, a ...any) {
 	}
 }
 
+// randomToken 生成 64 位十六进制随机串, 用作 peer token 与 connectionId。
+// 用 crypto/rand (密码学安全): math/rand 可预测, connectionId 被猜到
+// 可被中间人注入 OFFER/ANSWER 劫持数据连接。
 func randomToken() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	// crypto/rand.Read 在 Go 1.24+ 永不返回错误 (失败时 panic)。
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
+	}
 	const hexdig = "0123456789abcdef"
 	var sb strings.Builder
 	for _, c := range b {
@@ -161,21 +167,21 @@ func (p *Peer) Start(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return p.failStart(ctx.Err())
 	case <-time.After(p.deadline):
-		return fmt.Errorf("signaling OPEN timeout")
+		return p.failStart(fmt.Errorf("signaling OPEN timeout"))
 	case m := <-p.msgs:
 		if m.Type != "OPEN" {
 			if m.Type == "ID-TAKEN" {
-				return fmt.Errorf("peer id %q already taken", p.cfg.ID)
+				return p.failStart(fmt.Errorf("peer id %q already taken", p.cfg.ID))
 			}
 			if m.Type == "INVALID-KEY" {
-				return fmt.Errorf("invalid key %q", p.cfg.Key)
+				return p.failStart(fmt.Errorf("invalid key %q", p.cfg.Key))
 			}
 			if m.Type == "ERROR" {
-				return fmt.Errorf("server error: %s", string(m.Payload))
+				return p.failStart(fmt.Errorf("server error: %s", string(m.Payload)))
 			}
-			return fmt.Errorf("unexpected message %q waiting for OPEN", m.Type)
+			return p.failStart(fmt.Errorf("unexpected message %q waiting for OPEN", m.Type))
 		}
 		p.mu.Lock()
 		p.open = true
@@ -244,16 +250,30 @@ func (p *Peer) send(t ServerMessage) error {
 	return p.ws.Write(ctx, websocket.MessageText, b)
 }
 
+// failStart 在等待 OPEN 失败时清理信令连接与后台 goroutine:
+// 关闭 ws 让 readLoop 退出 (它读错误后走 closeSignalCh, 幂等),
+// 关闭 closeCh 让 heartbeatLoop 退出, 避免 ws/goroutine 泄漏。
+func (p *Peer) failStart(err error) error {
+	if p.ws != nil {
+		p.ws.Close(websocket.StatusNormalClosure, "open failed")
+	}
+	p.closeSignalCh()
+	return err
+}
+
+// closeSignalCh 幂等关闭 closeCh, readLoop 错误路径与 Close 共用同一个
+// sync.Once: 两者并发时绝不能 double close (close 已关闭的 channel 会 panic,
+// 这是曾经的真实竞态 — readLoop 的 select-default-close 与 Close 并发触发)。
+func (p *Peer) closeSignalCh() {
+	p.once.Do(func() { close(p.closeCh) })
+}
+
 func (p *Peer) readLoop() {
 	for {
 		_, data, err := p.ws.Read(context.Background())
 		if err != nil {
 			p.Debugf("signal read error: %v", err)
-			select {
-			case <-p.closeCh:
-			default:
-				close(p.closeCh)
-			}
+			p.closeSignalCh()
 			return
 		}
 		var m ServerMessage
@@ -262,9 +282,13 @@ func (p *Peer) readLoop() {
 			continue
 		}
 		p.Debugf("recv %s from %s", m.Type, m.Src)
+		// 信令消息不能丢 (OFFER/ANSWER/CANDIDATE 丢失 → 连接建不起来且无日志,
+		// 原来 select-default 静默丢弃就是这类隐性 bug 的来源): 缓冲满时阻塞
+		// 背压 (信令量小, 不会长时间卡住 readLoop), closeCh 关闭时退出。
 		select {
 		case p.msgs <- m:
-		default:
+		case <-p.closeCh:
+			return
 		}
 	}
 }
@@ -298,7 +322,7 @@ func (p *Peer) Close() error {
 	if p.ws != nil {
 		p.ws.Close(websocket.StatusNormalClosure, "bye")
 	}
-	p.once.Do(func() { close(p.closeCh) })
+	p.closeSignalCh()
 	for _, c := range conns {
 		c.Close()
 	}

@@ -77,6 +77,11 @@ func parseFrame(b []byte) (*frame, error) {
 	if int(l) != len(b)-9 {
 		return nil, fmt.Errorf("frame len mismatch: head %d got %d", l, len(b)-9)
 	}
+	// maxFrame 校验: 恶意/错误 peer 可声明超大 payload 占内存
+	// (发现背景: 代码审阅, 旧实现定义了 maxFrame 但从不使用)。
+	if l > maxFrame {
+		return nil, fmt.Errorf("frame too large: %d > %d", l, maxFrame)
+	}
 	return &frame{typ: b[4], streamID: binary.BigEndian.Uint32(b[5:9]), payload: b[9:]}, nil
 }
 
@@ -101,8 +106,96 @@ type serve struct {
 	streams map[uint32]*pipeStream
 }
 
+// reqBodyQueue 是 io.Pipe 的替代: 请求 body 的接收队列。
+//
+// 为什么不用 io.Pipe (发现背景: 代码审阅): 旧实现把 REQ_BODY 同步写进
+// io.Pipe, 上游读得慢时 Write 阻塞在 DataChannel 的消息回调里,
+// 一条慢流 head-of-line 卡死整条连接的所有流。本实现由 http.Transport
+// 的 body reader goroutine 消费, push 侧有界 + 背压, abort 能唤醒
+// 阻塞中的 push 立即返回, 不丢数据也不会永久卡住信令回调。
+type reqBodyQueue struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	data    [][]byte
+	head    int
+	eof     bool
+	aborted bool
+}
+
+// reqBodyQueueMax 队列块数上限 (256 * 16KB chunk ≈ 4MB 缓冲)。
+const reqBodyQueueMax = 256
+
+func newReqBodyQueue() *reqBodyQueue {
+	q := &reqBodyQueue{}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+// push 由 onMessage 调用; 队列满时阻塞 (背压传导到 DataChannel),
+// 流被 abort 时返回 false。
+func (q *reqBodyQueue) push(data []byte) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.data)-q.head >= reqBodyQueueMax && !q.aborted {
+		q.cond.Wait()
+	}
+	if q.aborted {
+		return false
+	}
+	q.data = append(q.data, data)
+	q.cond.Broadcast()
+	return true
+}
+
+// finish 标记 REQ_END: 之后 Read 读到 EOF。
+func (q *reqBodyQueue) finish() {
+	q.mu.Lock()
+	q.eof = true
+	q.cond.Broadcast()
+	q.mu.Unlock()
+}
+
+// abort 由 forward 清理时调用: 唤醒阻塞的 push, 之后 Read 返回错误。
+func (q *reqBodyQueue) abort() {
+	q.mu.Lock()
+	q.aborted = true
+	q.cond.Broadcast()
+	q.mu.Unlock()
+}
+
+// Read 实现 io.Reader, 被 http.Transport 消费。
+func (q *reqBodyQueue) Read(p []byte) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for q.head >= len(q.data) && !q.eof && !q.aborted {
+		q.cond.Wait()
+	}
+	if q.head < len(q.data) {
+		data := q.data[q.head]
+		n := copy(p, data)
+		if n < len(data) {
+			// 块比读缓冲区大: 剩余部分放回队首, 下次继续读
+			q.data[q.head] = data[n:]
+		} else {
+			q.data[q.head] = nil
+			q.head++
+			if q.head > 64 && q.head*2 > len(q.data) {
+				// 压缩队首已消费区, 防 data 切片无限增长
+				q.data = q.data[q.head:]
+				q.head = 0
+			}
+		}
+		q.cond.Broadcast()
+		return n, nil
+	}
+	if q.aborted {
+		return 0, io.ErrClosedPipe
+	}
+	return 0, io.EOF
+}
+
 type pipeStream struct {
-	pw *io.PipeWriter
+	body *reqBodyQueue
 }
 
 func newServe(target string) *serve {
@@ -123,36 +216,44 @@ func (s *serve) onMessage(dc *peerjs.DataConnection, f *frame) {
 			log.Printf("bad req head: %v", err)
 			return
 		}
-		pr, pw := io.Pipe()
+		st := &pipeStream{body: newReqBodyQueue()}
 		s.mu.Lock()
-		s.streams[f.streamID] = &pipeStream{pw: pw}
+		s.streams[f.streamID] = st
 		s.mu.Unlock()
-		go s.forward(dc, f.streamID, h, pr, pw)
+		go s.forward(dc, f.streamID, h, st)
 	case frameREQBODY:
 		s.mu.Lock()
 		st := s.streams[f.streamID]
 		s.mu.Unlock()
 		if st != nil && len(f.payload) > 0 {
-			st.pw.Write(f.payload)
+			if !st.body.push(f.payload) {
+				// 流已被清理 (forward 超时/出错), 忽略后续 body 帧
+				return
+			}
 		}
 	case frameREQEND:
 		s.mu.Lock()
 		st := s.streams[f.streamID]
 		s.mu.Unlock()
 		if st != nil {
-			st.pw.Close()
+			st.body.finish()
 		}
 	}
 }
 
-func (s *serve) forward(dc *peerjs.DataConnection, id uint32, h reqHead, pr *io.PipeReader, pw *io.PipeWriter) {
-	defer pr.Close()
+// forward 整体 5 分钟超时: 防 "只发 REQ_HEAD 不发 REQ_END" 的流永久
+// 挂住 goroutine + 上游连接 (发现背景: 代码审阅)。超时后 ctx 中断
+// body 读取, client.Do 返回错误, 流被清理, 阻塞的 push 被 abort 唤醒。
+func (s *serve) forward(dc *peerjs.DataConnection, id uint32, h reqHead, st *pipeStream) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	defer st.body.abort()
 
 	var body io.Reader
 	if h.Body {
-		body = pr
+		body = st.body
 	}
-	req, err := http.NewRequest(h.Method, s.target+h.URL, body)
+	req, err := http.NewRequestWithContext(ctx, h.Method, s.target+h.URL, body)
 	if err != nil {
 		log.Printf("build request: %v", err)
 		s.respond(dc, id, http.StatusBadGateway, map[string]string{"Content-Type": "text/plain"}, []byte(err.Error()))
@@ -198,12 +299,14 @@ func (s *serve) forward(dc *peerjs.DataConnection, id uint32, h reqHead, pr *io.
 }
 
 func (s *serve) respond(dc *peerjs.DataConnection, id uint32, status int, hdrs map[string]string, body []byte) {
-	b, _ := json.Marshal(respHead{Status: status, Headers: hdrs})
-	dc.Send(marshalFrame(frameRESPHEAD, id, b))
-	dc.Send(marshalFrame(frameRESPBODY, id, body))
+	// Content-Type 兜底必须在发送前设置 (旧实现在 RESP_HEAD 已发出后
+	// 才检查, 无效逻辑)。
 	if _, ok := hdrs["Content-Type"]; !ok {
 		hdrs["Content-Type"] = "text/plain"
 	}
+	b, _ := json.Marshal(respHead{Status: status, Headers: hdrs})
+	dc.Send(marshalFrame(frameRESPHEAD, id, b))
+	dc.Send(marshalFrame(frameRESPBODY, id, body))
 	dc.Send(marshalFrame(frameRESPEND, id, nil))
 }
 
@@ -223,6 +326,10 @@ type stream struct {
 }
 
 func (st *stream) finish() { st.once.Do(func() { close(st.done) }) }
+
+// bodyChCap 响应 body 缓冲块数 (256 * 16KB ≈ 4MB): 满时 onMessage
+// 阻塞发送 (不丢 chunk), 由 handler 消费或 done 关闭解除。
+const bodyChCap = 256
 
 type client struct {
 	mu      sync.Mutex
@@ -256,7 +363,7 @@ func (c *client) handler(w http.ResponseWriter, r *http.Request) {
 	id := atomic.AddUint32(&c.nextID, 1)
 	st := &stream{
 		headCh: make(chan *respHead, 1),
-		bodyCh: make(chan []byte, 64),
+		bodyCh: make(chan []byte, bodyChCap),
 		done:   make(chan struct{}),
 	}
 	c.mu.Lock()
@@ -290,6 +397,9 @@ func (c *client) handler(w http.ResponseWriter, r *http.Request) {
 			n, err := r.Body.Read(buf)
 			if n > 0 {
 				if err := dc.Send(marshalFrame(frameREQBODY, id, buf[:n])); err != nil {
+					// 发送失败必须发 REQ_END: 否则 serve 侧 forward
+					// 一直等 body 直到 5 分钟超时 (发现背景: 代码审阅)。
+					dc.Send(marshalFrame(frameREQEND, id, nil))
 					return
 				}
 			}
@@ -365,9 +475,13 @@ func (c *client) onMessage(dc *peerjs.DataConnection, f *frame) {
 		}
 	case frameRESPBODY:
 		if len(f.payload) > 0 {
+			// 满时阻塞而不是丢弃: 旧实现 select+default 在缓冲满时
+			// 静默丢 chunk, 逐字节隧道丢一块 = 下载文件损坏/JSON 截断
+			// (发现背景: 代码审阅)。阻塞由 handler 消费解除, 或流
+			// 结束 (RESPEND/handler 退出触发 done) 时退出。
 			select {
 			case st.bodyCh <- f.payload:
-			default:
+			case <-st.done:
 			}
 		}
 	case frameRESPEND:

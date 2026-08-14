@@ -32,6 +32,12 @@ func Run(dohEndpoint string, port int) error {
 	// DoH 客户端复用，避免每次查询新建连接与 Transport。
 	dohClient := &http.Client{Timeout: 10 * time.Second}
 
+	// sem 限制并发 DoH 转发: 每查询一个 goroutine, DoH 慢时无上限会堆积
+	// goroutine/连接。用信号量限流, 满时直接丢弃 (UDP 无连接, 客户端
+	// 超时会重试, 不会静默丢)。
+	const maxConcurrent = 64
+	sem := make(chan struct{}, maxConcurrent)
+
 	// 4. Graceful shutdown handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -73,7 +79,16 @@ func Run(dohEndpoint string, port int) error {
 		query := make([]byte, n)
 		copy(query, buf[:n])
 
-		go handleQuery(conn, clientAddr, query, dohClient, dohEndpoint)
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				handleQuery(conn, clientAddr, query, dohClient, dohEndpoint)
+			}()
+		default:
+			// 信号量满: 丢弃查询 (UDP 客户端超时会重试)。
+			log.Printf("并发查询已满 (%d), 丢弃来自 %v 的查询", maxConcurrent, clientAddr)
+		}
 	}
 }
 

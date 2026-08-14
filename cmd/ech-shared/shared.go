@@ -30,9 +30,15 @@ var (
 	logBuf []string
 )
 
-func logMsg(fmt string, args ...interface{}) {
+func logMsg(format string, args ...interface{}) {
 	logMu.Lock()
-	logBuf = append(logBuf, fmt)
+	s := format
+	if len(args) > 0 {
+		// 参数真正格式化, 而不是静默丢弃 (旧实现形参名 fmt 遮蔽了
+		// fmt 包, args 一直被忽略, 未来调用点传 %d 会悄悄丢参)。
+		s = fmt.Sprintf(format, args...)
+	}
+	logBuf = append(logBuf, s)
 	if len(logBuf) > 200 {
 		logBuf = logBuf[len(logBuf)-200:]
 	}
@@ -60,7 +66,7 @@ func ECHInit() {
 	logMsg("ECHInit: starting goroutine")
 	go func() {
 		if err := cloudflare_ech.InitDefault(); err != nil {
-			logMsg("ECHInit error: " + err.Error())
+			logMsg("ECHInit error: %v", err)
 			initErr.Store(err.Error())
 			initMu.Lock()
 			initing = false
@@ -145,9 +151,29 @@ func buildFetchRequest(goURL, goHost, goRef string) (*http.Request, error) {
 //	ECHRead 返回 >0  读取的字节数
 //	ECHRead 返回 0   EOF
 //	ECHRead 返回 -1  body 读取错误（详情见日志）
-//	ECHRead 返回 -2  无效句柄
+//	ECHRead 返回 -2  无效句柄（含已被 ECHClose 关闭）
+//
+// 坑（发现背景: 代码审阅）: cgo.Handle 对已 Delete 的句柄再调用
+// Value()/Delete() 会直接 panic (runtime/cgo: misuse of an invalid
+// Handle), C 侧重复 ECHClose 或 ECHRead 与 ECHClose 并发都会触发,
+// 而 cgo 导出函数里的 panic 无法被 C 侧捕获, 会终止整个进程。
+// 修复: 句柄包一层结构体, 用 closeOnce 保证 body 只关一次,
+// closed 原子标记让 ECHRead 主动避开已关句柄, 再包 recover 兜底
+// 吞掉任何 handle 层面的 panic。
 type streamHandle struct {
 	body io.ReadCloser
+	// closed 置位后 ECHRead 不再访问 body; closeOnce 保证幂等。
+	closed    atomic.Bool
+	closeOnce sync.Once
+}
+
+func (sh *streamHandle) close() {
+	sh.closeOnce.Do(func() {
+		sh.closed.Store(true)
+		if sh.body != nil {
+			sh.body.Close()
+		}
+	})
 }
 
 //export ECHFetchBegin
@@ -156,17 +182,17 @@ func ECHFetchBegin(urlStr, host, referer *C.char) uintptr {
 	goHost := C.GoString(host)
 	goRef := C.GoString(referer)
 
-	logMsg("ECHFetchBegin: " + goURL + " -> host " + goHost)
+	logMsg("ECHFetchBegin: %s -> host %s", goURL, goHost)
 
 	outReq, err := buildFetchRequest(goURL, goHost, goRef)
 	if err != nil {
-		logMsg("ECHFetchBegin request error: " + err.Error())
+		logMsg("ECHFetchBegin request error: %v", err)
 		return 0
 	}
 
 	resp, err := cloudflare_ech.Do(outReq)
 	if err != nil {
-		logMsg("ECHFetchBegin Do error: " + err.Error())
+		logMsg("ECHFetchBegin Do error: %v", err)
 		return 0
 	}
 
@@ -175,20 +201,29 @@ func ECHFetchBegin(urlStr, host, referer *C.char) uintptr {
 		bodyStr := string(bodyPreview)
 		resp.Body.Close()
 		detail := fmt.Sprintf("HTTP %d %s | URL=%s | body=%.200s", resp.StatusCode, http.StatusText(resp.StatusCode), goURL, bodyStr)
-		logMsg("ECHFetchBegin failed: " + detail)
+		logMsg("ECHFetchBegin failed: %s", detail)
 		return 0
 	}
 
 	h := cgo.NewHandle(&streamHandle{body: resp.Body})
-	logMsg("ECHFetchBegin success: handle=" + fmt.Sprintf("%d", uintptr(h)))
+	logMsg("ECHFetchBegin success: handle=%d", uintptr(h))
 	return uintptr(h)
 }
 
 //export ECHRead
-func ECHRead(handle uintptr, buf unsafe.Pointer, max C.int) C.int {
+func ECHRead(handle uintptr, buf unsafe.Pointer, max C.int) (ret C.int) {
+	// recover 兜底: 与 ECHClose 并发时 handle 可能已被 Delete,
+	// Value() 会 panic; 吞掉并返回 -2 (无效句柄), 不能让它跨 cgo
+	// 边界炸掉整个进程。
+	defer func() {
+		if recover() != nil {
+			ret = -2
+		}
+	}()
+
 	h := cgo.Handle(uintptr(handle))
 	v, ok := h.Value().(*streamHandle)
-	if !ok {
+	if !ok || v.closed.Load() {
 		return -2
 	}
 	if max <= 0 {
@@ -200,25 +235,36 @@ func ECHRead(handle uintptr, buf unsafe.Pointer, max C.int) C.int {
 		readLen = 256 * 1024
 	}
 	n, err := v.body.Read(unsafe.Slice((*byte)(buf), readLen))
+	if n > 0 {
+		// io.Reader 契约: n>0 时 err 可能同时为 io.EOF (网络 body
+		// 常见)。必须先返回数据, EOF 留到下次调用再报, 否则丢数据
+		// (发现背景: 代码审阅, 旧实现 n>0+EOF 直接 return 0)。
+		return C.int(n)
+	}
+	if err == io.EOF {
+		return 0
+	}
 	if err != nil {
-		if err == io.EOF {
-			return 0
-		}
-		logMsg("ECHRead error: " + err.Error())
+		logMsg("ECHRead error: %v", err)
 		return -1
 	}
-	return C.int(n)
+	return 0
 }
 
 //export ECHClose
 func ECHClose(handle uintptr) {
+	// recover 兜底: C 侧对同一 handle 调两次 ECHClose 时第二次
+	// h.Value()/h.Delete() 会 panic, 必须吞掉 (见 streamHandle 注释)。
+	defer func() { recover() }()
+
 	h := cgo.Handle(uintptr(handle))
 	v, ok := h.Value().(*streamHandle)
-	h.Delete()
-	if ok && v.body != nil {
-		v.body.Close()
-		logMsg("ECHClose: handle " + fmt.Sprintf("%d", uintptr(h)))
+	if !ok {
+		return
 	}
+	v.close()
+	h.Delete()
+	logMsg("ECHClose: handle %d", uintptr(h))
 }
 
 //export ECHFetch
@@ -227,11 +273,11 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 	goHost := C.GoString(host)
 	goRef := C.GoString(referer)
 
-	logMsg("ECHFetch: " + goURL + " -> host " + goHost)
+	logMsg("ECHFetch: %s -> host %s", goURL, goHost)
 
 	outReq, err := buildFetchRequest(goURL, goHost, goRef)
 	if err != nil {
-		logMsg("ECHFetch request error: " + err.Error())
+		logMsg("ECHFetch request error: %v", err)
 		return C.CString("ERR: " + err.Error())
 	}
 
@@ -243,7 +289,7 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 
 	resp, err := cloudflare_ech.Do(outReq)
 	if err != nil {
-		logMsg("ECHFetch Do error: " + err.Error())
+		logMsg("ECHFetch Do error: %v", err)
 		return C.CString("ERR: " + err.Error())
 	}
 	defer resp.Body.Close()
@@ -252,18 +298,18 @@ func ECHFetch(urlStr, host, referer *C.char) *C.char {
 		bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		bodyStr := string(bodyPreview)
 		detail := fmt.Sprintf("HTTP %d %s | URL=%s | body=%.200s", resp.StatusCode, http.StatusText(resp.StatusCode), goURL, bodyStr)
-		logMsg("ECHFetch failed: " + detail)
+		logMsg("ECHFetch failed: %s", detail)
 		return C.CString("ERR: " + detail)
 	}
 
 	buf, err := io.ReadAll(resp.Body)
 	if err != nil {
-		logMsg("ECHFetch read error: " + err.Error())
+		logMsg("ECHFetch read error: %v", err)
 		return C.CString("ERR: read body: " + err.Error())
 	}
 
 	encoded := base64.StdEncoding.EncodeToString(buf)
-	logMsg("ECHFetch success: " + fmt.Sprintf("%d bytes -> %d base64", len(buf), len(encoded)))
+	logMsg("ECHFetch success: %d bytes -> %d base64", len(buf), len(encoded))
 	return C.CString(encoded)
 }
 

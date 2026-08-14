@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -33,7 +34,7 @@ const (
 	rateBurst   = 10
 	rateCleanup = 10 * time.Minute
 
-	dayLimit = 10000 // 全局每日配额
+	dayLimit = 10000 // 全局每日配额 (10000 条/天)
 )
 
 // ---- 全局每日配额 ----
@@ -190,7 +191,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Referer 必须存在且来自 aichat.moonchan.xyz,拒绝空 Referer。
-	if ref := r.Header.Get("Referer"); ref == "" || !strings.HasPrefix(ref, allowedOrigin) {
+	// 用 url.Parse 精确比对 host: 旧实现 strings.HasPrefix 可被
+	// https://aichat.moonchan.xyz.evil.com 绕过 (发现背景: 代码审阅)。
+	if ref := r.Header.Get("Referer"); ref == "" {
+		reject()
+		http.Error(w, "referer not allowed", http.StatusForbidden)
+		return
+	} else if u, err := url.Parse(ref); err != nil || u.Hostname() != "aichat.moonchan.xyz" {
 		reject()
 		http.Error(w, "referer not allowed", http.StatusForbidden)
 		return
@@ -203,7 +210,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 全局每日配额 (1000 条/天)。
+	// 全局每日配额 (10000 条/天)。
 	if !allowDay() {
 		reject()
 		w.Header().Set("Retry-After", "3600")
@@ -211,13 +218,21 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	// body 限长 8MB: 防止任意客户端 POST 超大 body 打满内存
+	// (发现背景: 代码审阅, 旧实现 io.ReadAll 无上限)。
+	// 读 max+1 字节, 多出的 1 字节用于检测超限 (LimitReader 截断后
+	// 无法区分"恰好 max"和"超过 max")。
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20+1))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if len(body) == 0 {
 		http.Error(w, "empty body", http.StatusBadRequest)
+		return
+	}
+	if len(body) > 8<<20 {
+		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -285,8 +300,15 @@ func handle(w http.ResponseWriter, r *http.Request) {
 // statusHandler 只读状态端点: 配额使用、请求统计、活跃 IP 数。
 // 不需要 Origin/Referer 校验 (无敏感信息, 不暴露 key)。
 func statusHandler(w http.ResponseWriter, r *http.Request) {
-	statsMu.Lock()
+	// dayCount 由 dayMu 保护 (allowDay 用 dayMu 写), 不能在 statsMu 下
+	// 读: 锁不一致是 data race (发现背景: 代码审阅, 旧实现在 statsMu
+	// 锁内读 dayCount)。
+	dayMu.Lock()
 	dayCountNow := dayCount
+	dayDateNow := dayDate
+	dayMu.Unlock()
+
+	statsMu.Lock()
 	dayOKNow := dayOK
 	dayErrNow := dayUpstreamErr
 	sTotal, sOK, sErr, sUp, sRej := statsTotal, statsOK, statsErr, statsUpstream, statsRejected
@@ -296,15 +318,11 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	activeIPs := len(limiters)
 	limitersMu.Unlock()
 
-	dayMu.Lock()
-	dayDateNow := dayDate
-	dayMu.Unlock()
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"status": "ok",
+		"status":     "ok",
 		"uptime_sec": int(time.Since(statsStart).Seconds()),
-		"upstream": upstream,
+		"upstream":   upstream,
 		"daily": map[string]any{
 			"date":          dayDateNow,
 			"used":          dayCountNow,
@@ -314,11 +332,11 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 			"upstream_errs": dayErrNow,
 		},
 		"requests": map[string]int64{
-			"total":       sTotal,
-			"ok":          sOK,
-			"upstream_err": sUp,
+			"total":            sTotal,
+			"ok":               sOK,
+			"upstream_err":     sUp,
 			"upstream_4xx_5xx": sErr,
-			"rejected":    sRej,
+			"rejected":         sRej,
 		},
 		"active_ips": activeIPs,
 	})
