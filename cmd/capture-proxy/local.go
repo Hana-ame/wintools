@@ -24,6 +24,7 @@
 //	capture-proxy -role local --mode v4 --out captured          # 强制 v4
 //	capture-proxy -role local --cert fullchain.cer --key key    # HTTPS 监听
 //	capture-proxy -role local --detect=false                    # vanilla 纯透传
+//	capture-proxy -role provider --proxy https://u:p@host:port  # 出站全部走外部代理
 //
 // 模式 API:
 //
@@ -31,6 +32,13 @@
 //	POST /mode            body {"mode":"v6"}  或 query ?mode=v6  (v4|v6)
 //	GET  /status          -> 同 /mode + 按协议族累计统计
 //	GET  /stats           -> 按模型 usage 计费统计
+//
+// 外部代理 API (proxy mode): 设置后所有出站 (v4/v6 全部请求) 经该代理转发,
+// 代理主机用公共 DNS 解析; 空字符串 = 恢复直连。
+//
+//	GET  /proxy           -> {"proxy":"...","dial":"ip:port"}
+//	POST /proxy           body {"proxy":"https://u:p@host:port"} 或 query ?proxy=...
+//	POST /proxy           body {"proxy":""} 恢复直连
 package main
 
 import (
@@ -46,6 +54,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -476,6 +485,9 @@ type proxy struct {
 	famStats map[string]*famStat
 	start    time.Time
 	usage    *usageStats
+
+	// 外部 HTTP(S) 代理 (--proxy 或 POST /proxy 设置), 出站全部走它。
+	px proxyCfg
 }
 
 type famStat struct {
@@ -574,6 +586,97 @@ func resolveOnce(host string) (v4, v6 string) {
 	}
 	log.Printf("resolve %s failed on all public DNS", host)
 	return "", ""
+}
+
+// proxyResolveTTL 外部代理地址解析缓存时长: tunnel/动态 DNS 的 IP 会漂移,
+// 定期重解析避免代理失联。
+const proxyResolveTTL = 60 * time.Second
+
+// proxyCfg 保存经 --proxy / POST /proxy 配置的外部 HTTP(S) 代理。设置后所有
+// 出站连接 (v4/v6 的 4 个 client) 全部改走该代理, nil 表示直连。代理主机用
+// 公共 DNS 解析 (Termux 无 /etc/resolv.conf, 见 pkg/netdial 的坑), 结果缓存
+// proxyResolveTTL 后重解析。
+type proxyCfg struct {
+	mu         sync.RWMutex
+	raw        string   // 用户提供的代理 URL 原文
+	u          *url.URL // 解析后的 URL
+	dialAddr   string   // 解析出的 "ip:port" (解析失败退回原 host:port)
+	resolvedAt time.Time
+}
+
+// get 返回当前代理 URL 与可直接拨号的地址。返回 nil URL 表示直连。
+func (c *proxyCfg) get() (*url.URL, string) {
+	c.mu.RLock()
+	u := c.u
+	da := c.dialAddr
+	stale := u != nil && time.Since(c.resolvedAt) > proxyResolveTTL
+	c.mu.RUnlock()
+	if stale {
+		c.mu.Lock()
+		if c.u == u { // 仍指向同一配置才更新, 防止覆盖新配置
+			c.dialAddr = resolveDialAddr(u)
+			c.resolvedAt = time.Now()
+			da = c.dialAddr
+		}
+		c.mu.Unlock()
+	}
+	return u, da
+}
+
+func (c *proxyCfg) rawString() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.raw
+}
+
+// set 更新代理配置。raw 为空 = 直连 (关闭代理)。
+func (c *proxyCfg) set(raw string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if strings.TrimSpace(raw) == "" {
+		c.raw, c.u, c.dialAddr, c.resolvedAt = "", nil, "", time.Time{}
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid proxy url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("proxy scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("proxy url missing host")
+	}
+	c.raw = raw
+	c.u = u
+	c.dialAddr = resolveDialAddr(u)
+	c.resolvedAt = time.Now()
+	return nil
+}
+
+// resolveDialAddr 把代理 URL 变成可直接拨号的 "ip:port": 补齐默认端口, 主机名
+// 用公共 DNS 解析为 IP (优先 v4), 解析失败时退回原 host:port 走系统 DNS。
+func resolveDialAddr(u *url.URL) string {
+	host := u.Host
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		port := "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(host, port)
+	}
+	h, port, _ := net.SplitHostPort(host)
+	if net.ParseIP(h) != nil {
+		return net.JoinHostPort(h, port)
+	}
+	v4, v6 := resolveOnce(h)
+	if v4 != "" {
+		return net.JoinHostPort(v4, port)
+	}
+	if v6 != "" {
+		return net.JoinHostPort(v6, port)
+	}
+	return host
 }
 
 func (p *proxy) inCooldown(fam string, now time.Time) bool {
@@ -1334,15 +1437,29 @@ func ms(t, t0 time.Time) time.Duration {
 	return t.Sub(t0).Round(time.Millisecond)
 }
 
-func makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
+// makeClient 构造到上游的 client。支持运行时切换的外部代理 (--proxy / POST
+// /proxy):
+//   - Proxy 函数每次读当前代理配置, 返回 nil URL = 直连;
+//   - DialContext 有代理时拨代理 IP:port (公共 DNS 解析), 无代理时拨 endpoint
+//     (opencode.ai 的 v4/v6 IP, 绕过本机 DNS)。CONNECT 目标由 transport 从请求
+//     URL (v4/v6 IP) 派生, 所以 v4/v6 failover 在代理模式下依然生效;
+//   - https 代理的 TLS 握手由 Go transport 处理 (ServerName 自动指向代理主机)。
+func (p *proxy) makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
 	tlsCfg := &tls.Config{ServerName: sniHost, InsecureSkipVerify: true}
 	if !forceH2 {
 		tlsCfg.NextProtos = []string{"http/1.1"}
 	}
 	tr := &http.Transport{
 		TLSClientConfig: tlsCfg,
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			u, _ := p.px.get()
+			return u, nil
+		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+			if _, da := p.px.get(); da != "" {
+				return d.DialContext(ctx, "tcp", da)
+			}
 			return d.DialContext(ctx, "tcp", endpoint)
 		},
 		ResponseHeaderTimeout: 60 * time.Second,
@@ -1354,6 +1471,16 @@ func makeClient(endpoint, sniHost string, forceH2 bool) *http.Client {
 	return &http.Client{Transport: tr}
 }
 
+// closeIdle 代理配置变更后清空各 client 的空闲连接, 让新配置立即生效
+// (transport 连接池按 proxy+target 缓存, 不清理会继续用旧代理)。
+func (p *proxy) closeIdle() {
+	for _, c := range []*http.Client{p.clientV4, p.clientV6, p.clientV4H1, p.clientV6H1} {
+		if tr, ok := c.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
 func runProvider(args []string) {
 	fs := flag.NewFlagSet("provider", flag.ExitOnError)
 	listen := fs.String("listen", "127.0.0.1:8000", "监听地址")
@@ -1363,6 +1490,7 @@ func runProvider(args []string) {
 	key := fs.String("key", "", "TLS 私钥文件")
 	detect := fs.Bool("detect", true, "流检测 (true=detected, false=vanilla 纯透传)")
 	ban := fs.Bool("ban", false, "按 IP 限流 (200 req/10min, zen-proxy 行为)")
+	outProxy := fs.String("proxy", "", "外部 HTTP(S) 代理 (如 https://user:pass@host:port), 出站全部走该代理; 可用 POST /proxy 运行时改")
 	fs.Parse(args)
 
 	if *mode != "v4" && *mode != "v6" {
@@ -1376,10 +1504,6 @@ func runProvider(args []string) {
 
 	p := &proxy{
 		mode:       *mode,
-		clientV4:   makeClient(net.JoinHostPort(v4, "443"), zenHost, true),
-		clientV6:   makeClient(net.JoinHostPort(v6, "443"), zenHost, true),
-		clientV4H1: makeClient(net.JoinHostPort(v4, "443"), zenHost, false),
-		clientV6H1: makeClient(net.JoinHostPort(v6, "443"), zenHost, false),
 		v4URL:      "https://" + v4,
 		v6URL:      "https://[" + v6 + "]",
 		detect:     *detect,
@@ -1387,6 +1511,15 @@ func runProvider(args []string) {
 		start:      time.Now(),
 		usage:      newUsageStats(),
 	}
+	if *outProxy != "" {
+		if err := p.px.set(*outProxy); err != nil {
+			log.Fatalf("--proxy: %v", err)
+		}
+	}
+	p.clientV4 = p.makeClient(net.JoinHostPort(v4, "443"), zenHost, true)
+	p.clientV6 = p.makeClient(net.JoinHostPort(v6, "443"), zenHost, true)
+	p.clientV4H1 = p.makeClient(net.JoinHostPort(v4, "443"), zenHost, false)
+	p.clientV6H1 = p.makeClient(net.JoinHostPort(v6, "443"), zenHost, false)
 	if *ban {
 		p.ban = newBanList(maxReqsPerClient, banWindow, banLen)
 	}
@@ -1457,6 +1590,38 @@ func runProvider(args []string) {
 			log.Printf("mode switched to %s", m)
 		}
 		writeMode(w)
+	})
+	// 外部代理 API: POST 设置/切换 https 代理 (所有出站走它), 空字符串 = 直连。
+	mux.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			writeJSON(w, 204, map[string]any{})
+			return
+		}
+		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+			raw := r.URL.Query().Get("proxy")
+			if raw == "" {
+				if b, err := io.ReadAll(io.LimitReader(r.Body, 4096)); err == nil && len(b) > 0 {
+					var v struct {
+						Proxy string `json:"proxy"`
+					}
+					if json.Unmarshal(b, &v) == nil {
+						raw = v.Proxy
+					}
+				}
+			}
+			if err := p.px.set(raw); err != nil {
+				writeJSON(w, 400, map[string]any{"error": err.Error()})
+				return
+			}
+			p.closeIdle()
+			log.Printf("proxy set: %q", raw)
+		}
+		u, da := p.px.get()
+		res := map[string]any{"proxy": p.px.rawString()}
+		if u != nil {
+			res["dial"] = da
+		}
+		writeJSON(w, 200, res)
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
