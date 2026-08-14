@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -14,10 +15,16 @@ import (
 	"github.com/coder/websocket"
 )
 
-// opencode.ai 访问量统计: 总 CONNECT 次数 + 每分钟增量。
+// opencode.ai 访问量统计: 总 CONNECT 次数 + 每分钟增量 + 上下行字节。
+// 字节在双向转发时累计, 不依赖 HTTP 版本; 端到端流量 client 端也在计,
+// 这里计的是本 server 出口这段 (WS 隧道 <-> 目标)。
 var (
-	statsTotal atomic.Int64
-	statsMin   atomic.Int64
+	statsTotal  atomic.Int64
+	statsMin    atomic.Int64
+	statsUp     atomic.Int64
+	statsDown   atomic.Int64
+	statsUpMin  atomic.Int64
+	statsDownMin atomic.Int64
 )
 
 func runServer(args []string) {
@@ -34,12 +41,13 @@ func runServer(args []string) {
 	mux.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
 		handleServerConn(w, r, *force)
 	})
-	// /status: opencode.ai 访问量统计 (本分钟 + 累计)
+	// /status: 访问量统计 (本分钟 + 累计 + 上下行字节)
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(200)
-		fmt.Fprintf(w, `{"opencode_conns": %d, "last_minute": %d}`, statsTotal.Load(), statsMin.Load())
+		fmt.Fprintf(w, `{"opencode_conns": %d, "last_minute": %d, "up_bytes": %d, "down_bytes": %d}`,
+			statsTotal.Load(), statsMin.Load(), statsUp.Load(), statsDown.Load())
 	})
 
 	srv := &http.Server{
@@ -53,7 +61,9 @@ func runServer(args []string) {
 	go func() {
 		for {
 			time.Sleep(time.Minute)
-			log.Printf("opencode.ai 访问量: 本分钟 %d 次, 当天 %d 次", statsMin.Swap(0), statsTotal.Load())
+			log.Printf("opencode.ai 访问量: 本分钟 %d 次 (↑%.1fMB ↓%.1fMB), 当天 %d 次 (↑%.1fMB ↓%.1fMB)",
+				statsMin.Swap(0), float64(statsUpMin.Swap(0))/1e6, float64(statsDownMin.Swap(0))/1e6,
+				statsTotal.Load(), float64(statsUp.Load())/1e6, float64(statsDown.Load())/1e6)
 		}
 	}()
 	go func() {
@@ -61,9 +71,14 @@ func runServer(args []string) {
 			now := time.Now().UTC()
 			next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
 			time.Sleep(time.Until(next))
-			log.Printf("UTC+0 00:00: 当天 opencode.ai 访问量 %d 次, 重置", statsTotal.Load())
+			log.Printf("UTC+0 00:00: 当天 opencode.ai 访问量 %d 次 (↑%.1fMB ↓%.1fMB), 重置", statsTotal.Load(),
+				float64(statsUp.Load())/1e6, float64(statsDown.Load())/1e6)
 			statsTotal.Store(0)
 			statsMin.Store(0)
+			statsUp.Store(0)
+			statsDown.Store(0)
+			statsUpMin.Store(0)
+			statsDownMin.Store(0)
 		}
 	}()
 	if err := srv.ListenAndServe(); err != nil {
@@ -105,14 +120,16 @@ func handleServerConn(w http.ResponseWriter, r *http.Request, force string) {
 func relay(a, b net.Conn) {
 	done := make(chan struct{}, 1)
 	go func() {
-		ioCopy(a, b)
+		// a->b: 从 client (WS) 读到目标, 计上行。
+		ioCopy(&counterWriter{w: b, total: &statsUp, minute: &statsUpMin}, a)
 		done <- struct{}{}
 	}()
-	ioCopy(b, a)
+	// b->a: 从目标读到 client (WS), 计下行。
+	ioCopy(&counterWriter{w: a, total: &statsDown, minute: &statsDownMin}, b)
 	<-done
 }
 
-func ioCopy(dst, src net.Conn) {
+func ioCopy(dst io.Writer, src io.Reader) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
