@@ -760,6 +760,11 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 			log.Printf("model deepseek-v4-flash -> deepseek-v4-flash-free")
 		}
 		payload["model"] = model
+		// 新 opencode 客户端会发 role=developer (Anthropic/新 OpenAI 规范), 但
+		// Console 上游反序列化只认 system/user/assistant/tool/latest_reminder,
+		// developer 直接 400 "unknown variant `developer`" (发现背景: 用户报错)。
+		// developer 语义等价 system 级指令, 就地降级为 system。
+		sanitizeRoles(payload)
 		if mt, ok := payload["max_tokens"].(float64); !ok || mt > 131072 {
 			payload["max_tokens"] = 131072
 		}
@@ -1187,6 +1192,20 @@ func (p *proxy) forwardPassthrough(w http.ResponseWriter, resp *http.Response, f
 func messagesOf(p map[string]any) []any {
 	m, _ := p["messages"].([]any)
 	return m
+}
+
+// sanitizeRoles 把上游不认识的 message.role 降级为可接受值。目前只处理
+// developer -> system: 两者都是"系统级指令"语义, 直接改 role 不影响内容。
+func sanitizeRoles(payload map[string]any) {
+	for _, mm := range messagesOf(payload) {
+		m, ok := mm.(map[string]any)
+		if !ok {
+			continue
+		}
+		if r, _ := m["role"].(string); r == "developer" {
+			m["role"] = "system"
+		}
+	}
 }
 
 func toolsOf(p map[string]any) []any {
