@@ -30,7 +30,7 @@
 //
 //	GET  /mode            -> {"mode":"v4","v4_cooldown_sec":..,"v6_cooldown_sec":..}
 //	POST /mode            body {"mode":"v6"}  或 query ?mode=v6  (v4|v6)
-//	GET  /status          -> 同 /mode + 按协议族累计统计
+//	GET  /status          -> 同 /mode + 按协议族累计统计 + up_bytes/down_bytes 流量
 //	GET  /stats           -> 按模型 usage 计费统计
 //
 // 外部代理 API (proxy mode): 设置后所有出站 (v4/v6 全部请求) 经该代理转发,
@@ -293,6 +293,15 @@ func startReader(body io.Reader, done <-chan struct{}) chan chunkMsg {
 
 // usage 记录响应体里的 token 用量。非流式响应整体解析;
 // 流式响应每个 SSE 事件里可能带 usage (通常只在最后一个事件)。
+//
+// 缓存 token 的来源按上游 schema 分三路兼容:
+//   - deepseek 系: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens,
+//     prompt_tokens 是 hit+miss 总和, 若只记 prompt_tokens 会把命中部分虚增 input;
+//   - openai 系: usage.prompt_tokens_details.cached_tokens, 是 prompt_tokens 的子集;
+//   - 自定义 cache 对象: usage.cache.read/write。
+//
+// 发现背景: 线上 /status 出现 input 7.7B 而 cache_read=0 (代码审阅), deepseek 系
+// usage 里的 cache hit 被整体并进 prompt_tokens, 修复后 input 只记未命中的 miss。
 type usage struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
@@ -301,6 +310,30 @@ type usage struct {
 		Read  int64 `json:"read"`
 		Write int64 `json:"write"`
 	} `json:"cache"`
+
+	PromptCacheHitTokens  int64 `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens int64 `json:"prompt_cache_miss_tokens"`
+	PromptTokensDetails   struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// inputAndCache 把 prompt_tokens 拆成「未命中(按全价计费)」和「缓存命中」。
+// deepseek/openai 系的 prompt_tokens 都包含命中部分, 直接累加会让 input 虚高。
+func (u *usage) inputAndCache() (input, cached int64) {
+	input = u.PromptTokens
+	switch {
+	case u.PromptCacheHitTokens > 0:
+		cached = u.PromptCacheHitTokens
+	case u.Cache.Read > 0:
+		cached = u.Cache.Read
+	case u.PromptTokensDetails.CachedTokens > 0:
+		cached = u.PromptTokensDetails.CachedTokens
+	}
+	if cached > input {
+		cached = input // 防御: 上游数据异常时命中数不可能超过总数
+	}
+	return input - cached, cached
 }
 
 type modelStats struct {
@@ -336,10 +369,11 @@ func (s *usageStats) add(model string, req bool, u *usage) {
 	if u == nil {
 		return
 	}
-	m.Input += u.PromptTokens
+	input, cached := u.inputAndCache()
+	m.Input += input
+	m.CacheRead += cached
 	m.Output += u.CompletionTokens
 	m.Reasoning += u.ReasoningTokens
-	m.CacheRead += u.Cache.Read
 	m.CacheWrite += u.Cache.Write
 	m.Cost += estCost(u)
 }
@@ -356,8 +390,10 @@ func (s *usageStats) snapshot() map[string]*modelStats {
 }
 
 func estCost(u *usage) float64 {
-	return float64(u.Cache.Read)/1e6*priceCacheReadM +
-		float64(u.PromptTokens)/1e6*priceInputM +
+	// 用 inputAndCache 拆过的值计费, 避免缓存 token 被 input 全价 + cache 折价重复计费。
+	input, cached := u.inputAndCache()
+	return float64(cached)/1e6*priceCacheReadM +
+		float64(input)/1e6*priceInputM +
 		float64(u.CompletionTokens+u.ReasoningTokens)/1e6*priceOutputM
 }
 
@@ -485,6 +521,9 @@ type proxy struct {
 	famStats map[string]*famStat
 	start    time.Time
 	usage    *usageStats
+
+	upBytes   atomic.Int64 // 上行字节: client -> 上游 (转发出去的请求载荷)
+	downBytes atomic.Int64 // 下行字节: 上游 -> client (转发回来的响应载荷)
 
 	// 外部 HTTP(S) 代理 (--proxy 或 POST /proxy 设置), 出站全部走它。
 	px proxyCfg
@@ -886,6 +925,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		bodyStr = string(re)
 	}
 
+	// 上行统计: client 发来的请求载荷 (gzip 已解压、重序列化后的 bodyStr,
+	// 即实际转发给上游的字节)。与 ip-proxy 的 up 语义一致 (client -> 目标)。
+	p.upBytes.Add(int64(len(bodyStr)))
+
 	lastStatus := 0
 	var lastErrBody any
 	var lastHeaders http.Header
@@ -1001,6 +1044,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 			h.Set("Content-Type", "application/json")
 			setCORS(h)
 			w.WriteHeader(200)
+			p.downBytes.Add(int64(len(data)))
 			w.Write(data)
 			log.Printf("non-stream done")
 			return
@@ -1090,6 +1134,18 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 
 	p.usage.add(model, true, nil)
 
+	// 流式 usage 只在结束时计一次 (lastUsage): 上游每个 SSE chunk 都可能带 usage,
+	// 逐事件累加会把同一个响应的 token 重复计几百上千倍 (线上实证: 602 个请求却累计
+	// 77 亿 input token, 单请求均值 1280 万远超 128K 上下文上限, 代码审阅发现)。
+	// 取最后一个 usage 事件: 无论上游是「唯一一次」还是「每 chunk 累计值」, 它都是
+	// 最终累计数。
+	var lastUsage *usage
+	defer func() {
+		if lastUsage != nil {
+			p.usage.add(model, false, lastUsage)
+		}
+	}()
+
 	buf := pre
 	sawTool := false
 	finished := false
@@ -1101,6 +1157,7 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 	total := len(pre)
 	write := func(b []byte) error {
 		total += len(b)
+		p.downBytes.Add(int64(len(b)))
 		_, err := w.Write(b)
 		if err == nil && flusher != nil {
 			flusher.Flush()
@@ -1122,7 +1179,7 @@ loop:
 				continue
 			}
 			if u := parseSSEUsage(ev); u != nil {
-				p.usage.add(model, false, u)
+				lastUsage = u
 			}
 			if eventHasToolCall(ev) {
 				sawTool = true
@@ -1279,6 +1336,7 @@ func (p *proxy) forwardPassthrough(w http.ResponseWriter, resp *http.Response, f
 					p.usage.add(model, false, u)
 				}
 				total += len(ev) + 2
+				p.downBytes.Add(int64(len(ev) + 2))
 				if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
 					log.Printf("client disconnected mid-stream")
 					resp.Body.Close()
@@ -1643,6 +1701,8 @@ func runProvider(args []string) {
 		writeJSON(w, 200, map[string]any{
 			"status":          "ok",
 			"mode":            p.currentMode(),
+			"up_bytes":        p.upBytes.Load(),
+			"down_bytes":      p.downBytes.Load(),
 			"v4_cooldown_sec": p.cooldownSec("v4", now),
 			"v6_cooldown_sec": p.cooldownSec("v6", now),
 			"upstream":        "https://" + zenHost + zenPath,
