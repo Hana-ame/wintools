@@ -445,47 +445,6 @@ func idleInject(model string) []byte {
 	return toolInject(model, "call_idle", infIdleArg)
 }
 
-// isConnLevelFail 区分「连接级失败」与「上游业务错误」: 连接/首 token 超时、
-// 预读 stall (lastErrBody==nil, 走 503) 或连接错误 (lastErrBody 为 UpstreamError,
-// 走 502) 视为连接级; 其余 (400/429 等带上游 body 的错误) 不是。
-// 目的: 连接级失败时对带 tools 的流式请求注入「echo 继续」, 业务错误仍透传。
-func isConnLevelFail(lastErrBody any, lastStatus int) bool {
-	if lastErrBody == nil {
-		return true // 预读 stall / 无响应体, 全部栈耗尽
-	}
-	if lastStatus != 502 {
-		return false
-	}
-	if obj, ok := lastErrBody.(map[string]any); ok {
-		if e, ok := obj["error"].(map[string]any); ok {
-			if t, _ := e["type"].(string); t == "UpstreamError" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// writeIdleSSE 以 200 SSE 直接输出「echo 继续」tool_call 收尾流 (含 [DONE]),
-// 用于连接级失败时代替 502/503 错误响应。
-func writeIdleSSE(w http.ResponseWriter, model string) {
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	setCORS(h)
-	w.WriteHeader(200)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	if _, err := w.Write(idleInject(model)); err != nil {
-		log.Printf("write idle SSE: %v", err)
-		return
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
 // ---- 抓包 (capture) ----------------------------------------------------------
 
 type capture struct {
@@ -942,6 +901,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 			log.Printf("model deepseek-v4-flash -> deepseek-v4-flash-free")
 		}
 		payload["model"] = model
+		// 强制 thinking 强度为 max: 客户端 (opencode.json reasoningEffort) 可配
+		// 其它值甚至不配, 但本 proxy 的定位是给免费模型打满推理, 一律钳到
+		// max 再上传 (用户要求: 强制为 max)。
+		payload["reasoning_effort"] = "max"
 		// 新 opencode 客户端会发 role=developer (Anthropic/新 OpenAI 规范), 但
 		// Console 上游反序列化只认 system/user/assistant/tool/latest_reminder,
 		// developer 直接 400 "unknown variant `developer`" (发现背景: 用户报错)。
@@ -967,9 +930,6 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 
 	// 上行字节不计在这里: 原始字节由 countingConn 在出站连接的传输层累计
 	// (含 TLS 握手/请求头), 与 ip-proxy 语义对齐, 见 makeClient 的 DialContext。
-	lastStatus := 0
-	var lastErrBody any
-	var lastHeaders http.Header
 
 	for _, fam := range p.stacks(stackOverride) {
 		if p.inCooldown(fam, time.Now()) {
@@ -1035,8 +995,6 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 				log.Printf("%s upstream error: %v (dial=%s tls=%s wrote=%s)", fam, err,
 					ms(tDial, t0), ms(tTLS, t0), ms(tWrote, t0))
 				st.add(0, 0, 1, 0)
-				lastStatus = 502
-				lastErrBody = map[string]any{"error": map[string]any{"message": err.Error(), "type": "UpstreamError"}}
 				continue
 			}
 		}
@@ -1059,14 +1017,6 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 				continue
 			}
 			st.add(0, 0, 1, 0)
-			lastStatus = resp.StatusCode
-			lastHeaders = http.Header{}
-			proxyheaders.ForwardResponseHeaders(lastHeaders, resp.Header)
-			if len(obj) > 0 {
-				lastErrBody = obj
-			} else {
-				lastErrBody = map[string]any{"error": map[string]any{"message": string(data)}}
-			}
 			continue
 		}
 
@@ -1095,40 +1045,10 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		resp.Body.Close()
 	}
 
-	// FreeUsageLimitError (日额超限) 是真实配额信号, 必须透传 429 而不是注入:
-	// auto 模式下 v4/v6 双栈都冷却 = 429; v4/v6 单栈模式下该栈冷却 = 429。
-	// (v2.4.2 曾把双栈冷却也归入注入, 理解错误改回 429。注意不能沿用
-	// inCooldown(v4)&&inCooldown(v6): 单栈模式只有一栈被栈表尝试, 另一栈永远
-	// 不冷却, 该条件永不成立, 超限会错误落到 503/注入。)
-	stacks_ := p.stacks(stackOverride)
-	allCool := len(stacks_) > 0
-	for _, fam := range stacks_ {
-		if !p.inCooldown(fam, time.Now()) {
-			allCool = false
-			break
-		}
-	}
-	if allCool {
-		writeJSON(w, 429, map[string]any{"error": map[string]any{"message": "All IPs reached daily free usage limit", "type": freeLimitErr}})
-		return
-	}
-	// 连接级失败 (预读等首 token 超时 / 连接/握手/响应头超时 / 上游不可达):
-	// 全部栈耗尽后, 带 tools 的流式请求注入「echo 继续」正常收尾, 客户端工具
-	// 循环继续而不是收到 502/503 报错中断 (用户要求: 连接时间过长 → 主动断开 +
-	// 无 toolcall 则补上 echo 继续)。
-	// 注意只在连接级失败注入: 上游业务错误 (400 参数错误、429 配额等) 仍原样
-	// 透传, 避免对无效请求打无限续圈; 非 tools/非流式请求也仍按原样报错。
-	if isStream && recoverable && isConnLevelFail(lastErrBody, lastStatus) {
-		log.Printf("all upstreams failed (status=%d), inject idle instead of error", lastStatus)
-		writeIdleSSE(w, model)
-		return
-	}
-	if lastErrBody != nil {
-		proxyheaders.MergeHeaders(w.Header(), lastHeaders)
-		writeJSON(w, lastStatus, lastErrBody)
-		return
-	}
-	writeJSON(w, 503, map[string]any{"error": map[string]any{"message": "All upstream IPs exhausted or unavailable", "type": "UpstreamError"}})
+	// 全栈耗尽: 一律统一回 429 (用户明确: 无论配额/超时/业务错误,
+	// 全栈耗尽都应 429; 不再注入 echo 继续, 也不透传 400/502/503 具体错误。
+	// 注入场景仅保留在已有响应后的 mid-stream 断流/工具停滞, 见 forwardStream)。
+	writeJSON(w, 429, map[string]any{"error": map[string]any{"message": "All upstream IPs unavailable or reached daily free usage limit", "type": freeLimitErr}})
 }
 
 // forwardStream 转发 SSE 流, 带预读/stall/工具流保护/意外中断注入。
