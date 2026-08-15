@@ -53,8 +53,29 @@ jobs:
           name: ${{ matrix.os }}-${{ matrix.arch }}
           path: dist/${{ matrix.os }}/${{ matrix.arch }}/
 
+  # ech-shared 是 CGo 共享库, 需要本机 gcc, 单独在 Windows runner 上构建
+  # (ubuntu 交叉编译需 mingw-w64, 直接用原生 runner 更稳)
+  build-shared:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Setup MinGW gcc
+        run: choco install mingw -y --no-progress
+      - name: Build ech-shared DLL
+        run: |
+          go build -buildmode=c-shared -trimpath -ldflags="-s -w" `
+            -o echshared.dll ./cmd/ech-shared
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vcshost.dll
+          path: echshared.dll
+
   release:
-    needs: build
+    needs: [build, build-shared]
     runs-on: ubuntu-latest
     permissions:
       contents: write
