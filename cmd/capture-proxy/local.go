@@ -445,6 +445,47 @@ func idleInject(model string) []byte {
 	return toolInject(model, "call_idle", infIdleArg)
 }
 
+// isConnLevelFail 区分「连接级失败」与「上游业务错误」: 连接/首 token 超时、
+// 预读 stall (lastErrBody==nil, 走 503) 或连接错误 (lastErrBody 为 UpstreamError,
+// 走 502) 视为连接级; 其余 (400/429 等带上游 body 的错误) 不是。
+// 目的: 连接级失败时对带 tools 的流式请求注入「echo 继续」, 业务错误仍透传。
+func isConnLevelFail(lastErrBody any, lastStatus int) bool {
+	if lastErrBody == nil {
+		return true // 预读 stall / 无响应体, 全部栈耗尽
+	}
+	if lastStatus != 502 {
+		return false
+	}
+	if obj, ok := lastErrBody.(map[string]any); ok {
+		if e, ok := obj["error"].(map[string]any); ok {
+			if t, _ := e["type"].(string); t == "UpstreamError" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// writeIdleSSE 以 200 SSE 直接输出「echo 继续」tool_call 收尾流 (含 [DONE]),
+// 用于连接级失败时代替 502/503 错误响应。
+func writeIdleSSE(w http.ResponseWriter, model string) {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	setCORS(h)
+	w.WriteHeader(200)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	if _, err := w.Write(idleInject(model)); err != nil {
+		log.Printf("write idle SSE: %v", err)
+		return
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ---- 抓包 (capture) ----------------------------------------------------------
 
 type capture struct {
@@ -1054,6 +1095,20 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		resp.Body.Close()
 	}
 
+	// v4/v6 双双达到日限额 (FreeUsageLimitError 冷却中) 或连接级失败 (预读等首
+	// token 超时 / 连接/握手/响应头超时 / 上游不可达): 都视为「上游暂时不可用」,
+	// 带 tools 的流式请求注入「echo 继续」正常收尾, 客户端工具循环继续而不是
+	// 收到 429/502/503 报错中断 (用户要求: v4/v6 exceed 也要正常结束)。
+	// 注意只在可恢复场景注入: 上游业务错误 (400 参数错误等) 仍原样透传,
+	// 避免对无效请求打无限续圈; 非 tools/非流式请求也仍按原样 429。
+	if isStream && recoverable {
+		bothCool := p.inCooldown("v4", time.Now()) && p.inCooldown("v6", time.Now())
+		if bothCool || isConnLevelFail(lastErrBody, lastStatus) {
+			log.Printf("all upstreams unavailable (cooldown=%v status=%d), inject idle", bothCool, lastStatus)
+			writeIdleSSE(w, model)
+			return
+		}
+	}
 	if p.inCooldown("v4", time.Now()) && p.inCooldown("v6", time.Now()) {
 		writeJSON(w, 429, map[string]any{"error": map[string]any{"message": "All IPs reached daily free usage limit", "type": freeLimitErr}})
 		return
