@@ -1594,13 +1594,13 @@ func runProvider(args []string) {
 	}
 
 	p := &proxy{
-		mode:       *mode,
-		v4URL:      "https://" + v4,
-		v6URL:      "https://[" + v6 + "]",
-		detect:     *detect,
-		famStats:   map[string]*famStat{},
-		start:      time.Now(),
-		usage:      newUsageStats(),
+		mode:     *mode,
+		v4URL:    "https://" + v4,
+		v6URL:    "https://[" + v6 + "]",
+		detect:   *detect,
+		famStats: map[string]*famStat{},
+		start:    time.Now(),
+		usage:    newUsageStats(),
 	}
 	if *outProxy != "" {
 		if err := p.px.set(*outProxy); err != nil {
@@ -1759,6 +1759,18 @@ func runProvider(args []string) {
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
 	}
+
+	// 每天 UTC+0 00:00 重置当天累计字节, 与 ip-proxy 的 /status 统计口径一致
+	// (ip-proxy server.go 同款定时器; 字节计数是累计 atomic, 不重置会越攒越大)。
+	go func() {
+		for {
+			time.Sleep(time.Until(nextUTCMidnight()))
+			log.Printf("UTC+0 00:00: 当天累计流量 ↑%.1fMB ↓%.1fMB, 重置",
+				float64(p.upBytes.Load())/1e6, float64(p.downBytes.Load())/1e6)
+			p.upBytes.Store(0)
+			p.downBytes.Store(0)
+		}
+	}()
 
 	log.Printf("Local proxy on %s (mode=%s, forward -> https://%s%s, capture=%v, detect=%v)",
 		*listen, *mode, zenHost, zenPath, cap != nil, *detect)
