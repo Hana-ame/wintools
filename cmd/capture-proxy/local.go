@@ -1095,22 +1095,32 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		resp.Body.Close()
 	}
 
-	// v4/v6 双双达到日限额 (FreeUsageLimitError 冷却中) 或连接级失败 (预读等首
-	// token 超时 / 连接/握手/响应头超时 / 上游不可达): 都视为「上游暂时不可用」,
-	// 带 tools 的流式请求注入「echo 继续」正常收尾, 客户端工具循环继续而不是
-	// 收到 429/502/503 报错中断 (用户要求: v4/v6 exceed 也要正常结束)。
-	// 注意只在可恢复场景注入: 上游业务错误 (400 参数错误等) 仍原样透传,
-	// 避免对无效请求打无限续圈; 非 tools/非流式请求也仍按原样 429。
-	if isStream && recoverable {
-		bothCool := p.inCooldown("v4", time.Now()) && p.inCooldown("v6", time.Now())
-		if bothCool || isConnLevelFail(lastErrBody, lastStatus) {
-			log.Printf("all upstreams unavailable (cooldown=%v status=%d), inject idle", bothCool, lastStatus)
-			writeIdleSSE(w, model)
-			return
+	// FreeUsageLimitError (日额超限) 是真实配额信号, 必须透传 429 而不是注入:
+	// auto 模式下 v4/v6 双栈都冷却 = 429; v4/v6 单栈模式下该栈冷却 = 429。
+	// (v2.4.2 曾把双栈冷却也归入注入, 理解错误改回 429。注意不能沿用
+	// inCooldown(v4)&&inCooldown(v6): 单栈模式只有一栈被栈表尝试, 另一栈永远
+	// 不冷却, 该条件永不成立, 超限会错误落到 503/注入。)
+	stacks_ := p.stacks(stackOverride)
+	allCool := len(stacks_) > 0
+	for _, fam := range stacks_ {
+		if !p.inCooldown(fam, time.Now()) {
+			allCool = false
+			break
 		}
 	}
-	if p.inCooldown("v4", time.Now()) && p.inCooldown("v6", time.Now()) {
+	if allCool {
 		writeJSON(w, 429, map[string]any{"error": map[string]any{"message": "All IPs reached daily free usage limit", "type": freeLimitErr}})
+		return
+	}
+	// 连接级失败 (预读等首 token 超时 / 连接/握手/响应头超时 / 上游不可达):
+	// 全部栈耗尽后, 带 tools 的流式请求注入「echo 继续」正常收尾, 客户端工具
+	// 循环继续而不是收到 502/503 报错中断 (用户要求: 连接时间过长 → 主动断开 +
+	// 无 toolcall 则补上 echo 继续)。
+	// 注意只在连接级失败注入: 上游业务错误 (400 参数错误、429 配额等) 仍原样
+	// 透传, 避免对无效请求打无限续圈; 非 tools/非流式请求也仍按原样报错。
+	if isStream && recoverable && isConnLevelFail(lastErrBody, lastStatus) {
+		log.Printf("all upstreams failed (status=%d), inject idle instead of error", lastStatus)
+		writeIdleSSE(w, model)
 		return
 	}
 	if lastErrBody != nil {
