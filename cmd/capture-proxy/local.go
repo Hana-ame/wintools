@@ -522,8 +522,10 @@ type proxy struct {
 	start    time.Time
 	usage    *usageStats
 
-	upBytes   atomic.Int64 // 上行字节: client -> 上游 (转发出去的请求载荷)
-	downBytes atomic.Int64 // 下行字节: 上游 -> client (转发回来的响应载荷)
+	// 原始字节统计: 在出站连接的传输层计字节 (Write=上行, Read=下行), 含 TLS
+	// 握手/HTTP 头/帧开销。与 ip-proxy 隧道侧的语义一致, 数值可直接对齐。
+	upBytes   atomic.Int64
+	downBytes atomic.Int64
 
 	// 外部 HTTP(S) 代理 (--proxy 或 POST /proxy 设置), 出站全部走它。
 	px proxyCfg
@@ -925,10 +927,8 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		bodyStr = string(re)
 	}
 
-	// 上行统计: client 发来的请求载荷 (gzip 已解压、重序列化后的 bodyStr,
-	// 即实际转发给上游的字节)。与 ip-proxy 的 up 语义一致 (client -> 目标)。
-	p.upBytes.Add(int64(len(bodyStr)))
-
+	// 上行字节不计在这里: 原始字节由 countingConn 在出站连接的传输层累计
+	// (含 TLS 握手/请求头), 与 ip-proxy 语义对齐, 见 makeClient 的 DialContext。
 	lastStatus := 0
 	var lastErrBody any
 	var lastHeaders http.Header
@@ -1044,7 +1044,6 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 			h.Set("Content-Type", "application/json")
 			setCORS(h)
 			w.WriteHeader(200)
-			p.downBytes.Add(int64(len(data)))
 			w.Write(data)
 			log.Printf("non-stream done")
 			return
@@ -1157,7 +1156,6 @@ func (p *proxy) forwardStream(w http.ResponseWriter, resp *http.Response, fam, m
 	total := len(pre)
 	write := func(b []byte) error {
 		total += len(b)
-		p.downBytes.Add(int64(len(b)))
 		_, err := w.Write(b)
 		if err == nil && flusher != nil {
 			flusher.Flush()
@@ -1336,7 +1334,6 @@ func (p *proxy) forwardPassthrough(w http.ResponseWriter, resp *http.Response, f
 					p.usage.add(model, false, u)
 				}
 				total += len(ev) + 2
-				p.downBytes.Add(int64(len(ev) + 2))
 				if _, err := w.Write(append(ev, '\n', '\n')); err != nil {
 					log.Printf("client disconnected mid-stream")
 					resp.Body.Close()
@@ -1495,6 +1492,32 @@ func ms(t, t0 time.Time) time.Duration {
 	return t.Sub(t0).Round(time.Millisecond)
 }
 
+// countingConn 包一层 net.Conn, 在传输层累计原始字节: Write=上行, Read=下行。
+// 用嵌入接口满足 http.Transport 需要的全部 net.Conn 方法, 不破坏连接池/TLS。
+// 在 DialContext 返回前包上, 之后 TLS 握手、请求头、HTTP/2 帧、响应体全部计数,
+// 与 ip-proxy 隧道侧的统计语义一致 (ip-proxy 也是包住连接在 Write 层计数)。
+type countingConn struct {
+	net.Conn
+	up   *atomic.Int64
+	down *atomic.Int64
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.up.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.down.Add(int64(n))
+	}
+	return n, err
+}
+
 // makeClient 构造到上游的 client。支持运行时切换的外部代理 (--proxy / POST
 // /proxy):
 //   - Proxy 函数每次读当前代理配置, 返回 nil URL = 直连;
@@ -1515,10 +1538,20 @@ func (p *proxy) makeClient(endpoint, sniHost string, forceH2 bool) *http.Client 
 		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+			var (
+				conn net.Conn
+				err  error
+			)
 			if _, da := p.px.get(); da != "" {
-				return d.DialContext(ctx, "tcp", da)
+				conn, err = d.DialContext(ctx, "tcp", da)
+			} else {
+				conn, err = d.DialContext(ctx, "tcp", endpoint)
 			}
-			return d.DialContext(ctx, "tcp", endpoint)
+			if err != nil {
+				return nil, err
+			}
+			// 原始字节统计: 包住刚拨出的连接, 让后续 TLS 握手/请求头/帧全部计入。
+			return &countingConn{Conn: conn, up: &p.upBytes, down: &p.downBytes}, nil
 		},
 		ResponseHeaderTimeout: 60 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
