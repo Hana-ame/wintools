@@ -798,11 +798,8 @@ func (p *proxy) cooldownSec(fam string, now time.Time) int {
 func (p *proxy) impersonate(req *http.Request, client http.Header) {
 	req.Header.Set("Content-Type", "application/json")
 	proxyheaders.ForwardRequestHeaders(req.Header, client)
-	if a := client.Get("Authorization"); a != "" {
-		req.Header.Set("Authorization", a)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+defaultAPIKey)
-	}
+	// 固定使用 public key, 无视客户端 Authorization (用户明确要求: 全部走公共免费通道)。
+	req.Header.Set("Authorization", "Bearer "+defaultAPIKey)
 	// 伪装 opencode client: 除非客户端本来就是真实 opencode (UA 以 opencode 开头),
 	// 否则强制覆盖为 opencode UA。curl / Go 等默认 UA 会被上游 Cloudflare 挑战 hang。
 	if ua := client.Get("User-Agent"); !strings.HasPrefix(strings.ToLower(ua), "opencode") {
