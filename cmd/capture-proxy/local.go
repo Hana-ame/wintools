@@ -1714,7 +1714,9 @@ func runProvider(args []string) {
 		}
 		writeJSON(w, 200, res)
 	})
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+	// 状态查询: 抽出为变量, 供 "/status" 和兜底路由的 GET 复用
+	// (所有 GET 请求都转发到 /status)。
+	status := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			writeJSON(w, 204, map[string]any{})
 			return
@@ -1743,10 +1745,23 @@ func runProvider(args []string) {
 			"stats":           stats,
 			"models":          p.usage.snapshot(),
 		})
-	})
+	}
+	mux.HandleFunc("/status", status)
+	// 兜底路由: 任何未匹配路径的 POST 都当 /chat/completions 转发,
+	// 任何 GET 都当 /status 查询 (兼容客户端发到自定义/其他路径的场景)。
+	// 控制 API (/mode /proxy /status) 因注册更具体路径优先匹配不受影响;
+	// 其余方法 (PUT/DELETE 等) 返回文本探测响应。
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			writeJSON(w, 204, map[string]any{})
+			return
+		}
+		if r.Method == "POST" {
+			p.handle(w, r, r.Method, cap)
+			return
+		}
+		if r.Method == "GET" {
+			status(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain")
