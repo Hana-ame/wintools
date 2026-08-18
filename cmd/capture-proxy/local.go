@@ -389,6 +389,14 @@ func (s *usageStats) snapshot() map[string]*modelStats {
 	return out
 }
 
+// reset 清空全部按模型累计的 usage。每日 UTC 午夜调用, 否则模型统计
+// 只增不减, /status 里的 input/output 会越攒越大, 与按天计费口径不符。
+func (s *usageStats) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.models = make(map[string]*modelStats)
+}
+
 func estCost(u *usage) float64 {
 	// 用 inputAndCache 拆过的值计费, 避免缓存 token 被 input 全价 + cache 折价重复计费。
 	input, cached := u.inputAndCache()
@@ -557,6 +565,22 @@ func (p *proxy) statsFor(fam string) *famStat {
 		p.famStats[fam] = s
 	}
 	return s
+}
+
+// resetDaily 每日 UTC 午夜清零全部当天累计统计: 字节流量 + 按协议族的
+// reqs/ok/errs/free (famStats) + 按模型的 usage 计费。famStats 与 usage
+// 都是累计值, 不随天自然归零, 不重置的话 /status 会越攒越大。
+func (p *proxy) resetDaily() {
+	p.upBytes.Store(0)
+	p.downBytes.Store(0)
+	p.mu.Lock()
+	for _, s := range p.famStats {
+		s.mu.Lock()
+		s.reqs, s.ok, s.errs, s.free = 0, 0, 0, 0
+		s.mu.Unlock()
+	}
+	p.mu.Unlock()
+	p.usage.reset()
 }
 
 func (p *proxy) currentMode() string {
@@ -1757,15 +1781,15 @@ func runProvider(args []string) {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	// 每天 UTC+0 00:00 重置当天累计字节, 与 ip-proxy 的 /status 统计口径一致
-	// (ip-proxy server.go 同款定时器; 字节计数是累计 atomic, 不重置会越攒越大)。
+	// 每天 UTC+0 00:00 重置当天全部累计统计 (流量 + v4/v6 协议族统计 +
+	// 按模型 usage: requests/input/cache_read/cache_write/output/reasoning/cost),
+	// 与 ip-proxy 的 /status 统计口径一致 (ip-proxy server.go 同款定时器)。
 	go func() {
 		for {
 			time.Sleep(time.Until(nextUTCMidnight()))
 			log.Printf("UTC+0 00:00: 当天累计流量 ↑%.1fMB ↓%.1fMB, 重置",
 				float64(p.upBytes.Load())/1e6, float64(p.downBytes.Load())/1e6)
-			p.upBytes.Store(0)
-			p.downBytes.Store(0)
+			p.resetDaily()
 		}
 	}()
 
