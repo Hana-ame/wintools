@@ -37,6 +37,10 @@
         "zen.l.moonchan.xyz": {
             "host": "opencode.ai"
         },
+        "sensenova.l.moonchan.xyz": {
+            "host": "token.sensenova.cn",
+            "mode": "direct"
+        },
         "dlsite.l.moonchan.xyz": {
             "host": "www.dlsite.com",
             "referer": "https://www.dlsite.com/",
