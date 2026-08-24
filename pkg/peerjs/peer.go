@@ -38,6 +38,9 @@ type Config struct {
 	Token    string // 随机生成即可
 	Debug    bool
 	PingWait time.Duration
+	// ICEHook 可选：定制 PeerConnection 配置（测试注入 loopback 候选、
+	// 部署换自建 TURN 等）。在 NewPeerConnection 构造前同步调用。
+	ICEHook func(*webrtc.Configuration, *webrtc.SettingEngine)
 }
 
 type ServerMessage struct {
@@ -208,7 +211,13 @@ func (p *Peer) handleLoop() {
 }
 
 func (p *Peer) retrieveID(ctx context.Context) (string, error) {
-	scheme := "https"
+	// scheme 跟随 Secure：retrieveID 旧版写死 https，导致自托管 http
+	// 信令（如本地 peerserver）借 ID 直接报 "server gave HTTP response to
+	// HTTPS client"。与 Start() 的 ws/wss 选择保持一致。
+	scheme := "http"
+	if p.cfg.Secure || p.cfg.Port == 443 {
+		scheme = "https"
+	}
 	host := fmt.Sprintf("%s:%d", p.cfg.Host, p.cfg.Port)
 	if p.cfg.Port == 443 {
 		host = p.cfg.Host
@@ -353,13 +362,16 @@ func (p *Peer) Connect(ctx context.Context, remote string) (*DataConnection, err
 	connectionId := "dc_" + randomToken()
 	dc := p.newDataConnection(remote, connectionId, connectionId, "binary", true)
 
-	pc, err := newPeerConnection(connectionId)
+	pc, err := newPeerConnection(connectionId, &p.cfg)
 	if err != nil {
 		return nil, err
 	}
 	dc.pc = pc
 
-	label := "http"
+	// serialization 必须声明 "raw": 浏览器 peerjs 会沿用 offerer 声明的序列化
+	// 方式,默认 "binary" 是 BinaryPack 编码,Go 侧裸字节对不上;raw 模式下
+	// string=文本帧 / ArrayBuffer=二进制帧直传,与 SendText/Send 一致。
+	label := "media"
 	opts := &webrtc.DataChannelInit{Ordered: &dc.reliable}
 	rdc, err := pc.CreateDataChannel(label, opts)
 	if err != nil {
@@ -402,7 +414,7 @@ func (p *Peer) Connect(ctx context.Context, remote string) (*DataConnection, err
 			"connectionId":  connectionId,
 			"label":         label,
 			"reliable":      true,
-			"serialization": "binary",
+			"serialization": "raw",
 		}),
 	})
 	p.Debugf("offer sent to %s conn=%s", remote, connectionId)

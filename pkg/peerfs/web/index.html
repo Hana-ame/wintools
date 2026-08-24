@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>peerfs — 浏览器文件浏览</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background: #111; color: #ddd; margin: 0; padding: 16px; max-width: 960px; margin-inline: auto; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: #1b1b1f; border-radius: 8px; padding: 10px; margin-bottom: 12px; }
+  .bar input { background: #26262c; border: 1px solid #3a3a44; color: #eee; border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+  #host { width: 170px; } #port { width: 64px; } #peerId { width: 150px; } #token { width: 110px; }
+  button { background: #3b6ea5; color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-size: 13px; }
+  button:hover { filter: brightness(1.15); }
+  button.sec { background: transparent; border: 1px solid #3a3a44; color: #aaa; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; margin-right: 4px; }
+  .dot.on { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+  .dot.err { background: #e5534b; }
+  #status { font-size: 13px; color: #999; }
+  .crumbs { margin: 8px 0; font-size: 14px; }
+  .crumbs a { color: #7ab3e0; cursor: pointer; text-decoration: none; margin-right: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #24242a; }
+  tr:hover td { background: #1c1c22; }
+  a.name { color: #cde3f7; cursor: pointer; text-decoration: none; }
+  td.size { color: #888; white-space: nowrap; }
+  td.act { text-align: right; white-space: nowrap; }
+  td.act button { padding: 3px 10px; font-size: 12px; background: #2c2c33; }
+  dialog { background: #16161a; color: #ddd; border: 1px solid #333; border-radius: 10px; max-width: 92vw; }
+  dialog::backdrop { background: rgba(0,0,0,.65); }
+  dialog img, dialog video { max-width: 88vw; max-height: 78vh; display: block; margin-bottom: 8px; background: #000; }
+  .empty { color: #777; padding: 24px 0; text-align: center; }
+</style>
+</head>
+<body>
+<h1><span class="dot" id="dot"></span> peerfs <span id="status">未连接</span></h1>
+
+<div class="bar">
+  <input id="host" placeholder="信令 host" title="信令服务器 host（同机部署时=本页地址的 host）">
+  <input id="port" type="number" placeholder="port" title="信令端口">
+  <label style="font-size:13px"><input type="checkbox" id="secure"> TLS</label>
+  <input id="key" placeholder="key" value="peerjs" style="width:80px">
+  <input id="peerId" placeholder="节点 peer id" title="后端节点的 PeerJS ID">
+  <input id="token" placeholder="token(可选)" title="数据面 hello 校验 token">
+  <button id="btnConn">连接</button>
+</div>
+
+<div class="crumbs" id="crumbs"></div>
+<table id="tbl" style="display:none">
+  <thead><tr><th>名称</th><th>大小</th><th></th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div class="empty" id="empty">连接节点后浏览文件</div>
+
+<dialog id="dlg">
+  <div id="dlgBody"></div>
+  <button onclick="document.getElementById('dlg').close()">关闭</button>
+</dialog>
+
+<script src="bridge.js"></script>
+<script>
+window.__PEERFS__ = __PEERFS_CONFIG__;
+</script>
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var fs = null, cwd = '/';
+
+  // 配置优先级：URL 参数 > 节点注入 config > 默认
+  async function loadConfig() {
+    var cfg = {};
+    try {
+      var r = await fetch('config.json');
+      if (r.ok) cfg = await r.json();
+    } catch (e) { /* 静态托管场景无 config.json */ }
+    var sig = cfg.signaling || {};
+    var q = new URLSearchParams(location.search);
+    return {
+      host: q.get('host') || sig.host || '0.peerjs.com',
+      port: +(q.get('port') || sig.port || (location.protocol === 'https:' ? 443 : (sig.port || 443))),
+      secure: q.get('secure') ? q.get('secure') === '1' : (sig.secure !== undefined ? !!sig.secure : location.protocol === 'https:'),
+      key: q.get('key') || sig.key || 'peerjs',
+      peerId: q.get('peer') || cfg.peerId || '',
+      token: localStorage.getItem('peerfs_token') || '',
+    };
+  }
+
+  function fillForm(c) {
+    $('host').value = c.host; $('port').value = c.port;
+    $('secure').checked = c.secure; $('key').value = c.key;
+    if (c.peerId) $('peerId').value = c.peerId;
+    if (c.token) $('token').value = c.token;
+  }
+
+  function status(txt, cls) {
+    $('status').textContent = txt;
+    $('dot').className = 'dot' + (cls ? ' ' + cls : '');
+  }
+
+  function fmtSize(n) {
+    if (!n && n !== 0) return '';
+    var u = ['B', 'KB', 'MB', 'GB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i ? n.toFixed(1) : n) + ' ' + u[i];
+  }
+
+  function kind(name) {
+    var ext = (name.split('.').pop() || '').toLowerCase();
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 'svg'].indexOf(ext) >= 0) return 'image';
+    if (['mp4', 'webm', 'mkv', 'mov', 'm4v'].indexOf(ext) >= 0) return 'video';
+    if (['mp3', 'ogg', 'wav', 'flac', 'm4a'].indexOf(ext) >= 0) return 'audio';
+    return 'other';
+  }
+
+  function crumbs(p) {
+    var el = $('crumbs'); el.innerHTML = '';
+    var parts = p.split('/').filter(Boolean);
+    var mk = function (txt, path) {
+      var a = document.createElement('a'); a.textContent = txt;
+      a.onclick = function () { browse(path); };
+      el.appendChild(a); el.appendChild(document.createTextNode(' / '));
+    };
+    mk('root', '/');
+    var acc = '';
+    parts.forEach(function (seg) { acc += '/' + seg; mk(seg, acc); });
+  }
+
+  async function browse(path) {
+    try {
+      var entries = await fs.list(path);
+      cwd = path; crumbs(path);
+      $('tbl').style.display = ''; $('empty').style.display = 'none';
+      var rows = $('rows'); rows.innerHTML = '';
+      entries.sort(function (a, b) { return (b.dir - a.dir) || a.name.localeCompare(b.name); });
+      entries.forEach(function (e) {
+        var tr = document.createElement('tr');
+        var full = (path === '/' ? '' : path) + '/' + e.name;
+        var nameTd = document.createElement('td');
+        var a = document.createElement('a'); a.className = 'name'; a.textContent = (e.dir ? '📁 ' : '') + e.name;
+        a.onclick = function () { e.dir ? browse(full) : openFile(e.name, full); };
+        nameTd.appendChild(a);
+        var sizeTd = document.createElement('td'); sizeTd.className = 'size';
+        sizeTd.textContent = e.dir ? '' : fmtSize(e.size);
+        var actTd = document.createElement('td'); actTd.className = 'act';
+        var k = kind(e.name);
+        if (!e.dir && k !== 'other') {
+          var b = document.createElement('button'); b.textContent = '预览';
+          b.onclick = function () { openFile(e.name, full); };
+          actTd.appendChild(b);
+        }
+        tr.appendChild(nameTd); tr.appendChild(sizeTd); tr.appendChild(actTd);
+        rows.appendChild(tr);
+      });
+    } catch (err) {
+      status('list 失败: ' + err.message, 'err');
+    }
+  }
+
+  async function openFile(name, full) {
+    var dlg = $('dlg'), body = $('dlgBody');
+    body.textContent = '加载中… (' + name + ')';
+    dlg.showModal();
+    try {
+      var k = kind(name), url = await fs.url(full);
+      body.innerHTML = '';
+      if (k === 'image') {
+        var img = new Image(); img.src = url; body.appendChild(img);
+      } else {
+        var v = document.createElement(k === 'audio' ? 'audio' : 'video');
+        v.src = url; v.controls = true; if (k === 'video') { v.autoplay = true; }
+        body.appendChild(v);
+      }
+    } catch (err) {
+      body.textContent = '加载失败: ' + err.message;
+    }
+  }
+
+  async function connect() {
+    var c = {
+      host: $('host').value.trim(), port: +$('port').value,
+      secure: $('secure').checked, key: $('key').value.trim(),
+      peerId: $('peerId').value.trim(), token: $('token').value,
+    };
+    localStorage.setItem('peerfs_token', c.token);
+    if (fs) { try { fs.close(); } catch (e) {} fs = null; }
+    status('连接中…');
+    try {
+      fs = await new PeerFS(c).connect();
+      status('已连接 → ' + c.peerId, 'on');
+      browse('/');
+    } catch (err) {
+      status('连接失败: ' + err.message, 'err');
+    }
+  }
+
+  $('btnConn').onclick = connect;
+  $('token').addEventListener('keydown', function (e) { if (e.key === 'Enter') connect(); });
+
+  loadConfig().then(function (c) { fillForm(c); if (c.peerId) connect(); });
+})();
+</script>
+</body>
+</html>
