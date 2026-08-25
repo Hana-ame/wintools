@@ -17,8 +17,13 @@ var webFiles embed.FS
 //	GET /__peerfs/             页面（bridge.js + index.html）
 //	GET /__peerfs/config.json  节点配置（peer id + 信令坐标），页面自动加载
 func (n *Node) MountConsole(mux *http.ServeMux) {
-	mux.HandleFunc("/__peerfs", n.serveConsole)
 	mux.HandleFunc("/__peerfs/", n.serveConsoleAssets)
+	mux.HandleFunc("/__peerfs", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/__peerfs/", http.StatusFound)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/__peerfs/", http.StatusFound)
+	})
 }
 
 // 配置占位符：index.html 里 window.__PEERFS__ = __PEERFS_CONFIG__; 的
@@ -73,8 +78,10 @@ func (n *Node) signalingJSON() map[string]any {
 	sig := n.cfg.Signaling
 	host := sig.Host
 	port := sig.Port
-	if host == "" && port == 0 {
-		return nil // 未配置 → 页面走公共云默认或 URL 参数覆盖
+	// 内嵌信令：节点连 127.0.0.1/localhost，但浏览器应使用页面 host
+	// 返回空 host 让页面侧用 location.hostname 而非公共云
+	if host == "" || host == "127.0.0.1" || host == "localhost" {
+		return map[string]any{"host": "", "port": 0, "secure": false, "key": sig.Key}
 	}
 	if port == 0 {
 		port = 443

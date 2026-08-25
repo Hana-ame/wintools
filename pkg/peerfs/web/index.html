@@ -71,18 +71,23 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
   var fs = null, cwd = '/';
 
   // 配置优先级：URL 参数 > 节点注入 config > 默认
+  // 节点注入的 sig.host="" 表示「内嵌信令，用同源 location.host」
   async function loadConfig() {
     var cfg = {};
     try {
       var r = await fetch('config.json');
       if (r.ok) cfg = await r.json();
     } catch (e) { /* 静态托管场景无 config.json */ }
-    var sig = cfg.signaling || {};
+    var sig = (cfg.signaling != null) ? cfg.signaling : {};
     var q = new URLSearchParams(location.search);
+    // 如果 sig.host 是空字符串（内嵌信令标志），且 URL 参数没覆盖，则用页面 host
+    var useSameHost = (sig.host === '' && !q.has('host'));
+    // location.port 在 80/443 时返回空字符串
+    var pagePort = location.port || (location.protocol === 'https:' ? 443 : 80);
     return {
-      host: q.get('host') || sig.host || '0.peerjs.com',
-      port: +(q.get('port') || sig.port || (location.protocol === 'https:' ? 443 : (sig.port || 443))),
-      secure: q.get('secure') ? q.get('secure') === '1' : (sig.secure !== undefined ? !!sig.secure : location.protocol === 'https:'),
+      host: q.get('host') || (useSameHost ? location.hostname : sig.host) || '0.peerjs.com',
+      port: +(q.get('port') || (useSameHost ? pagePort : sig.port) || 443),
+      secure: q.get('secure') ? q.get('secure') === '1' : (useSameHost ? (location.protocol === 'https:') : (sig.secure !== undefined ? !!sig.secure : location.protocol === 'https:')),
       key: q.get('key') || sig.key || 'peerjs',
       peerId: q.get('peer') || cfg.peerId || '',
       token: localStorage.getItem('peerfs_token') || '',

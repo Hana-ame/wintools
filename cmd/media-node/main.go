@@ -14,8 +14,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Hana-ame/wintools/pkg/peerfs"
 )
@@ -23,7 +26,7 @@ import (
 func main() {
 	var (
 		dir    = flag.String("dir", ".", "文件服务根目录")
-		listen = flag.String("listen", ":8090", "HTTP 监听（控制台页 + 可选内嵌信令）")
+		listen = flag.String("listen", "0.0.0.0:8000", "HTTP 监听（控制台页 + 可选内嵌信令）")
 		name   = flag.String("name", "", "节点 peer id 后缀，最终 id = wt-media-<name>；空 = 借随机 id")
 		token  = flag.String("token", "", "数据面 hello 校验 token；空 = 不校验")
 
@@ -53,8 +56,14 @@ func main() {
 
 	sig := peerfs.Signaling{Host: *shost, Port: *sport, Secure: *ssecure, Key: *key}
 	if *signal {
-		// 内嵌信令与控制台同源同端口：Signaling 留空，页面用 location.host。
-		sig = peerfs.Signaling{Key: *key, Secure: false}
+		// 内嵌信令：节点连本地信令（同源同端口），页面也连同源信令
+		localPort := 8000
+		if s := strings.Split(*listen, ":"); len(s) > 1 {
+			if p, err := strconv.Atoi(s[len(s)-1]); err == nil {
+				localPort = p
+			}
+		}
+		sig = peerfs.Signaling{Host: "127.0.0.1", Port: localPort, Secure: false, Key: *key}
 	}
 
 	node := peerfs.New(peerfs.Config{
@@ -66,6 +75,30 @@ func main() {
 	})
 	node.MountConsole(mux)
 
+	// 先起 HTTP 再连信令：内嵌信令时节点要连自己的 HTTP 端口
+	srv := &http.Server{Addr: *listen, Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	// 等 HTTP 端口就绪（最长 5 秒）
+	ready := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			conn, err := net.DialTimeout("tcp", *listen, 50*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				close(ready)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		log.Fatalf("port %s not ready after 5s", *listen)
+	}()
+	<-ready
+
 	ctx := context.Background()
 	if err := node.Start(ctx); err != nil {
 		log.Fatalf("peer start: %v", err)
@@ -73,9 +106,7 @@ func main() {
 	log.Printf("peer id: %s  root: %s", node.ID(), *dir)
 	log.Printf("console: http://127.0.0.1%s/__peerfs/", *listen)
 
-	if err := http.ListenAndServe(*listen, mux); err != nil {
-		log.Fatalf("listen: %v", err)
-	}
+	select {} // 阻塞主 goroutine
 }
 
 func joinID(name string) string {

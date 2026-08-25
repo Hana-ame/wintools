@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>peerfs - 节点浏览</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #ddd; margin: 0; padding: 16px; max-width: 960px; margin-inline: auto; }
+    h1 { font-size: 18px; margin: 0 0 12px; }
+    .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: #1b1b1f; border-radius: 8px; padding: 10px; margin-bottom: 12px; }
+    .bar input { background: #26262c; border: 1px solid #3a3a44; color: #eee; border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+    #srv { width: 170px; } #port { width: 64px; }
+    button { background: #3b6ea5; color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-size: 13px; }
+    button:hover { filter: brightness(1.15); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; margin-right: 4px; }
+    .dot.on { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+    .dot.err { background: #e5534b; }
+    #status { font-size: 13px; color: #999; }
+    .node-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .node-card { background: #1b1b1f; border: 1px solid #2a2a30; border-radius: 8px; padding: 10px; cursor: pointer; width: 200px; }
+    .node-card:hover { border-color: #3b6ea5; }
+    .node-card.active { border-color: #4caf50; }
+    .node-card .name { font-weight: bold; color: #cde3f7; }
+    .node-card .tags { margin-top: 4px; font-size: 11px; }
+    .node-card .tag { display: inline-block; background: #2a2a30; color: #999; border-radius: 4px; padding: 1px 6px; margin-right: 3px; }
+    .node-card .status { font-size: 11px; margin-top: 4px; color: #666; }
+    .node-card .status.on { color: #4caf50; }
+    .crumbs { margin: 8px 0; font-size: 14px; }
+    .crumbs a { color: #7ab3e0; cursor: pointer; text-decoration: none; margin-right: 2px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #24242a; }
+    tr:hover td { background: #1c1c22; }
+    a.name { color: #cde3f7; cursor: pointer; text-decoration: none; }
+    td.size { color: #888; white-space: nowrap; }
+    td.act { text-align: right; white-space: nowrap; }
+    td.act button { padding: 3px 10px; font-size: 12px; background: #2c2c33; }
+    dialog { background: #16161a; color: #ddd; border: 1px solid #333; border-radius: 10px; max-width: 92vw; }
+    dialog::backdrop { background: rgba(0,0,0,.65); }
+    dialog img, dialog video { max-width: 88vw; max-height: 78vh; display: block; margin-bottom: 8px; background: #000; }
+    .empty { color: #777; padding: 24px 0; text-align: center; }
+  </style>
+</head>
+<body>
+  <h1><span class="dot" id="dot"></span> peerfs <span id="status">未连接</span></h1>
+  <div class="bar">
+    <input id="srv" placeholder="信令 host">
+    <input id="port" type="number" placeholder="port" style="width:64px">
+    <label style="font-size:13px"><input type="checkbox" id="secure"> TLS</label>
+    <input id="token" placeholder="token" style="width:110px">
+    <button id="initBtn">连接信令</button>
+  </div>
+  <div id="nodesPanel" style="display:none">
+    <h2>在线节点</h2>
+    <div class="node-list" id="nodeList"></div>
+  </div>
+  <div id="filePanel" style="display:none">
+    <h2 id="currentNode">文件浏览</h2>
+    <div class="crumbs" id="crumbs"></div>
+    <table id="tbl" style="display:none">
+      <thead><tr><th>名称</th><th>大小</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty">选择一个节点浏览文件</div>
+  </div>
+  <dialog id="dlg">
+    <div id="dlgBody"></div>
+    <button onclick="document.getElementById('dlg').close()">关闭</button>
+  </dialog>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script>
+    var peer = null;
+    var connections = {};
+    var currentNode = null;
+    var myId = 'web-' + Math.random().toString(36).slice(2, 8);
+    var baseUrl = '';
+
+    function $(id) { return document.getElementById(id); }
+    function status(txt, cls) {
+      $('status').textContent = txt;
+      $('dot').className = 'dot' + (cls ? ' ' + cls : '');
+    }
+    function genReqId() { return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+    function fmtSize(n) {
+      if (!n && n !== 0) return '';
+      var u = ['B','KB','MB','GB'], i = 0;
+      while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+      return (i ? n.toFixed(1) : n) + ' ' + u[i];
+    }
+    function kind(name) {
+      var ext = (name.split('.').pop() || '').toLowerCase();
+      if (['jpg','jpeg','png','gif','webp','avif','bmp','svg'].indexOf(ext) >= 0) return 'image';
+      if (['mp4','webm','mkv','mov','m4v'].indexOf(ext) >= 0) return 'video';
+      if (['mp3','ogg','wav','flac','m4a'].indexOf(ext) >= 0) return 'audio';
+      return 'other';
+    }
+
+    function destroy() {
+      for (var k in connections) {
+        try { connections[k].conn.close(); } catch(e) {}
+      }
+      connections = {};
+      currentNode = null;
+      if (peer) { try { peer.destroy(); } catch(e){} peer = null; }
+    }
+
+    function init() {
+      destroy();
+      var host = $('srv').value.trim();
+      var port = parseInt($('port').value, 10) || 8000;
+      var secure = $('secure').checked;
+      var protocol = secure ? 'https://' : 'http://';
+      baseUrl = protocol + host + ':' + port;
+
+      peer = new Peer(myId, {
+        host: host, port: port, path: '/', key: 'peerjs', secure: secure, debug: 2,
+        config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
+      });
+
+      peer.on('open', function(pid) {
+        myId = pid;
+        status('信令已连接，ID=' + pid, 'on');
+        $('nodesPanel').style.display = '';
+        $('filePanel').style.display = 'none';
+        fetchNodes();
+        setInterval(function() { fetchNodes(); }, 10000);
+      });
+      peer.on('connection', function(c) {});
+      peer.on('disconnected', function() { status('信令断开'); });
+      peer.on('error', function(err) { status('错误: ' + err.type, 'err'); });
+    }
+
+    function fetchNodes() {
+      fetch(baseUrl + '/discover/nodes')
+        .then(function(r) { return r.json(); })
+        .then(function(data) { renderNodeList(data.nodes || []); })
+        .catch(function(err) {});
+    }
+
+    function renderNodeList(nodes) {
+      var el = $('nodeList');
+      el.innerHTML = '';
+      nodes.forEach(function(n) {
+        if (n.peerId === myId) return;
+        var card = document.createElement('div');
+        card.className = 'node-card';
+        if (n.peerId === currentNode) card.className += ' active';
+        var nameDiv = document.createElement('div');
+        nameDiv.className = 'name';
+        nameDiv.textContent = n.peerId;
+        card.appendChild(nameDiv);
+        // NodeType badge
+        if (n.nodeType) {
+          var typeSpan = document.createElement('span');
+          typeSpan.className = 'tag';
+          typeSpan.textContent = n.nodeType;
+          typeSpan.style.cssText = 'background:#3b6ea5;color:#fff;';
+          nameDiv.appendChild(document.createTextNode(' '));
+          nameDiv.appendChild(typeSpan);
+        }
+        // Tags
+        if (n.collections && n.collections.length) {
+          var tagsDiv = document.createElement("div");
+          tagsDiv.className = "tags";
+          n.collections.forEach(function(c) {
+            var tag = document.createElement("span");
+            tag.className = "tag";
+            tag.textContent = c;
+            tagsDiv.appendChild(tag);
+          });
+          card.appendChild(tagsDiv);
+        }
+        // Stats
+        if (n.uptime || n.uploadBytes || n.downloadBytes) {
+          var statsDiv = document.createElement('div');
+          statsDiv.className = 'tags';
+          var parts = [];
+          if (n.uptime) parts.push(Math.floor(n.uptime / 60) + 'm online');
+          if (n.uploadBytes) parts.push(fmtSize(n.uploadBytes) + ' up');
+          if (n.downloadBytes) parts.push(fmtSize(n.downloadBytes) + ' down');
+          statsDiv.textContent = parts.join(' | ');
+          card.appendChild(statsDiv);
+        }
+        var statusDiv = document.createElement('div');
+        statusDiv.className = 'status';
+        if (connections[n.peerId]) {
+          statusDiv.className += ' on';
+          statusDiv.textContent = '已连接';
+        } else {
+          statusDiv.textContent = '点击连接';
+        }
+        card.appendChild(statusDiv);
+        card.onclick = function() {
+          if (connections[n.peerId]) switchNode(n.peerId);
+          else connectNode(n.peerId);
+        };
+        el.appendChild(card);
+      });
+      if (nodes.length === 0) {
+        el.innerHTML = '<div class="empty">暂无在线节点</div>';
+      }
+    }
+
+    function connectNode(nodeId) {
+      if (!peer) return;
+      status('连接 ' + nodeId + '...');
+      var c = peer.connect(nodeId, { serialization: 'raw', reliable: true });
+      var state = { conn: c, cwd: '/', pending: new Map(), streams: new Map(), reqToStream: new Map() };
+      connections[nodeId] = state;
+      currentNode = nodeId;
+      c.on('open', function() {
+        // send hello first (token optional; server ignores if no token configured)
+        var token = $('token').value.trim();
+        c.send(JSON.stringify({ type: 'hello', token: token }));
+        status('已连接 -> ' + nodeId, 'on');
+        switchNode(nodeId);
+      });
+      c.on('data', function(d) { onData(nodeId, d); });
+      c.on('close', function() {
+        status(nodeId + ' 断开');
+        delete connections[nodeId];
+        if (currentNode === nodeId) {
+          currentNode = null;
+          $('filePanel').style.display = 'none';
+        }
+        fetchNodes();
+      });
+      c.on('error', function() { status(nodeId + ' 连接错误', 'err'); });
+    }
+
+    function switchNode(nodeId) {
+      currentNode = nodeId;
+      var state = connections[nodeId];
+      if (!state) return;
+      $('currentNode').textContent = '文件浏览 - ' + nodeId;
+      $('filePanel').style.display = '';
+      state.cwd = '/';
+      browseNode(nodeId, '/');
+    }
+
+    function onData(nodeId, d) {
+      var state = connections[nodeId];
+      if (!state) return;
+      if (typeof d === 'string') {
+        var h;
+        try { h = JSON.parse(d); } catch(e) { return; }
+        if (h.type === 'meta') {
+          var st = { chunks: [], received: 0, total: h.total };
+          state.streams.set(h.streamId, st);
+          state.reqToStream.set(h.reqId, h.streamId);
+          return;
+        }
+        var p = state.pending.get(h.reqId);
+        if (!p) {
+          if (h.type === 'err') {
+            status(nodeId + ' error: ' + (h.msg || 'unknown'), 'err');
+          }
+          return;
+        }
+        state.pending.delete(h.reqId);
+        var sid = state.reqToStream.get(h.reqId);
+        state.reqToStream.delete(h.reqId);
+        var st = state.streams.get(sid);
+        state.streams.delete(sid);
+        if (h.type === 'entries') {
+          p.resolve(h.entries || []);
+        } else if (h.type === 'done') {
+          if (st && st.total >= 0 && st.received !== st.total)
+            p.reject(new Error('truncated: ' + st.received + '/' + st.total));
+          else p.resolve(new Blob(st ? st.chunks : [], {type: 'application/octet-stream'}));
+        } else {
+          p.reject(new Error(h.msg || h.type));
+        }
+        return;
+      }
+      if (d.byteLength < 4) return;
+      var view = new DataView(d);
+      var streamId = view.getUint32(0, false);
+      var chunk = d.slice(4);
+      var st = state.streams.get(streamId);
+      if (st) { st.chunks.push(chunk); st.received += chunk.byteLength; }
+    }
+
+    function browseNode(nodeId, p) {
+      listNode(nodeId, p).then(function(entries) {
+        var state = connections[nodeId];
+        if (!state) return;
+        state.cwd = p;
+        renderCrumbs(nodeId, p);
+        $('tbl').style.display = ''; $('empty').style.display = 'none';
+        var rows = $('rows'); rows.innerHTML = '';
+        entries.sort(function(a,b) { return (b.dir - a.dir) || a.name.localeCompare(b.name); });
+        entries.forEach(function(e) {
+          var tr = document.createElement('tr');
+          var full = (p === '/' ? '' : p) + '/' + e.name;
+          var nameTd = document.createElement('td');
+          var a = document.createElement('a'); a.className = 'name';
+          a.textContent = (e.dir ? '? ' : '') + e.name;
+          a.onclick = function() { e.dir ? browseNode(nodeId, full) : openFileNode(nodeId, e.name, full); };
+          nameTd.appendChild(a);
+          var sizeTd = document.createElement('td'); sizeTd.className = 'size';
+          sizeTd.textContent = e.dir ? '' : fmtSize(e.size);
+          var actTd = document.createElement('td'); actTd.className = 'act';
+          var k = kind(e.name);
+          if (!e.dir && k !== 'other') {
+            var b = document.createElement('button'); b.textContent = '预览';
+            b.onclick = function() { openFileNode(nodeId, e.name, full); };
+            actTd.appendChild(b);
+          }
+          tr.appendChild(nameTd); tr.appendChild(sizeTd); tr.appendChild(actTd);
+          rows.appendChild(tr);
+        });
+      }).catch(function(err) { status('list 失败: ' + err.message, 'err'); });
+    }
+
+    function renderCrumbs(nodeId, p) {
+      var el = $('crumbs'); el.innerHTML = '';
+      var mk = function(txt, path) {
+        var a = document.createElement('a'); a.textContent = txt;
+        a.onclick = function() { browseNode(nodeId, path); };
+        el.appendChild(a); el.appendChild(document.createTextNode(' / '));
+      };
+      mk('root', '/');
+      var acc = '';
+      p.split('/').filter(Boolean).forEach(function(seg) { acc += '/' + seg; mk(seg, acc); });
+    }
+
+    function listNode(nodeId, p) {
+      return new Promise(function(resolve, reject) {
+        var state = connections[nodeId];
+        if (!state) { reject(new Error('not connected')); return; }
+        var reqId = genReqId();
+        state.pending.set(reqId, { resolve: resolve, reject: reject });
+        state.conn.send(JSON.stringify({ type: 'list', path: p, reqId: reqId }));
+      });
+    }
+
+    function readNode(nodeId, filePath, opts) {
+      opts = opts || {};
+      return new Promise(function(resolve, reject) {
+        var state = connections[nodeId];
+        if (!state) { reject(new Error('not connected')); return; }
+        var reqId = genReqId();
+        state.pending.set(reqId, { resolve: resolve, reject: reject });
+        state.conn.send(JSON.stringify({
+          type: 'read', path: filePath,
+          offset: opts.offset|0,
+          size: opts.size === undefined ? -1 : opts.size,
+          reqId: reqId
+        }));
+      });
+    }
+
+    function openFileNode(nodeId, name, full) {
+      var dlg = $('dlg'), body = $('dlgBody');
+      body.textContent = '加载中... (' + name + ')';
+      dlg.showModal();
+      readNode(nodeId, full).then(function(blob) {
+        var url = URL.createObjectURL(blob);
+        body.innerHTML = '';
+        var k = kind(name);
+        if (k === 'image') {
+          var img = new Image(); img.src = url; body.appendChild(img);
+        } else {
+          var v = document.createElement(k === 'audio' ? 'audio' : 'video');
+          v.src = url; v.controls = true; if (k === 'video') v.autoplay = true;
+          body.appendChild(v);
+        }
+        // Make image/video clickable to toggle fullscreen
+        var media = k === 'image' ? img : v;
+        var fullscreen = false;
+        media.style.cursor = 'pointer';
+        media.onclick = function() {
+          if (fullscreen) {
+            dlg.style.width = '';
+            dlg.style.maxWidth = '92vw';
+            fullscreen = false;
+          } else {
+            dlg.style.width = '100vw';
+            dlg.style.maxWidth = '100vw';
+            dlg.style.height = '100vh';
+            dlg.style.maxHeight = '100vh';
+            if (k === 'image') {
+              img.style.maxWidth = '100vw';
+              img.style.maxHeight = '100vh';
+          } else {
+              v.style.maxWidth = '100vw';
+              v.style.maxHeight = '100vh';
+          }
+            fullscreen = true;
+          }
+        };
+      }).catch(function(err) { body.textContent = '加载失败: ' + err.message; });
+    }
+
+    $('initBtn').onclick = init;
+    (function autoFill() {
+      var loc = window.location;
+      $('srv').value = loc.hostname || 'localhost';
+      var p = parseInt(loc.port, 10);
+      $('port').value = p ? p : (loc.protocol === 'https:' ? 443 : 80);
+      $('secure').checked = (loc.protocol === 'https:');
+    })();
+  </script>
+</body>
+</html>
