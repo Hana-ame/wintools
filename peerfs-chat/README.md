@@ -315,19 +315,21 @@ go run ./cmd/peerfs-proxy -id twimg-proxy -shost 127.0.0.1 -sport 8000
 
 ---
 
-## peerfs-proxy：ECH 代理节点
+## peerfs-proxy：twimg 代理节点
 
-`cmd/peerfs-proxy` 是一个通过 ECH（Encrypted Client Hello）域前置抓取 Twitter 媒体的代理节点，
-同时支持任意 URL 抓取，并通过 WebRTC DataChannel 提供给浏览器。
+`cmd/peerfs-proxy` 是一个 **只做一件事** 的代理节点：
+通过 ECH（Encrypted Client Hello）域前置，从 `video-cf.twimg.com` 抓取 Twitter 媒体图片/视频，
+并通过 WebRTC DataChannel 发送给浏览器。
+
+**不做：** 不提供任意 URL 抓取，不做文件浏览，不暴露本地文件系统。
 
 ### 虚拟路径
 
 | 路径 | 说明 |
 |------|------|
-| `twimg/<path>` | 从 `https://video-cf.twimg.com/<path>` 抓取（Twitter 媒体 CDN） |
-| `url/<encoded_url>` | 从任意 URL 抓取（需先 url encode） |
+| `twimg/<path>` | 从 `https://video-cf.twimg.com/<path>` 抓取 |
 
-浏览器通过 `list` 看到两个虚拟目录 `twimg/` 和 `url/`，进入后为空（无子目录）。
+浏览器通过 `list` 看到唯一的虚拟目录 `twimg/`，进入为空（无子目录）。
 
 ### 命令行参数
 
@@ -340,14 +342,14 @@ go run ./cmd/peerfs-proxy -id twimg-proxy -shost 127.0.0.1 -sport 8000
 | `-token` | `""` | 数据通道 hello 认证 token，空=不认证 |
 | `-debug` | `false` | 调试日志 |
 
-### 使用示例
+### 启动
 
 ```bash
 # 编译
 cd cmd/peerfs-proxy
 go build -o peerfs-proxy
 
-# 启动（无认证，默认连 127.0.0.1:8000 信令）
+# 启动（无认证）
 ./peerfs-proxy -id my-twimg -shost 127.0.0.1 -sport 8000
 
 # 启动（带 token 认证）
@@ -371,7 +373,7 @@ go build -o peerfs-proxy
 1. 打开 `http://<信令服务器>:8000/`
 2. 在连接栏输入信令 host（默认 127.0.0.1）和端口（默认 8000）
 3. 点"连接信令"
-4. 节点列表显示在线节点
+4. 节点列表显示在线节点，节点类型为 `twimg`
 5. 点击节点卡连接
 
 ### Token 认证
@@ -384,9 +386,82 @@ go build -o peerfs-proxy
 
 token 可通过 URL 参数传入：`http://host:8000/?token=SECRET`
 
+---
+
+## 手动使用 peerjs 连接 twimg proxy
+
+如果不想用自带的页面，可以用 peerjs 库直接连接：
+
+```html
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+// 1. 创建 peer（信令连接）
+const peer = new Peer(undefined, {
+  host: 'peerfs.moonchan.xyz',   // 信令服务器
+  port: 443,
+  secure: true,
+  path: '/',
+  key: 'peerjs',
+});
+
+peer.on('open', async () => {
+  // 2. 连接到 twimg 代理节点
+  const conn = peer.connect('twimg-proxy', {
+    serialization: 'raw',
+    reliable: true,
+  });
+
+  conn.on('open', () => {
+    // 3. 发送 hello（可选，无 token 可跳过）
+    conn.send(JSON.stringify({ type: 'hello', token: '' }));
+
+    // 4. 发送 list 查看可用的虚拟目录
+    conn.send(JSON.stringify({ type: 'list', path: '/', reqId: 'r1' }));
+  });
+
+  // 5. 接收数据
+  conn.on('data', async (data) => {
+    if (typeof data === 'string') {
+      const msg = JSON.parse(data);
+      if (msg.type === 'entries') {
+        console.log('可用的目录:', msg.entries);
+        // msg.entries = [{name: "twimg/", dir: true, size: 0}]
+
+        // 6. 请求一张图片
+        conn.send(JSON.stringify({
+          type: 'read',
+          path: 'twimg/media/xxx.jpg',
+          offset: 0,
+          size: -1,
+          reqId: 'r2',
+        }));
+      }
+      if (msg.type === 'meta') {
+        console.log('文件大小:', msg.total, 'bytes');
+        // 等待二进制数据块...
+      }
+      if (msg.type === 'done') {
+        console.log('文件传输完成');
+        // 二进制数据已收集到 chunks 数组
+      }
+      if (msg.type === 'err') {
+        console.error('错误:', msg.msg);
+      }
+    } else {
+      // 二进制数据块：前 4 字节是 streamID，后面是数据
+      const view = new DataView(data);
+      const streamId = view.getUint32(0, false);
+      const chunk = data.slice(4);
+      console.log('收到 stream', streamId, 'chunk', chunk.byteLength, 'bytes');
+    }
+  });
+});
+</script>
+```
+
 ### 数据通道协议
 
-#### hello 帧（token 认证）
+#### hello 帧（可选 token 认证）
 
 ```
 → {"type":"hello","token":"SECRET"}
@@ -401,7 +476,7 @@ token 可通过 URL 参数传入：`http://host:8000/?token=SECRET`
 
 ```
 → {"type":"list","path":"/","reqId":"r1"}
-← {"type":"entries","entries":[{"name":"twimg/","dir":true},{"name":"url/","dir":true}],"reqId":"r1"}
+← {"type":"entries","entries":[{"name":"twimg/","dir":true,"size":0}],"reqId":"r1"}
 ```
 
 #### 文件读取
@@ -414,16 +489,9 @@ token 可通过 URL 参数传入：`http://host:8000/?token=SECRET`
 ← {"type":"done","reqId":"r2"}
 ```
 
-#### 快捷 fetch
-
-```
-→ {"type":"fetch","path":"https://example.com/photo.jpg","reqId":"r3"}
-← （同 read 协议，自动转换 path 为 url/<encoded_url>）
-```
-
 #### 错误
 
 ```
 ← {"type":"err","msg":"bad token","reqId":""}
-← {"type":"err","msg":"file not found","reqId":"r1"}
+← {"type":"err","msg":"only twimg/ is allowed","reqId":"r1"}
 ```

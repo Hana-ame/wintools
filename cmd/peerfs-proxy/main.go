@@ -213,10 +213,6 @@ func (st *connState) handleControl(data []byte) error {
 	case "read":
 		go st.handleRead(h)
 		return nil
-	case "fetch":
-		h.Path = "url/" + url.QueryEscape(h.Path)
-		go st.handleRead(h)
-		return nil
 	default:
 		return st.sendHeader(Header{Type: "err", ReqID: h.ReqID,
 			Msg: "unknown type: " + h.Type})
@@ -240,13 +236,12 @@ func (st *connState) sendBinaryChunk(streamID uint32, data []byte) error {
 func (st *connState) handleList(h Header) error {
 	path := strings.TrimPrefix(h.Path, "/")
 	switch {
-	case path == "", path == "twimg", path == "url":
+	case path == "", path == "twimg":
 		entries := []Entry{
 			{Name: "twimg/", Dir: true, Size: 0},
-			{Name: "url/", Dir: true, Size: 0},
 		}
 		return st.sendHeader(Header{Type: "entries", ReqID: h.ReqID, Entries: entries})
-	case strings.HasPrefix(path, "twimg/"), strings.HasPrefix(path, "url/"):
+	case strings.HasPrefix(path, "twimg/"):
 		return st.sendHeader(Header{Type: "entries", ReqID: h.ReqID, Entries: nil})
 	default:
 		return st.sendHeader(Header{Type: "err", ReqID: h.ReqID, Msg: "unknown path"})
@@ -256,21 +251,12 @@ func (st *connState) handleList(h Header) error {
 func (st *connState) handleRead(h Header) {
 	path := strings.TrimPrefix(h.Path, "/")
 
-	var fetchURL string
-	switch {
-	case strings.HasPrefix(path, "twimg/"):
-		fetchURL = "https://video-cf.twimg.com/" + strings.TrimPrefix(path, "twimg/")
-	case strings.HasPrefix(path, "url/"):
-		u, err := url.QueryUnescape(strings.TrimPrefix(path, "url/"))
-		if err != nil {
-			_ = st.sendHeader(Header{Type: "err", ReqID: h.ReqID, Msg: "bad url encoding"})
-			return
-		}
-		fetchURL = u
-	default:
-		_ = st.sendHeader(Header{Type: "err", ReqID: h.ReqID, Msg: "unknown path"})
+	if !strings.HasPrefix(path, "twimg/") {
+		_ = st.sendHeader(Header{Type: "err", ReqID: h.ReqID, Msg: "only twimg/ is allowed"})
 		return
 	}
+
+	fetchURL := "https://video-cf.twimg.com/" + strings.TrimPrefix(path, "twimg/")
 
 	target, err := url.Parse(fetchURL)
 	if err != nil {
