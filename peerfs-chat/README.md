@@ -270,8 +270,8 @@ http://localhost:8000/
 
 ## 安全性
 
-- 信令服务器无 token 校验（演示用途）
-- 数据通道无认证（可自行扩展 hello 帧）
+- 信令服务器可选 token 白名单（`-tokens` 参数）
+- 数据通道可选 hello 认证（`-token` 参数），默认无认证
 - 路径穿越防护：`path.Clean` + `filepath.Join` 限制在服务目录内
 - 浏览器和客户端在同一内网时建议使用 `127.0.0.1`
 
@@ -288,7 +288,7 @@ http://localhost:8000/
 
 | nodeType | 说明 |
 |----------|------|
-| `file` | 本地文件服务节点 |
+| `file` | 本地文件服务节点（goclient） |
 | `twimg` | Twitter 图片代理节点（通过 ECH 从 video-cf.twimg.com 抓取） |
 | `proxy` | 通用代理节点 |
 
@@ -312,3 +312,118 @@ go run ./cmd/peerfs-proxy -id twimg-proxy -shost 127.0.0.1 -sport 8000
 | `downloadBytes` | 下载字节数 |
 
 浏览器每 10 秒刷新节点列表，自动显示统计信息。
+
+---
+
+## peerfs-proxy：ECH 代理节点
+
+`cmd/peerfs-proxy` 是一个通过 ECH（Encrypted Client Hello）域前置抓取 Twitter 媒体的代理节点，
+同时支持任意 URL 抓取，并通过 WebRTC DataChannel 提供给浏览器。
+
+### 虚拟路径
+
+| 路径 | 说明 |
+|------|------|
+| `twimg/<path>` | 从 `https://video-cf.twimg.com/<path>` 抓取（Twitter 媒体 CDN） |
+| `url/<encoded_url>` | 从任意 URL 抓取（需先 url encode） |
+
+浏览器通过 `list` 看到两个虚拟目录 `twimg/` 和 `url/`，进入后为空（无子目录）。
+
+### 命令行参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-id` | `twimg-proxy` | 本机 peer ID |
+| `-shost` | `127.0.0.1` | 信令服务器 host |
+| `-sport` | `8000` | 信令服务器端口 |
+| `-collections` | `proxy,twitter,images` | 节点标签（逗号分隔） |
+| `-token` | `""` | 数据通道 hello 认证 token，空=不认证 |
+| `-debug` | `false` | 调试日志 |
+
+### 使用示例
+
+```bash
+# 编译
+cd cmd/peerfs-proxy
+go build -o peerfs-proxy
+
+# 启动（无认证，默认连 127.0.0.1:8000 信令）
+./peerfs-proxy -id my-twimg -shost 127.0.0.1 -sport 8000
+
+# 启动（带 token 认证）
+./peerfs-proxy -id my-twimg -token SECRET -shost 127.0.0.1 -sport 8000
+```
+
+### 协议特性
+
+- **64KB 分块发送**：使用 `SendThrottled` 流控，避免大文件打爆发送缓冲
+- **Range 支持**：响应 `offset`/`size` 参数，发 HTTP Range 请求头，支持断点续传
+- **ECH 域前置**：通过 `cloudflare-ech.com` 加密连接目标服务器
+- **并发多流**：多个 `read` 请求可同时进行，通过 `streamId` 解复用
+- **hello 认证**：可选 token 校验，防止未授权访问
+
+---
+
+## 前端使用说明
+
+### 连接流程
+
+1. 打开 `http://<信令服务器>:8000/`
+2. 在连接栏输入信令 host（默认 127.0.0.1）和端口（默认 8000）
+3. 点"连接信令"
+4. 节点列表显示在线节点
+5. 点击节点卡连接
+
+### Token 认证
+
+如果节点配置了 `-token`，浏览器需要输入对应 token：
+
+1. 在连接栏的 token 输入框填入 token
+2. 信令连接后，浏览器会自动发送 `hello` 帧附带 token
+3. token 正确则连接成功，错误则状态栏显示错误
+
+token 可通过 URL 参数传入：`http://host:8000/?token=SECRET`
+
+### 数据通道协议
+
+#### hello 帧（token 认证）
+
+```
+→ {"type":"hello","token":"SECRET"}
+```
+
+浏览器在 DataChannel 打开后立即发送 hello 帧（token 可空）。
+服务端：
+- 无 token 配置：忽略 hello，直接处理后续请求
+- 有 token 配置：校验 token，匹配后放行；不匹配则返回 err 帧并关闭连接
+
+#### 目录列表
+
+```
+→ {"type":"list","path":"/","reqId":"r1"}
+← {"type":"entries","entries":[{"name":"twimg/","dir":true},{"name":"url/","dir":true}],"reqId":"r1"}
+```
+
+#### 文件读取
+
+```
+→ {"type":"read","path":"twimg/media/xxx.jpg","offset":0,"size":-1,"reqId":"r2"}
+← {"type":"meta","total":12345,"streamId":1,"reqId":"r2"}
+← <4B streamID=1 big-endian><chunk data 64KB>   二进制帧
+← ...
+← {"type":"done","reqId":"r2"}
+```
+
+#### 快捷 fetch
+
+```
+→ {"type":"fetch","path":"https://example.com/photo.jpg","reqId":"r3"}
+← （同 read 协议，自动转换 path 为 url/<encoded_url>）
+```
+
+#### 错误
+
+```
+← {"type":"err","msg":"bad token","reqId":""}
+← {"type":"err","msg":"file not found","reqId":"r1"}
+```
