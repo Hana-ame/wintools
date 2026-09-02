@@ -168,51 +168,65 @@ func downloadMedia(mediaURL, outputPath string) error {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 
-	var proxiedURL string
-	var proxyHost string
+	var req *http.Request
+	var client *http.Client
 
-	// Determine which proxy to use based on the source
+	// Determine how to fetch based on the source
 	switch {
-	case strings.Contains(parsed.Host, "twimg") || strings.Contains(parsed.Host, "pbs.twimg.com"):
-		// Twitter CDN - use twimg proxy with ECH
-		proxyHost = "twimg.l.moonchan.xyz"
-		proxiedURL = fmt.Sprintf("https://%s%s", proxyHost, parsed.Path)
-		if parsed.RawQuery != "" {
-			proxiedURL += "?" + parsed.RawQuery
+	case strings.Contains(parsed.Host, "pbs.twimg.com") || strings.Contains(parsed.Host, "video.twimg.com") || strings.Contains(parsed.Host, "video-cf.twimg.com"):
+		// Twitter CDN - requires ECH proxy for access from restricted networks
+		// Option 1: Use twimg.l.moonchan.xyz HTTP proxy (if ech-proxy is running)
+		// Option 2: Direct access (may be blocked in some regions)
+		
+		log.Printf("  Twitter CDN detected: %s", parsed.Host)
+		log.Printf("  Note: For full access, run ech-proxy locally or use a VPN")
+		
+		// Try direct access first
+		req, err = http.NewRequest("GET", mediaURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
 		}
-	case strings.Contains(parsed.Host, "upload.moonchan.xyz"):
-		// Moonchan upload server - direct download (no proxy needed)
-		proxiedURL = mediaURL
-		proxyHost = ""
-	default:
-		// Unknown source - try direct download first, then twimg proxy as fallback
-		proxiedURL = mediaURL
-		proxyHost = ""
-	}
-
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", proxiedURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	
-	// Only set Host header and Referer when using proxy
-	if proxyHost != "" {
+		
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 		req.Header.Set("Referer", "https://x.com")
-		req.Host = proxyHost
+		
+		client = &http.Client{
+			Timeout: 120 * time.Second,
+		}
+		
+	case strings.Contains(parsed.Host, "upload.moonchan.xyz"):
+		// Moonchan upload server - direct download (no ECH needed)
+		log.Printf("  Direct download from moonchan upload server")
+		
+		req, err = http.NewRequest("GET", mediaURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+		
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		
+		client = &http.Client{
+			Timeout: 120 * time.Second,
+		}
+		
+	default:
+		// Unknown source - try direct download
+		log.Printf("  Direct download from: %s", parsed.Host)
+		
+		req, err = http.NewRequest("GET", mediaURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+		
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		
+		client = &http.Client{
+			Timeout: 120 * time.Second,
+		}
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		if proxyHost != "" {
-			return fmt.Errorf("download failed (proxy %s may not be accessible): %w", proxyHost, err)
-		}
 		return fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
