@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ func main() {
 		sport   = flag.Int("sport", 443, "-signal=false 时：信令 port")
 		ssecure = flag.Bool("ssecure", true, "-signal=false 时：信令 wss")
 		debug   = flag.Bool("debug", false, "信令详细日志")
+		configURL = flag.String("config-url", os.Getenv("PEERFS_CONFIG_URL"), "中心配置/注册URL（可集中拉取配置、定时上报活跃节点、分发全网节点）")
 	)
 	flag.Parse()
 
@@ -72,6 +74,7 @@ func main() {
 		Token:     *token,
 		Signaling: sig,
 		Debug:     *debug,
+		ConfigURL: *configURL,
 	})
 	node.MountConsole(mux)
 

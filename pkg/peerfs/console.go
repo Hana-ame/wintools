@@ -105,11 +105,22 @@ func (n *Node) serveConsoleAssets(w http.ResponseWriter, r *http.Request) {
 	case "/config.json":
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
 			"peerId":    n.ID(),
 			"root":      n.cfg.Root,
 			"signaling": n.signalingJSON(),
-		})
+		}
+		if n.cfg.ConfigURL != "" {
+			resp["configUrl"] = n.cfg.ConfigURL
+		}
+		if nodes := n.GetHubNodes(); len(nodes) > 0 {
+			resp["hubNodes"] = nodes
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	case "/nodes":
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": n.GetHubNodes()})
 	case "/candidate":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

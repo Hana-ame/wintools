@@ -1,6 +1,7 @@
 package peerfs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,11 +10,13 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/Hana-ame/wintools/pkg/netdial"
 	"github.com/Hana-ame/wintools/pkg/peerjs"
 )
 
@@ -85,6 +88,7 @@ type Config struct {
 	Token     string    // hello 校验；空 = 不校验（信令白名单足够时可不设）
 	Signaling Signaling // 连哪个信令服务器
 	Debug     bool
+	ConfigURL string    // 中心配置与分发 URL（可拉取配置、集中注册、分发全网节点）
 	// ICEHook 可选：透传给 pkg/peerjs（测试注入 loopback、部署换 TURN）。
 	ICEHook func(*webrtc.Configuration, *webrtc.SettingEngine)
 }
@@ -94,6 +98,9 @@ type Node struct {
 	cfg  Config
 	root http.Dir
 	peer *peerjs.Peer
+
+	hubNodesMu sync.RWMutex
+	hubNodes   []map[string]any
 
 	startOnce sync.Once
 	startErr  error
@@ -114,6 +121,139 @@ func (n *Node) ID() string {
 	return n.peer.ID()
 }
 
+// GetHubNodes 返回从中心配置拉取到的全网活跃节点列表（分发用）。
+func (n *Node) GetHubNodes() []map[string]any {
+	n.hubNodesMu.RLock()
+	defer n.hubNodesMu.RUnlock()
+	if len(n.hubNodes) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, len(n.hubNodes))
+	copy(out, n.hubNodes)
+	return out
+}
+
+func (n *Node) fetchCentralConfig(ctx context.Context) {
+	if n.cfg.ConfigURL == "" {
+		return
+	}
+	client := netdial.Client(5 * time.Second)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, n.cfg.ConfigURL, nil)
+	if err != nil {
+		log.Printf("[peerfs-config] build request failed: %v", err)
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[peerfs-config] fetch central config from %s failed: %v", n.cfg.ConfigURL, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[peerfs-config] central config status: %d", resp.StatusCode)
+		return
+	}
+
+	var data struct {
+		PeerID    string           `json:"peerId"`
+		Name      string           `json:"name"`
+		Token     string           `json:"token"`
+		Signaling *Signaling       `json:"signaling"`
+		Nodes     []map[string]any `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return
+	}
+	if n.cfg.PeerID == "" {
+		if data.PeerID != "" {
+			n.cfg.PeerID = data.PeerID
+		} else if data.Name != "" {
+			n.cfg.PeerID = "wt-media-" + data.Name
+		}
+	}
+	if n.cfg.Token == "" && data.Token != "" {
+		n.cfg.Token = data.Token
+	}
+	if data.Signaling != nil && n.cfg.Signaling.Host == "" {
+		n.cfg.Signaling = *data.Signaling
+	}
+	if len(data.Nodes) > 0 {
+		n.hubNodesMu.Lock()
+		n.hubNodes = data.Nodes
+		n.hubNodesMu.Unlock()
+	}
+	log.Printf("[peerfs-config] successfully loaded central config from %s", n.cfg.ConfigURL)
+}
+
+func (n *Node) startAnnounceLoop(ctx context.Context) {
+	announceURL := n.cfg.ConfigURL
+	if strings.HasSuffix(announceURL, "/discover/nodes") {
+		announceURL = strings.TrimSuffix(announceURL, "/discover/nodes") + "/discover/announce"
+	} else if !strings.Contains(announceURL, "/announce") {
+		announceURL = strings.TrimRight(announceURL, "/") + "/discover/announce"
+	}
+	nodesURL := strings.Replace(announceURL, "/announce", "/nodes", 1)
+
+	client := netdial.Client(5 * time.Second)
+
+	ticker := time.NewTicker(20 * time.Second)
+	go func() {
+		defer ticker.Stop()
+		n.doAnnounce(ctx, client, announceURL, nodesURL)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				n.doAnnounce(ctx, client, announceURL, nodesURL)
+			}
+		}
+	}()
+}
+
+func (n *Node) doAnnounce(ctx context.Context, client *http.Client, announceURL, nodesURL string) {
+	bodyData := map[string]any{
+		"id":            n.ID(),
+		"peerId":        n.ID(),
+		"name":          n.cfg.PeerID,
+		"root":          n.cfg.Root,
+		"collections":   []string{"media", "default"},
+		"tokenRequired": n.cfg.Token != "",
+		"signaling":     n.cfg.Signaling,
+		"lastSeen":      time.Now().Unix(),
+	}
+	b, _ := json.Marshal(bodyData)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, announceURL, bytes.NewReader(b))
+	if err == nil {
+		req.Header.Set("Content-Type", "application/json")
+		if resp, err := client.Do(req); err == nil {
+			_ = resp.Body.Close()
+		}
+	}
+
+	queryURL := nodesURL
+	if !strings.Contains(queryURL, "?") {
+		queryURL += "?coll=media"
+	}
+	nreq, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL, nil)
+	if err == nil {
+		if resp, err := client.Do(nreq); err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var res struct {
+					Nodes []map[string]any `json:"nodes"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && len(res.Nodes) > 0 {
+					n.hubNodesMu.Lock()
+					n.hubNodes = res.Nodes
+					n.hubNodesMu.Unlock()
+				}
+			}
+		}
+	}
+}
+
 // InjectCandidate 允许通过外部通道（如 HTTP 8080 临时候选通道）直接向正在建立的连接注入对端候选。
 func (n *Node) InjectCandidate(connId string, cand webrtc.ICECandidateInit) {
 	if n.peer != nil {
@@ -128,6 +268,8 @@ func (n *Node) Start(ctx context.Context) error {
 }
 
 func (n *Node) start(ctx context.Context) error {
+	n.fetchCentralConfig(ctx)
+
 	sig := n.cfg.Signaling
 	n.peer = peerjs.NewPeer(peerjs.Config{
 		ID:      n.cfg.PeerID,
@@ -143,6 +285,11 @@ func (n *Node) start(ctx context.Context) error {
 	if err := n.peer.Start(ctx); err != nil {
 		return fmt.Errorf("peerfs: signaling start: %w", err)
 	}
+
+	if n.cfg.ConfigURL != "" {
+		n.startAnnounceLoop(ctx)
+	}
+
 	return nil
 }
 
