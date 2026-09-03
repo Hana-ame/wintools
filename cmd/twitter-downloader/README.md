@@ -33,31 +33,17 @@ twitter-downloader.exe @BBC
 
 1. **API Query**: Fetches media list from `x.moonchan.xyz` API (supports both gzip and plain JSON)
 2. **Media Download**: 
-   - For Twitter CDN URLs (`pbs.twimg.com`, `video-cf.twimg.com`, `video.twimg.com`): Attempts direct download. **Note**: In restricted networks, these may be blocked. For full access, see "ECH Proxy Setup" below.
-   - For moonchan upload URLs (`upload.moonchan.xyz`): Direct download (always works)
-3. **Smart Routing**: Automatically detects URL source and applies appropriate download method
+   - For Twitter CDN URLs (`pbs.twimg.com`, `video-cf.twimg.com`, `video.twimg.com`): Uses **ECH (Encrypted Client Hello)** domain fronting to access `video-cf.twimg.com` directly, bypassing network restrictions
+   - For moonchan upload URLs (`upload.moonchan.xyz`): Direct download
+3. **ECH Technology**: The tool integrates `pkg/ech` which:
+   - Encrypts the real destination (`video-cf.twimg.com`) in TLS handshake
+   - Uses Cloudflare's ECH infrastructure for domain fronting
+   - Presents a different SNI to middleboxes while reaching the actual Twitter CDN
+   - Works exactly like `ech-proxy`'s twimg configuration
 
-### ECH Proxy Setup (For Twitter CDN Access)
+### No Additional Setup Required
 
-To access Twitter CDN media from restricted networks, you have two options:
-
-**Option 1: Run ech-proxy locally**
-```bash
-# Clone wintools and build ech-proxy
-git clone https://github.com/Hana-ame/wintools.git
-cd wintools
-go build -o ech-proxy ./cmd/ech-proxy
-
-# Run ech-proxy (requires configuration)
-./ech-proxy --http
-```
-
-Then configure your system to use the local proxy for Twitter domains.
-
-**Option 2: Use VPN or proxy**
-Configure your system VPN/proxy to bypass restrictions for Twitter domains.
-
-**Current Limitation**: This standalone version does not include built-in ECH support due to Go version constraints. Future versions will integrate pkg/ech directly when Go toolchain issues are resolved.
+The twitter-downloader has **built-in ECH support** - no need to run ech-proxy separately or configure VPN. Just download and run!
 
 ## Output
 

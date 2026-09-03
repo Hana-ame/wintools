@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
 )
 
 // MediaItem represents a single media item from the Twitter API response
@@ -40,6 +42,15 @@ type APIResponse struct {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Initialize ECH client for accessing Twitter CDN through domain fronting
+	log.Println("Initializing ECH client...")
+	if err := cloudflare_ech.InitDefault(); err != nil {
+		log.Printf("Warning: ECH initialization failed: %v", err)
+		log.Println("Twitter CDN downloads may fail. Moonchan uploads will still work.")
+	} else {
+		log.Println("ECH client ready - Twitter CDN access enabled")
+	}
 
 	// Get username from command line or prompt
 	var username string
@@ -169,30 +180,55 @@ func downloadMedia(mediaURL, outputPath string) error {
 	}
 
 	var req *http.Request
-	var client *http.Client
 
 	// Determine how to fetch based on the source
 	switch {
 	case strings.Contains(parsed.Host, "pbs.twimg.com") || strings.Contains(parsed.Host, "video.twimg.com") || strings.Contains(parsed.Host, "video-cf.twimg.com"):
-		// Twitter CDN - requires ECH proxy for access from restricted networks
-		// Option 1: Use twimg.l.moonchan.xyz HTTP proxy (if ech-proxy is running)
-		// Option 2: Direct access (may be blocked in some regions)
+		// Twitter CDN - use ECH to access video-cf.twimg.com directly (like ech-proxy does)
+		log.Printf("  Using ECH for Twitter CDN: %s → video-cf.twimg.com", parsed.Host)
 		
-		log.Printf("  Twitter CDN detected: %s", parsed.Host)
-		log.Printf("  Note: For full access, run ech-proxy locally or use a VPN")
+		// Construct the real URL with video-cf.twimg.com as the target
+		realURL := fmt.Sprintf("https://video-cf.twimg.com%s", parsed.Path)
+		if parsed.RawQuery != "" {
+			realURL += "?" + parsed.RawQuery
+		}
 		
-		// Try direct access first
-		req, err = http.NewRequest("GET", mediaURL, nil)
+		req, err = http.NewRequest("GET", realURL, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 		
+		// Set headers required by Twitter CDN (same as ech-proxy twimg config)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 		req.Header.Set("Referer", "https://x.com")
+		req.Host = "video-cf.twimg.com"
 		
-		client = &http.Client{
-			Timeout: 120 * time.Second,
+		// Use ECH Do() - this encrypts the SNI and uses Cloudflare ECH domain fronting
+		resp, err := cloudflare_ech.Do(req)
+		if err != nil {
+			return fmt.Errorf("ECH download failed: %w", err)
 		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("download returned status %d", resp.StatusCode)
+		}
+
+		// Create output file
+		outFile, err := os.Create(outputPath)
+		if err != nil {
+			return fmt.Errorf("failed to create file: %w", err)
+		}
+		defer outFile.Close()
+
+		// Copy response body to file with progress tracking
+		written, err := io.Copy(outFile, resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to save file: %w", err)
+		}
+
+		log.Printf("  Downloaded %d bytes (%.2f MB)", written, float64(written)/(1024*1024))
+		return nil
 		
 	case strings.Contains(parsed.Host, "upload.moonchan.xyz"):
 		// Moonchan upload server - direct download (no ECH needed)
@@ -205,10 +241,6 @@ func downloadMedia(mediaURL, outputPath string) error {
 		
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 		
-		client = &http.Client{
-			Timeout: 120 * time.Second,
-		}
-		
 	default:
 		// Unknown source - try direct download
 		log.Printf("  Direct download from: %s", parsed.Host)
@@ -219,10 +251,11 @@ func downloadMedia(mediaURL, outputPath string) error {
 		}
 		
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-		
-		client = &http.Client{
-			Timeout: 120 * time.Second,
-		}
+	}
+
+	// For non-ECH downloads, use standard HTTP client
+	client := &http.Client{
+		Timeout: 120 * time.Second,
 	}
 
 	resp, err := client.Do(req)

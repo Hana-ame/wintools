@@ -1,6 +1,6 @@
 module github.com/Hana-ame/wintools
 
-go 1.26.4
+go 1.26.7
 
 require (
 	github.com/Hana-ame/go-peerserver v0.1.0
