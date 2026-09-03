@@ -287,7 +287,13 @@ func (st *connState) handleRead(dc frameWriter, h Header) {
 		return
 	}
 	size := fi.Size()
-	if h.Offset < 0 || h.Offset > size {
+	if h.Offset < 0 {
+		// 支持负数 offset 读取文件末尾 N 字节（如非 faststart 视频读取末尾 moov box）
+		h.Offset = size + h.Offset
+		if h.Offset < 0 {
+			h.Offset = 0
+		}
+	} else if h.Offset > size {
 		st.replyErr(dc, h.ReqID, "offset beyond end of file")
 		return
 	}

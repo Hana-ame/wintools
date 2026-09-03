@@ -535,11 +535,19 @@
           },
         };
 
+        var readTimer = setTimeout(function () {
+          worker.pending.delete(reqId);
+          self._releaseWorker(worker);
+          reject(new Error('read timeout (15s): ' + filePath));
+        }, 15000);
+
         worker.pending.set(reqId, {
           resolve: function (blob) {
+            clearTimeout(readTimer);
             resolve(blob);
           },
           reject: function (err) {
+            clearTimeout(readTimer);
             self._releaseWorker(worker);
             reject(err);
           },
@@ -668,17 +676,30 @@
     var self = this;
     var streamUrl = this.streamUrl(filePath);
 
-    // 优先：如果浏览器已激活 Service Worker 控制器，采用虚拟 Range 流式播放（真正的边下边播 + 支持快进/快退 Seek）
-    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      this._log('启用 Service Worker 虚拟 Range 管道，实现秒开【边下边播】: ' + filePath, '#73daca');
+    var doStream = function () {
+      self._log('启用 Service Worker 虚拟 Range 管道，秒开【边下边播】: ' + filePath, '#73daca');
       mediaEl.src = streamUrl;
       return mediaEl.play().catch(function (err) {
-        self._log('播放器等待手势或正在缓冲: ' + err.message, '#e0af68');
+        self._log('播放器就绪，等待播放: ' + err.message, '#e0af68');
+      });
+    };
+
+    if ('serviceWorker' in navigator) {
+      if (navigator.serviceWorker.controller) {
+        return doStream();
+      }
+      return navigator.serviceWorker.ready.then(function () {
+        return doStream();
+      }).catch(function () {
+        self._log('Service Worker 就绪超时，降级为 DataChannel 内存直解', '#e0af68');
+        return self.url(filePath).then(function (u) {
+          mediaEl.src = u;
+          return mediaEl.play().catch(function () {});
+        });
       });
     }
 
-    // 次选：无 Service Worker 或未激活时，直接通过 DataChannel 并发拉取内存 Blob 播放
-    this._log('Service Worker 未激活，使用 WebRTC DataChannel 内存直接解码: ' + filePath, '#e0af68');
+    this._log('当前环境不支持 Service Worker，使用 WebRTC DataChannel 内存直解: ' + filePath, '#e0af68');
     return this.url(filePath).then(function (u) {
       mediaEl.src = u;
       return mediaEl.play().catch(function () {});
@@ -689,6 +710,8 @@
   PeerFS.prototype._setupServiceWorkerBridge = function () {
     var self = this;
     if (!('serviceWorker' in navigator)) return;
+    if (this._swBridgeSetup) return;
+    this._swBridgeSetup = true;
 
     navigator.serviceWorker.addEventListener('message', function (event) {
       var data = event.data;
@@ -708,7 +731,9 @@
         port.onmessage = function (pe) {
           if (pe.data && pe.data.type === 'abort') {
             aborted = true;
-            self._releaseWorker(worker);
+            // 边界防线：不提前将 busy 置为 false，防止服务端旧切片飞入新任务。
+            // 清空 activeStream 丢弃旧切片，待服务端 done 到达后自动由 onDone 释放归还通道池
+            worker.activeStream = null;
           }
         };
 

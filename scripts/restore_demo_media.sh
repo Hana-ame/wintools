@@ -70,6 +70,9 @@ if ! curl -sL --connect-timeout 5 --max-time 15 \
     -o "${TARGET_DIR}/sample.mp4" || true
 fi
 
+# 7. img/landscape.jpg (高分辨率图片，用于测试边下边显)
+curl -sL --connect-timeout 5 --max-time 15 "https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=1600" -o "${TARGET_DIR}/img/landscape.jpg" || true
+
 chmod -R 755 "${TARGET_DIR}"
 
 echo "==> 演示媒体目录恢复完成: ${TARGET_DIR}"

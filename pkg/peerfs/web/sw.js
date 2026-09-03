@@ -53,9 +53,12 @@ self.addEventListener('fetch', function (event) {
     var end = -1;
     if (rangeHeader) {
       var match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+      var suffixMatch = rangeHeader.match(/bytes=-(\d+)/);
       if (match) {
         start = parseInt(match[1], 10) || 0;
         if (match[2]) end = parseInt(match[2], 10);
+      } else if (suffixMatch) {
+        start = -parseInt(suffixMatch[1], 10) || 0;
       }
     }
 

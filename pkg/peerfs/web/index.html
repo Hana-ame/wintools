@@ -299,30 +299,63 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
     dlg.showModal();
 
     if (k === 'video' || k === 'audio') {
-      $('dlgBody').innerHTML = '<div style="padding:24px;text-align:center">⏳ 正在通过 WebRTC DataChannel 读取数据并生成纯内存 Blob...</div>';
-      try {
-        var u = await fs.url(filePath);
-        var media = document.createElement(k);
-        media.controls = true;
-        media.autoplay = true;
-        media.style.width = '100%';
-        media.src = u;
-        $('dlgBody').innerHTML = '';
-        $('dlgBody').appendChild(media);
-        media.play().catch(function () {});
-        logMsg('WebRTC 数据通道传输完毕，纯内存 Blob 就绪播放: ' + filePath, '#9ece6a');
-      } catch (e) {
-        $('dlgBody').innerHTML = '<div style="color:#e5534b;padding:20px;">DataChannel 读取失败: ' + e.message + '</div>';
-        logMsg('读取失败: ' + e.message, '#e5534b');
-      }
+      var media = document.createElement(k);
+      media.controls = true;
+      media.autoplay = true;
+      media.playsInline = true;
+      media.style.width = '100%';
+      $('dlgBody').innerHTML = '';
+      $('dlgBody').appendChild(media);
+
+      var switchBtn = document.createElement('button');
+      switchBtn.className = 'sec';
+      switchBtn.style.cssText = 'display:block;margin:12px auto 0 auto;font-size:12px;padding:6px 14px;cursor:pointer;';
+      switchBtn.textContent = '🔄 若流媒体未起播，点击使用 DataChannel 内存直解';
+      switchBtn.onclick = function () {
+        switchBtn.textContent = '⏳ 正在通过 DataChannel 读取...';
+        fs.url(filePath).then(function (u) {
+          media.src = u;
+          media.play().catch(function () {});
+          switchBtn.textContent = '✅ 已切换为 DataChannel 内存直接播放';
+        }).catch(function (e) {
+          switchBtn.textContent = '❌ 读取失败: ' + e.message;
+        });
+      };
+      $('dlgBody').appendChild(switchBtn);
+
+      media.onerror = function () {
+        var err = media.error;
+        var codeMap = { 1: '取回终止', 2: '网络错误', 3: '解码错误/格式损坏', 4: '格式不支持' };
+        var code = err ? err.code : 0;
+        logMsg('播放器提示: ' + (codeMap[code] || ('code ' + code)), '#e5534b');
+        logMsg('自动切换为 DataChannel 内存直接读取播放...', '#e0af68');
+        switchBtn.click();
+      };
+      fs.play(filePath, media);
     } else if (k === 'image') {
-      $('dlgBody').innerHTML = '<div style="padding:20px;text-align:center">正在通过 DataChannel 加载图片...</div>';
-      try {
-        var url = await fs.url(filePath);
-        $('dlgBody').innerHTML = '<img src="' + url + '" style="max-width:88vw;max-height:75vh;display:block;margin:auto;border-radius:4px;">';
-      } catch (e) {
-        $('dlgBody').innerHTML = '<div style="color:#e5534b;padding:20px;">加载失败: ' + e.message + '</div>';
+      $('dlgBody').innerHTML = '';
+      var img = document.createElement('img');
+      img.style.cssText = 'max-width:88vw;max-height:75vh;display:block;margin:auto;border-radius:4px;background:#18181f;min-height:80px;';
+
+      if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+        logMsg('启用流式通道，实现图片【边下边显】: ' + filePath, '#73daca');
+        img.src = fs.streamUrl(filePath);
+      } else {
+        logMsg('正在通过 DataChannel 读取图片: ' + filePath, '#bb9af7');
+        fs.url(filePath).then(function (u) {
+          img.src = u;
+        }).catch(function (e) {
+          $('dlgBody').innerHTML = '<div style="color:#e5534b;padding:20px;">加载失败: ' + e.message + '</div>';
+        });
       }
+
+      img.onerror = function () {
+        logMsg('流式加载提示，尝试 DataChannel 内存直解...', '#e0af68');
+        fs.url(filePath).then(function (u) {
+          img.src = u;
+        });
+      };
+      $('dlgBody').appendChild(img);
     } else if (k === 'text') {
       $('dlgBody').innerHTML = '<div style="padding:20px;text-align:center">正在通过 DataChannel 读取文本内容...</div>';
       try {
@@ -332,8 +365,10 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
         pre.textContent = text;
         $('dlgBody').innerHTML = '';
         $('dlgBody').appendChild(pre);
+        logMsg('文本内容已载入 (' + text.length + ' 字节): ' + filePath, '#9ece6a');
       } catch (e) {
         $('dlgBody').innerHTML = '<div style="color:#e5534b;padding:20px;">读取失败: ' + e.message + '</div>';
+        logMsg('文本读取失败: ' + e.message, '#e5534b');
       }
     } else {
       $('dlgBody').innerHTML = '<div style="text-align:center;padding:24px;">' +
