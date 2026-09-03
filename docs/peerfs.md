@@ -173,6 +173,7 @@ bash scripts/restore_demo_media.sh
 - 点击文件列表中的视频：触发 **Service Worker 虚拟 206 边下边播**；
 - 点击文件列表中的图片：触发 **ReadableStream 渐进式边下边显**；
 - 网络面板与日志框：**全程 0 条文件 HTTP GET 请求**，全量数据纯 WebRTC SCTP 管道疾速直连。
+- **独立中心信令与发现服务器部署实战**：详见 [docs/peerfs-center-server.md](peerfs-center-server.md)。
 
 ---
 
