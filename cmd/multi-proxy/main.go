@@ -6,9 +6,17 @@
 // 模型源名路由 (deepseek-v4-flash-<name>) /mode 同步全部删除——
 // 纯转发, capture-proxy 自己处理这些。
 //
+// Fallback 语义 (用户明确要求): 按 --source 顺序使用, 先用第一个;
+// 该源出现 exceed (429 或 FreeUsageLimitError / daily free usage limit)
+// 后设冷却到当日 UTC 午夜 (与 capture-proxy 每日 UTC 午夜重置一致,
+// 即"用尽即停, 当天不再碰它"), 后续请求自动换第二个;
+// 全部源 exceed/不可用后返回 429 (exceeded), 不注入、不透传具体错误。
+//
 // 用法:
 //
-//	multi-proxy --listen 127.0.0.1:8443 --source cp1=http://127.0.0.1:8000 --source cp2=http://other:8000
+//	multi-proxy --listen 127.0.0.1:8000 \
+//	  --source vps=https://vps.moonchan.xyz:8443 \
+//	  --source cloudcone=https://cloudcone.moonchan.xyz:8443
 //
 // API:
 //
@@ -50,6 +58,29 @@ const (
 	maxBody = 64 << 20
 )
 
+// nextUTCMidnight 下一个 UTC 午夜: 与 capture-proxy 的每日统计重置时刻一致,
+// exceed 冷却持续到那时, 到期后源自动恢复可用。
+func nextUTCMidnight() time.Time {
+	now := time.Now().UTC()
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+}
+
+// isExceed 判断上游响应是否表示"配额用尽" (需换源且当天不再用)。
+// 匹配 capture-proxy 的 429 响应形态 (local.go: 全栈耗尽统一 429,
+// error.type=FreeUsageLimitError, 或 Banned; 以及 body 里的 daily free
+// usage limit 文案)。
+func isExceed(status int, body []byte) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	for _, needle := range []string{"FreeUsageLimitError", "daily free usage limit", "exceeded", "Banned"} {
+		if bytes.Contains(body, []byte(needle)) {
+			return true
+		}
+	}
+	return false
+}
+
 // upstream 一个 capture-proxy 源。
 type upstream struct {
 	name string
@@ -59,6 +90,7 @@ type upstream struct {
 	cooldownUntil time.Time
 	lastErr       string
 	reqs          int64
+	exceeded      bool
 	// 最近一次失败的上游响应 (状态/错误体/响应头), 供 handleProxy
 	// 全源失败时聚合出最贴近上游的错误响应。
 	lastStatus     int
@@ -134,6 +166,8 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 顺序尝试; 冷却中的源直接跳过, 全源不可用时按最后一个错误响应。
+	// fallback 语义: 遇 exceed (429/FreeUsageLimitError) 的源冷却到当日
+	// UTC 午夜, 后续请求不再碰它, 自动换下一个; 全部 exceed/不可用回 429。
 	lastStatus := http.StatusBadGateway
 	var lastBody any = map[string]any{"error": map[string]any{"message": "all sources unavailable", "type": "UpstreamError"}}
 	var lastHeaders http.Header
@@ -151,7 +185,23 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		u.mu.Unlock()
 	}
 	if tried == 0 {
-		// 全部在冷却: 大概率是配额/临时故障, 回 429 而不是 502。
+		// 全部在冷却: 大概率是配额用尽/临时故障, 回 429 而不是 502。
+		// 至少一个源 exceed 过就明确报 exceeded (用户要求)。
+		anyExceeded := false
+		for _, u := range upList {
+			u.mu.Lock()
+			e := u.exceeded
+			u.mu.Unlock()
+			if e {
+				anyExceeded = true
+				break
+			}
+		}
+		if anyExceeded {
+			log.Printf("all sources exceeded -> 429")
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"message": "all sources exceeded daily free usage limit", "type": "FreeUsageLimitError"}})
+			return
+		}
 		log.Printf("all sources in cooldown -> 429")
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"message": "all sources in cooldown", "type": "UpstreamError"}})
 		return
@@ -190,11 +240,20 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, r *http.Request
 		if err := json.Unmarshal(data, &obj); err != nil {
 			obj = map[string]any{"error": map[string]any{"message": string(data)}}
 		}
-		// 4xx 业务错误 (400/404/429) 换源无意义但无害, 统一换下一个源;
-		// 不设冷却, 避免误锁正常服务的源。
 		u.setErr(fmt.Sprintf("HTTP %d", resp.StatusCode))
 		u.mu.Lock()
 		u.lastStatus, u.lastErrBody, u.lastErrHeaders = resp.StatusCode, obj, resp.Header
+		// exceed (429 / FreeUsageLimitError): 该源配额用尽, 冷却到当日
+		// UTC 午夜 (capture-proxy 每日重置时刻), 当天不再尝试它,
+		// 请求自动落到下一个源。非 exceed 的业务错误不设冷却,
+		// 避免误锁正常服务的源。
+		if isExceed(resp.StatusCode, data) {
+			u.exceeded = true
+			u.cooldownUntil = nextUTCMidnight()
+			log.Printf("%s: EXCEEDED HTTP %d -> cooldown until %s (UTC), next source", u.name, resp.StatusCode, u.cooldownUntil.UTC().Format("15:04"))
+		} else {
+			u.exceeded = false
+		}
 		u.mu.Unlock()
 		log.Printf("%s: HTTP %d -> next source", u.name, resp.StatusCode)
 		return false
@@ -202,6 +261,9 @@ func (s *server) tryUpstream(w http.ResponseWriter, u *upstream, r *http.Request
 
 	u.incrReqs()
 	u.setErr("")
+	u.mu.Lock()
+	u.exceeded = false
+	u.mu.Unlock()
 
 	if !isStream {
 		data, _ := io.ReadAll(resp.Body)
@@ -347,13 +409,14 @@ func (s *server) handler() http.Handler {
 			cd := u.cooldownUntil.Sub(now).Seconds()
 			lastErr := u.lastErr
 			reqs := u.reqs
+			exceeded := u.exceeded
 			u.mu.Unlock()
 			if cd < 0 {
 				cd = 0
 			}
 			srcs[u.name] = map[string]any{
 				"base": u.base, "cooldown_sec": int(cd),
-				"reqs": reqs, "last_err": lastErr,
+				"reqs": reqs, "last_err": lastErr, "exceeded": exceeded,
 			}
 		}
 		writeJSON(w, 200, map[string]any{"status": "ok", "sources": srcs})

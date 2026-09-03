@@ -819,11 +819,23 @@ func (p *proxy) cooldownSec(fam string, now time.Time) int {
 }
 
 // impersonate 让上游看到「真实 opencode 客户端」特征: 透传客户端 header, 缺失则补齐。
+// upstreamPath 把客户端请求路径映射为上游 zen 路径 (path 透传)。
+// /zen/* 原样转发 (/zen/go/v1/* 因此可达 go 上游); 其余旧别名挂到 /zen/v1
+// 下: /v1/chat/completions 与 /chat/completions 都落到 /zen/v1/chat/completions。
+func upstreamPath(p string) string {
+	if strings.HasPrefix(p, "/zen/") {
+		return p
+	}
+	return zenPath + strings.TrimPrefix(p, "/v1")
+}
+
 func (p *proxy) impersonate(req *http.Request, client http.Header) {
 	req.Header.Set("Content-Type", "application/json")
 	proxyheaders.ForwardRequestHeaders(req.Header, client)
-	// 固定使用 public key, 无视客户端 Authorization (用户明确要求: 全部走公共免费通道)。
-	req.Header.Set("Authorization", "Bearer "+defaultAPIKey)
+	// Authorization 透传 (用户要求: 不再自带 key)。旧版在这里强制覆盖成
+	// "Bearer public" (zen 只放行 free 模型时代的做法), 现在 key 完全由
+	// 客户端决定: 不传就是不带鉴权, 上游报 AuthError 原样回给客户端。
+	// ForwardRequestHeaders 已把客户端 Authorization 拷进 req, 这里不再动它。
 	// 伪装 opencode client: 除非客户端本来就是真实 opencode (UA 以 opencode 开头),
 	// 否则强制覆盖为 opencode UA。curl / Go 等默认 UA 会被上游 Cloudflare 挑战 hang。
 	if ua := client.Get("User-Agent"); !strings.HasPrefix(strings.ToLower(ua), "opencode") {
@@ -920,10 +932,11 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		if m, _ := payload["model"].(string); m != "" {
 			model = m
 		}
-		if model == "deepseek-v4-flash" {
-			model = defaultModel
-			log.Printf("model deepseek-v4-flash -> deepseek-v4-flash-free")
-		}
+		// 模型名原样透传 (用户要求: 允许所有模型)。旧版在这里把
+		// deepseek-v4-flash 改写成 -free, 那是 zen public 只放行 free 模型
+		// 时代的兜底; 现在策略改为客户端请求什么就转发什么, 不再改写,
+		// 也不拦截任何模型 —— 上游不支持的模型由上游报错并原样透传 (见下方
+		// 非 200 处理), 本层不再吞错误伪装成限额。
 		payload["model"] = model
 		// 强制 thinking 强度为 max: 客户端 (opencode.json reasoningEffort) 可配
 		// 其它值甚至不配, 但本 proxy 的定位是给免费模型打满推理, 一律钳到
@@ -955,6 +968,15 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 	// 上行字节不计在这里: 原始字节由 countingConn 在出站连接的传输层累计
 	// (含 TLS 握手/请求头), 与 ip-proxy 语义对齐, 见 makeClient 的 DialContext。
 
+	// 最后一个上游真实错误响应 (非 200 且非 FreeUsageLimitError), 全栈
+	// 尝试结束后透传给客户端; 零值表示从未拿到真实响应 (连接级失败/全冷却)。
+	var lastErrStatus int
+	var lastErrBody []byte
+	// path 透传 (用户要求): 上游路径由客户端请求路径决定, 不再固定
+	// /chat/completions 或按空 body 猜 /models。仅把非 /zen 前缀的旧
+	// 别名归一: /v1/x 与裸 /x 挂到 /zen/v1 下, 让以代理根为 baseURL 的
+	// 旧客户端继续工作; /zen/* 原样转发 (/zen/go/v1/* 因此可达 go 上游)。
+	upPath := upstreamPath(r.URL.Path)
 	for _, fam := range p.stacks(stackOverride) {
 		if p.inCooldown(fam, time.Now()) {
 			continue
@@ -963,15 +985,11 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		if fam == "v4" {
 			client = p.clientV4
 		}
-		path := "/chat/completions"
-		if len(body) == 0 {
-			path = "/models"
-		}
 		base := p.v6URL
 		if fam == "v4" {
 			base = p.v4URL
 		}
-		req, err := http.NewRequest(method, base+zenPath+path, strings.NewReader(bodyStr))
+		req, err := http.NewRequest(method, base+upPath, strings.NewReader(bodyStr))
 		if err != nil {
 			continue
 		}
@@ -1001,7 +1019,7 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 				}
 				// 必须重建请求: 原 req 的 Body 已被第一次尝试耗尽/关闭,
 				// 直接复用会报 "ContentLength=X with Body length 0"。
-				retryReq, rerr := http.NewRequest(method, base+zenPath+path, strings.NewReader(bodyStr))
+				retryReq, rerr := http.NewRequest(method, base+upPath, strings.NewReader(bodyStr))
 				if rerr != nil {
 					err = rerr
 				} else {
@@ -1041,6 +1059,18 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 				continue
 			}
 			st.add(0, 0, 1, 0)
+			// 真实错误透传 (用户要求: 不再把业务错误吞成限额 429)。拿到
+			// 上游 HTTP 响应但状态非 200 时, 记下最后一个真实响应:
+			// - 4xx 是请求本身的问题 (模型不存在/鉴权失败/参数错), 换 IP 栈
+			//   结果不会变, 立即透传给客户端;
+			// - 5xx 可能是单栈瞬时故障, 先试下一个栈, 全部失败后透传最后
+			//   一个真实响应。
+			// 只有「连 HTTP 响应都没拿到」(拨号/超时) 或全栈都命中
+			// FreeUsageLimitError 冷却时, 才落到函数末尾的统一 429。
+			lastErrStatus, lastErrBody = resp.StatusCode, data
+			if resp.StatusCode < 500 {
+				break
+			}
 			continue
 		}
 
@@ -1069,9 +1099,19 @@ func (p *proxy) handle(w http.ResponseWriter, r *http.Request, method string, ca
 		resp.Body.Close()
 	}
 
-	// 全栈耗尽: 一律统一回 429 (用户明确: 无论配额/超时/业务错误,
-	// 全栈耗尽都应 429; 不再注入 echo 继续, 也不透传 400/502/503 具体错误。
-	// 注入场景仅保留在已有响应后的 mid-stream 断流/工具停滞, 见 forwardStream)。
+	// 全栈尝试结束。优先透传拿到的真实上游错误 (用户要求: 不再把业务
+	// 错误吞成限额); 只有从未拿到真实响应 —— 拨号/超时连接级失败, 或全栈
+	// 命中 FreeUsageLimitError 冷却 —— 才回统一 429 (该路径语义仍是
+	// 「IP 不可用/免费额度耗尽」, 不是模型限制)。
+	if lastErrStatus != 0 {
+		h := w.Header()
+		h.Set("Content-Type", "application/json")
+		setCORS(h)
+		w.WriteHeader(lastErrStatus)
+		w.Write(lastErrBody)
+		log.Printf("passthrough upstream error %d (%d bytes)", lastErrStatus, len(lastErrBody))
+		return
+	}
 	writeJSON(w, 429, map[string]any{"error": map[string]any{"message": "All upstream IPs unavailable or reached daily free usage limit", "type": freeLimitErr}})
 }
 
@@ -1753,26 +1793,15 @@ func runProvider(args []string) {
 		})
 	}
 	mux.HandleFunc("/status", status)
-	// 兜底路由: 任何未匹配路径的 POST 都当 /chat/completions 转发,
-	// 任何 GET 都当 /status 查询 (兼容客户端发到自定义/其他路径的场景)。
-	// 控制 API (/mode /proxy /status) 因注册更具体路径优先匹配不受影响;
-	// 其余方法 (PUT/DELETE 等) 返回文本探测响应。
+	// 兜底路由: method/path 全透传 (用户要求)。除上面显式注册的控制 API
+	// (/mode /proxy /status, 更具体路径优先匹配) 外, 任何路径任何方法都
+	// 原样转发上游 —— 客户端完全决定 method+path+key。
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
 			writeJSON(w, 204, map[string]any{})
 			return
 		}
-		if r.Method == "POST" {
-			p.handle(w, r, r.Method, cap)
-			return
-		}
-		if r.Method == "GET" {
-			status(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(200)
-		w.Write([]byte("Local proxy running\n"))
+		p.handle(w, r, r.Method, cap)
 	})
 
 	srv := &http.Server{
