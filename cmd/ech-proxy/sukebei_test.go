@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,12 @@ func dohResolveA(ctx context.Context, host string) (string, error) {
 // sukebei.nyaa.si 不在 Cloudflare 后面（FranTech VPS，自签证书），
 // ECH 域前置无效，但 SNI 伪装实测可用。
 func TestSukebeiSNIFrontingNoProxy(t *testing.T) {
+	// 真实外网 SNI 伪装直连集成测试：依赖到 sukebei.nyaa.si 的出站网络，
+	// CI runner 环境无此网络会卡到 10 分钟总超时。默认跳过，仅本地验证时
+	// 显式置 NETWORK_TESTS=1 才跑。
+	if os.Getenv("NETWORK_TESTS") == "" {
+		t.Skip("skipping real-network SNI-fronting test; set NETWORK_TESTS=1 to enable")
+	}
 	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
 		"http_proxy", "https_proxy", "all_proxy", "no_proxy"} {
 		t.Setenv(k, "")
@@ -131,6 +138,11 @@ func TestSukebeiSNIFrontingNoProxy(t *testing.T) {
 // TestProxyHandlerSNIMode 验证本地代理按 Host 路由 sukebei.l.moonchan.xyz，
 // 走 SNI 伪装模式并能取回 nyaa 页面。
 func TestProxyHandlerSNIMode(t *testing.T) {
+	// 同上：该测试经 echproxy.ProxyHandler 真实连 sukebei.nyaa.si，CI 无网络
+	// 会卡住触发总超时。默认跳过，本地验证置 NETWORK_TESTS=1 才跑。
+	if os.Getenv("NETWORK_TESTS") == "" {
+		t.Skip("skipping real-network SNI-fronting test; set NETWORK_TESTS=1 to enable")
+	}
 	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
 		"http_proxy", "https_proxy", "all_proxy", "no_proxy"} {
 		t.Setenv(k, "")
