@@ -173,3 +173,253 @@ bash scripts/restore_demo_media.sh
 - 点击文件列表中的视频：触发 **Service Worker 虚拟 206 边下边播**；
 - 点击文件列表中的图片：触发 **ReadableStream 渐进式边下边显**；
 - 网络面板与日志框：**全程 0 条文件 HTTP GET 请求**，全量数据纯 WebRTC SCTP 管道疾速直连。
+
+---
+
+## 6. 其他独立前端页面接入实战教程（支持任意跨域、Vue/React 与静态站点）
+
+不仅限于节点自带的 `/__peerfs/` 控制台，任何独立的第三方网页（如跑在 `https://my-app.com`、Vite、Webpack、Next.js、Vue、React 或本地静态 HTML）均可直接接入远端的 `peerfs` 节点。
+
+### 6.1 核心跨域优势（天然零 CORS 限制）
+* **传统痛点**：跨域名请求大文件或视频流，必须在远端服务器配置严格的 CORS 头（`Access-Control-Allow-Origin`、`Access-Control-Allow-Headers: Range` 等），否则浏览器会直接拦截媒体流。
+* **peerfs 机制**：
+  * **媒体数据**：100% 运行在 WebRTC SCTP 管道内，不受浏览器同源策略（SOP）和 CORS 限制；
+  * **虚拟流代理**：`sw.js` 部署在你的前端站点域名下，`<video>` 和 `<img>` 请求的是本地同源地址（如 `https://my-app.com/__peerfs/stream/...`），被本地 Service Worker 截胡，**在物理层面彻底消灭了 CORS 跨域问题**。
+
+---
+
+### 6.2 接入所需的前端资源文件
+
+只需将以下 3 个文件放置在你的前端工程的公共静态资源目录（如 `public/`）中：
+
+1. **`peerjs.min.js`**：从 CDN 获取（或由节点提供）：
+   ```html
+   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+   ```
+2. **`bridge.js`**：本仓库 `pkg/peerfs/web/bridge.js`（核心客户端 SDK）。
+3. **`sw.js`**：本仓库 `pkg/peerfs/web/sw.js`（Service Worker 流式拦截器，必须放在你网站的根作用域下，例如 `public/sw.js`）。
+
+---
+
+### 6.3 完整单文件独立集成 Demo (`index.html`)
+
+在任意第三方 Web 服务器上创建一个 `index.html`，即可开箱即用地直连远程 Go 节点：
+
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>第三方网站接入 PeerFS 示例</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    video, img { max-width: 100%; border-radius: 8px; margin: 10px 0; background: #000; }
+    pre { background: #f4f4f5; padding: 12px; border-radius: 6px; overflow-x: auto; }
+    button { padding: 8px 16px; margin-right: 8px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>外部网站直连 PeerFS 媒体流</h1>
+  <div>
+    <button id="btnList">📂 遍历远程目录</button>
+    <button id="btnPlayVideo">▶ 边下边播视频 (Faststart MP4)</button>
+    <button id="btnShowImg">🖼 随下随显图片</button>
+    <button id="btnReadText">📄 读取文本内容</button>
+  </div>
+
+  <div id="mediaContainer"></div>
+  <pre id="output">等待操作...</pre>
+
+  <!-- 1. 引入依赖 -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="bridge.js"></script>
+
+  <script>
+    (async function () {
+      // 2. 注册 Service Worker 虚拟管道（支持边下边播与渐进式图像渲染）
+      if ('serviceWorker' in navigator) {
+        try {
+          await navigator.serviceWorker.register('sw.js', { scope: '/' });
+          console.log('[App] Service Worker 注册成功');
+        } catch (e) {
+          console.warn('[App] Service Worker 注册跳过，将降级为内存 Blob 模式:', e);
+        }
+      }
+
+      // 3. 初始化 PeerFS 客户端并直连远程 Go 节点
+      const fs = new PeerFS({
+        host: '8080-cs-1027351186466-default.cs-us-west1-ijlt.cloudshell.dev', // 你的节点/信令域名
+        port: 443,
+        secure: true,
+        key: 'peerjs',
+        peerId: 'wt-media-demo', // 目标 Go 节点 ID
+        conns: 64,               // 64 条轻量并发通道池
+      });
+
+      console.log('[App] 正在直连远程节点...');
+      await fs.connect();
+      console.log('[App] WebRTC 数据通道池就绪！');
+      document.getElementById('output').textContent = '节点直连成功！通道已就绪。';
+
+      // 4. 功能调用示例
+
+      // 示例 A: 遍历目录
+      document.getElementById('btnList').onclick = async () => {
+        const entries = await fs.list('/');
+        document.getElementById('output').textContent = JSON.stringify(entries, null, 2);
+      };
+
+      // 示例 B: 原生视频边下边播（首切片秒开，支持随意 Seek）
+      document.getElementById('btnPlayVideo').onclick = () => {
+        const container = document.getElementById('mediaContainer');
+        container.innerHTML = '';
+        const video = document.createElement('video');
+        video.controls = true;
+        video.autoplay = true;
+        video.playsInline = true;
+        container.appendChild(video);
+
+        // 调用 fs.play 或直接给 video.src 赋虚拟流地址
+        fs.play('/sample.mp4', video);
+        document.getElementById('output').textContent = '已挂载流媒体管道: /sample.mp4';
+      };
+
+      // 示例 C: 原生图片随下随显（边接收 64KB 切片边解码绘制）
+      document.getElementById('btnShowImg').onclick = () => {
+        const container = document.getElementById('mediaContainer');
+        container.innerHTML = '';
+        const img = document.createElement('img');
+        img.src = fs.streamUrl('/img/landscape.jpg'); // 接入虚拟流管道
+        container.appendChild(img);
+        document.getElementById('output').textContent = '已挂载流式图片: /img/landscape.jpg';
+      };
+
+      // 示例 D: 读取文本文件
+      document.getElementById('btnReadText').onclick = async () => {
+        const text = await fs.readText('/hello.txt');
+        document.getElementById('output').textContent = '文本内容:\n' + text;
+      };
+    })();
+  </script>
+</body>
+</html>
+```
+
+---
+
+### 6.4 Vue 3 / React 组件中的工程化接入方式
+
+#### Vue 3 示例
+```vue
+<script setup>
+import { onMounted, ref } from 'vue';
+
+const videoRef = ref(null);
+const fileList = ref([]);
+let fs = null;
+
+onMounted(async () => {
+  // 1. 注册 SW
+  if ('serviceWorker' in navigator) {
+    await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  }
+
+  // 2. 初始化 PeerFS (假定全局引入或以 npm 引入 bridge.js)
+  fs = new window.PeerFS({
+    host: 'node.your-domain.com',
+    port: 443,
+    secure: true,
+    peerId: 'wt-media-demo',
+    conns: 64,
+  });
+  await fs.connect();
+
+  // 3. 拉取目录
+  fileList.value = await fs.list('/');
+});
+
+function playVideo(path) {
+  if (fs && videoRef.value) {
+    fs.play(path, videoRef.value);
+  }
+}
+</script>
+
+<template>
+  <div>
+    <video ref="videoRef" controls autoplay playsinline style="width: 100%; max-width: 600px;" />
+    <ul>
+      <li v-for="item in fileList" :key="item.name">
+        {{ item.name }}
+        <button v-if="!item.dir" @click="playVideo('/' + item.name)">播放</button>
+      </li>
+    </ul>
+  </div>
+</template>
+```
+
+#### React 示例
+```jsx
+import React, { useEffect, useRef, useState } from 'react';
+
+export function MediaViewer() {
+  const videoRef = useRef(null);
+  const [files, setFiles] = useState([]);
+  const [fsClient, setFsClient] = useState(null);
+
+  useEffect(() => {
+    async function init() {
+      if ('serviceWorker' in navigator) {
+        await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+      }
+      const fs = new window.PeerFS({
+        host: 'node.your-domain.com',
+        port: 443,
+        secure: true,
+        peerId: 'wt-media-demo',
+        conns: 64,
+      });
+      await fs.connect();
+      setFsClient(fs);
+      const list = await fs.list('/');
+      setFiles(list);
+    }
+    init();
+  }, []);
+
+  const handlePlay = (path) => {
+    if (fsClient && videoRef.current) {
+      fsClient.play(path, videoRef.current);
+    }
+  };
+
+  return (
+    <div>
+      <video ref={videoRef} controls autoPlay playsInline style={{ width: '100%' }} />
+      <div>
+        {files.map((f) => (
+          <button key={f.name} onClick={() => handlePlay('/' + f.name)}>
+            {f.name}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+### 6.5 前端 SDK 核心 API 快速参考表
+
+| 方法 | 签名 | 说明 |
+| :--- | :--- | :--- |
+| **`connect`** | `fs.connect() : Promise<PeerFS>` | 连接信令，建立底层 WebRTC 会话并拉起 64 条轻量数据通道 |
+| **`play`** | `fs.play(path, mediaEl) : Promise` | **边下边播入口**：将 `<video>` 或 `<audio>` 绑定至虚拟流媒体通道，首切片即开播，支持进度条拖拽 |
+| **`streamUrl`** | `fs.streamUrl(path) : string` | 获取虚拟流式地址（如 `/__peerfs/stream/demo.mp4`），直接赋给 `<video src>` 或 `<img src>` |
+| **`url`** | `fs.url(path, opts) : Promise<string>` | **纯内存 Blob 入口**：将文件并发拉入浏览器内存并生成 `blob:` URL（适合小文件或无 SW 环境） |
+| **`list`** | `fs.list(dirPath) : Promise<Entry[]>` | 遍历远程节点指定目录下的文件与子文件夹列表 |
+| **`readText`**| `fs.readText(path) : Promise<string>` | 读取纯文本文件（UTF-8 解码） |
+| **`download`**| `fs.download(path, filename) : Promise` | 直接触发浏览器下载，大文件自动通过 64 通道分片并行加速 |
+| **`stat`** | `fs.stat(path) : Promise<Meta>` | 获取文件大小等元数据（不下载数据主体） |
+| **`close`** | `fs.close()` | 彻底断开数据通道与信令，销毁连接池与定时器 |
