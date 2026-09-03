@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hana-ame/wintools/pkg/netdial"
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -22,23 +28,40 @@ func doHTTP(req *http.Request, timeout time.Duration) (*http.Response, error) {
 	return c.Do(req)
 }
 
+var (
+	defaultUDPMuxOnce sync.Once
+	defaultUDPConn    *net.UDPConn
+	defaultUDPMux     ice.UDPMux
+)
+
+func getUDPMux() (ice.UDPMux, *net.UDPConn, error) {
+	var err error
+	defaultUDPMuxOnce.Do(func() {
+		defaultUDPConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err == nil {
+			defaultUDPMux = webrtc.NewICEUDPMux(nil, defaultUDPConn)
+		}
+	})
+	return defaultUDPMux, defaultUDPConn, err
+}
+
 // newPeerConnection 创建 PeerConnection；cfg.ICEHook 非空时允许调用方定制
 // Configuration/SettingEngine（测试注入 loopback 候选、部署换 TURN 等）。
 func newPeerConnection(connectionId string, cfg *Config) (*webrtc.PeerConnection, error) {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-			{
-				URLs: []string{
-					"turn:eu-0.turn.peerjs.com:3478",
-					"turn:us-0.turn.peerjs.com:3478",
-				},
-				Username:   "peerjs",
-				Credential: "peerjsp",
-			},
+			{URLs: []string{
+				"stun:stun.l.google.com:19302",
+				"stun:stun1.l.google.com:19302",
+				"stun:stun.cloudflare.com:3478",
+			}},
 		},
 	}
 	s := webrtc.SettingEngine{}
+	s.SetIncludeLoopbackCandidate(true)
+	if mux, _, err := getUDPMux(); err == nil && mux != nil {
+		s.SetICEUDPMux(mux)
+	}
 	if cfg != nil && cfg.ICEHook != nil {
 		cfg.ICEHook(&config, &s)
 	}
@@ -73,8 +96,9 @@ type DataConnection struct {
 	serialization string
 	reliable      bool
 
-	pc  *webrtc.PeerConnection
-	rdc *webrtc.DataChannel
+	pc      *webrtc.PeerConnection
+	rdc     *webrtc.DataChannel
+	isChild bool
 
 	mu        sync.Mutex
 	open      bool
@@ -135,9 +159,40 @@ func (dc *DataConnection) onOffer() {
 	}
 	dc.pc = pc
 
+	var firstChannel atomic.Bool
+	firstChannel.Store(true)
+
 	pc.OnDataChannel(func(ch *webrtc.DataChannel) {
-		dc.rdc = ch
-		dc.wireDataChannel()
+		if firstChannel.CompareAndSwap(true, false) {
+			dc.rdc = ch
+			dc.wireDataChannel()
+			return
+		}
+
+		// 方案 2: 同一 WebRTC PeerConnection 下并发建立多条轻量 DataChannel
+		subDC := &DataConnection{
+			peer:          dc.peer,
+			remote:        dc.remote,
+			connectionId:  fmt.Sprintf("%s-%s", dc.connectionId, ch.Label()),
+			label:         ch.Label(),
+			serialization: dc.serialization,
+			reliable:      dc.reliable,
+			pc:            dc.pc,
+			rdc:           ch,
+			isChild:       true,
+			msgs:          make(chan []byte, 64),
+			closeCh:       make(chan struct{}),
+		}
+		subDC.wireDataChannel()
+
+		dc.peer.mu.Lock()
+		dc.peer.conns[subDC.connectionId] = subDC
+		onConn := dc.peer.onConn
+		dc.peer.mu.Unlock()
+
+		if onConn != nil {
+			onConn(subDC)
+		}
 	})
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -253,9 +308,68 @@ func (dc *DataConnection) addCandidate(cand []byte) {
 		dc.peer.Debugf("bad candidate: %v", err)
 		return
 	}
+	if c.Candidate != "" {
+		go PunchCandidate(c.Candidate)
+	}
 	if err := dc.pc.AddICECandidate(c); err != nil {
 		dc.peer.Debugf("add candidate: %v", err)
 	}
+}
+
+// PunchCandidate 解析对端 (浏览器) 候选并主动发射出站 UDP STUN Ping 包，
+// 强制 NAT / 云端防火墙创建会话映射表项 (Stateful Connection Tracking)，
+// 实现出站打洞，使对端后续的数据通道报文能够穿透入站防火墙。
+func PunchCandidate(candStr string) {
+	fields := strings.Fields(candStr)
+	if len(fields) < 8 {
+		return
+	}
+	transport := strings.ToLower(fields[2])
+	if transport != "udp" {
+		return
+	}
+	ipStr := fields[4]
+	portStr := fields[5]
+	if strings.HasSuffix(ipStr, ".local") {
+		return // mDNS 地址无法直连
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return
+	}
+	raddr := &net.UDPAddr{IP: ip, Port: port}
+
+	// 关键：必须从 Pion 正在监听的同一块 UDP Socket (udpConn) 发出出站打洞包！
+	// 这样 NAT / 云防火墙建立的放行规则才恰好对应 Pion 的监听端口。
+	_, uConn, _ := getUDPMux()
+
+	// 构造标准 STUN Binding Request 请求包头 (RFC 5389)
+	stunReq := []byte{
+		0x00, 0x01, 0x00, 0x00, // Binding Request, length = 0
+		0x21, 0x12, 0xa4, 0x42, // Magic Cookie
+		0x70, 0x65, 0x65, 0x72, 0x66, 0x73, 0x2d, 0x70, 0x69, 0x6e, 0x67, 0x21, // Transaction ID
+	}
+	for i := 0; i < 3; i++ {
+		if uConn != nil {
+			_, _ = uConn.WriteTo(stunReq, raddr)
+		} else {
+			conn, err := net.DialUDP("udp", nil, raddr)
+			if err == nil {
+				_, _ = conn.Write(stunReq)
+				conn.Close()
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	localPort := 0
+	if uConn != nil {
+		localPort = uConn.LocalAddr().(*net.UDPAddr).Port
+	}
+	log.Printf("[peerfs-punch] sent outbound UDP STUN hole-punch ping (local_port=%d) to browser: %s:%d", localPort, ipStr, port)
 }
 
 // markRemoteDesc 在 SetRemoteDescription 成功后调用：解锁候选缓存并回放。
@@ -326,7 +440,7 @@ func (dc *DataConnection) Close() {
 	if dc.rdc != nil {
 		dc.rdc.Close()
 	}
-	if dc.pc != nil {
+	if !dc.isChild && dc.pc != nil {
 		dc.pc.Close()
 	}
 	dc.peer.mu.Lock()

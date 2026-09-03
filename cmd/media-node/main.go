@@ -104,7 +104,11 @@ func main() {
 		log.Fatalf("peer start: %v", err)
 	}
 	log.Printf("peer id: %s  root: %s", node.ID(), *dir)
-	log.Printf("console: http://127.0.0.1%s/__peerfs/", *listen)
+	consoleHost := *listen
+	if strings.HasPrefix(consoleHost, ":") || strings.HasPrefix(consoleHost, "0.0.0.0:") {
+		consoleHost = "127.0.0.1" + consoleHost[strings.Index(consoleHost, ":"):]
+	}
+	log.Printf("console: http://%s/__peerfs/", consoleHost)
 
 	select {} // 阻塞主 goroutine
 }

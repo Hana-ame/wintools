@@ -484,3 +484,23 @@ func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
 }
+
+// AddRemoteCandidate 将外部通道（如 HTTP 8080 临时候选通道）接收到的对端 ICE 候选直接注入连接。
+func (p *Peer) AddRemoteCandidate(connId string, cand webrtc.ICECandidateInit) {
+	p.mu.Lock()
+	var dc *DataConnection
+	if connId != "" {
+		dc = p.conns[connId]
+	}
+	if dc == nil {
+		for _, c := range p.conns {
+			dc = c
+			break
+		}
+	}
+	p.mu.Unlock()
+	if dc != nil {
+		b, _ := json.Marshal(cand)
+		dc.handleCandidate(b)
+	}
+}

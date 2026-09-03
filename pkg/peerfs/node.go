@@ -45,10 +45,22 @@ type Header struct {
 	Path    string  `json:"path,omitempty"`    // list/read
 	Offset  int64   `json:"offset,omitempty"`  // read
 	Size    int64   `json:"size,omitempty"`    // read；-1 = 读到文件尾
-	Total   int64   `json:"total,omitempty"`   // meta
-	ReqID   string  `json:"reqId,omitempty"`   // 除 hello 外必带
-	Msg     string  `json:"msg,omitempty"`     // err
-	Entries []Entry `json:"entries,omitempty"` // entries
+	Total    int64   `json:"total,omitempty"`   // meta
+	FileSize int64   `json:"fileSize,omitempty"`// meta: 完整文件大小
+	ReqID    string  `json:"reqId,omitempty"`   // 除 hello 外必带
+	Msg      string  `json:"msg,omitempty"`     // err
+	Entries  []Entry `json:"entries,omitempty"` // entries
+}
+
+// UnmarshalJSON 为 Header 提供默认值：未传 size 时默认 -1（读到文件尾）。
+func (h *Header) UnmarshalJSON(b []byte) error {
+	type alias Header
+	raw := alias{Size: -1}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*h = Header(raw)
+	return nil
 }
 
 // Entry 是 list 返回的目录项。
@@ -102,6 +114,13 @@ func (n *Node) ID() string {
 	return n.peer.ID()
 }
 
+// InjectCandidate 允许通过外部通道（如 HTTP 8080 临时候选通道）直接向正在建立的连接注入对端候选。
+func (n *Node) InjectCandidate(connId string, cand webrtc.ICECandidateInit) {
+	if n.peer != nil {
+		n.peer.AddRemoteCandidate(connId, cand)
+	}
+}
+
 // Start 注册信令并开始接受浏览器的 DataChannel 连接。
 func (n *Node) Start(ctx context.Context) error {
 	n.startOnce.Do(func() { n.startErr = n.start(ctx) })
@@ -138,6 +157,7 @@ func (n *Node) Close() error {
 // connState 是一条入站 DataConnection 的会话状态。
 type connState struct {
 	n      *Node
+	remote string
 	authed bool
 }
 
@@ -149,19 +169,22 @@ type frameWriter interface {
 }
 
 func (n *Node) onConn(dc *peerjs.DataConnection) {
-	st := &connState{n: n}
+	remote := dc.Remote()
+	st := &connState{n: n, remote: remote}
+	log.Printf("[peerfs] incoming connection from %s", remote)
+
 	// hello 门禁：超时未通过认证直接关连接（防任意网页猜到 ID 就能读文件）。
 	t := time.AfterFunc(helloTimeout, func() {
 		if !st.authed {
-			log.Printf("peerfs: %s handshake timeout, closing", dc.Remote())
+			log.Printf("[peerfs] %s handshake timeout, closing", remote)
 			dc.Close()
 		}
 	})
-	dc.OnClose(func() { t.Stop() })
+	dc.OnClose(func() {
+		t.Stop()
+		log.Printf("[peerfs] connection closed: %s", remote)
+	})
 	dc.OnMessageKind(func(m peerjs.Message) { st.onMessage(dc, m) })
-	if n.cfg.Debug {
-		log.Printf("peerfs: connection from %s", dc.Remote())
-	}
 }
 
 func (st *connState) onMessage(dc frameWriter, m peerjs.Message) {
@@ -176,6 +199,7 @@ func (st *connState) onMessage(dc frameWriter, m peerjs.Message) {
 	}
 	if !st.authed {
 		if h.Type != "hello" {
+			log.Printf("[peerfs] %s rejected: non-hello first frame", st.remote)
 			dc.Close()
 			return
 		}
@@ -185,13 +209,15 @@ func (st *connState) onMessage(dc frameWriter, m peerjs.Message) {
 			return
 		}
 		st.authed = true
+		log.Printf("[peerfs] %s handshake authenticated", st.remote)
 		return
 	}
 	switch h.Type {
+	case "ping":
+		_ = dc.SendText(`{"type":"pong"}`)
+	case "pong":
+		// 保活确认，无需额外操作
 	case "list":
-		// 同步处理（不 spawn goroutine）：pion 按序投递消息，同步执行即天然
-		// 严格 lock-step —— 上一请求响应发完才处理下一个头；SendThrottled 等
-		// 远端排空不会死锁（浏览器/SCTP 接收与我们的发送互不阻塞）。
 		st.handleList(dc, h)
 	case "read":
 		st.handleRead(dc, h)
@@ -234,6 +260,7 @@ func (st *connState) handleList(dc frameWriter, h Header) {
 		entries = append(entries, e)
 	}
 	b, _ := json.Marshal(Header{Type: "entries", ReqID: h.ReqID, Entries: entries})
+	log.Printf("[peerfs] %s: list %s -> %d entries", st.remote, name, len(entries))
 	dc.SendText(string(b))
 }
 
@@ -272,8 +299,9 @@ func (st *connState) handleRead(dc frameWriter, h Header) {
 	if h.Size >= 0 && h.Size < total {
 		total = h.Size
 	}
+	log.Printf("[peerfs] %s: read %s (offset=%d, size=%d, total=%d, fileSize=%d)", st.remote, name, h.Offset, h.Size, total, size)
 	// meta 先行：浏览器按 total 计数收块，收满等 done 帧。
-	headB, _ := json.Marshal(Header{Type: "meta", ReqID: h.ReqID, Total: total})
+	headB, _ := json.Marshal(Header{Type: "meta", ReqID: h.ReqID, Total: total, FileSize: size})
 	if err := dc.SendText(string(headB)); err != nil {
 		return
 	}
@@ -299,13 +327,13 @@ func (st *connState) handleRead(dc frameWriter, h Header) {
 	}
 	doneB, _ := json.Marshal(Header{Type: "done", ReqID: h.ReqID})
 	dc.SendText(string(doneB))
+	log.Printf("[peerfs] %s: read %s done", st.remote, name)
 }
 
 func (st *connState) replyErr(dc frameWriter, reqID, msg string) {
+	log.Printf("[peerfs] %s: error (reqId=%s): %s", st.remote, reqID, msg)
 	b, _ := json.Marshal(Header{Type: "err", ReqID: reqID, Msg: msg})
 	if err := dc.SendText(string(b)); err != nil {
-		if st.n.cfg.Debug {
-			log.Printf("peerfs: send err frame: %v", err)
-		}
+		log.Printf("[peerfs] %s: send err frame failed: %v", st.remote, err)
 	}
 }

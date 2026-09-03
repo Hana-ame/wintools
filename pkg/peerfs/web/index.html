@@ -3,61 +3,120 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>peerfs — 浏览器文件浏览</title>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<title>peerfs v2.4.11 — 浏览器 P2P 文件流式播放与直取</title>
+<script src="peerjs.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, sans-serif; background: #111; color: #ddd; margin: 0; padding: 16px; max-width: 960px; margin-inline: auto; }
-  h1 { font-size: 18px; margin: 0 0 12px; }
+  body { font-family: system-ui, sans-serif; background: #111; color: #ddd; margin: 0; padding: 16px; max-width: 980px; margin-inline: auto; }
+  h1 { font-size: 18px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .badge { font-size: 11px; background: #2a3a4e; color: #7ab3e0; border-radius: 4px; padding: 2px 6px; font-weight: normal; }
   .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: #1b1b1f; border-radius: 8px; padding: 10px; margin-bottom: 12px; }
   .bar input { background: #26262c; border: 1px solid #3a3a44; color: #eee; border-radius: 6px; padding: 6px 8px; font-size: 13px; }
-  #host { width: 170px; } #port { width: 64px; } #peerId { width: 150px; } #token { width: 110px; }
-  button { background: #3b6ea5; color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-size: 13px; }
+  #host { width: 150px; } #port { width: 64px; } #peerId { width: 140px; } #token { width: 90px; } #conns { width: 55px; }
+  button { background: #3b6ea5; color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-size: 13px; font-weight: 500; }
   button:hover { filter: brightness(1.15); }
-  button.sec { background: transparent; border: 1px solid #3a3a44; color: #aaa; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; margin-right: 4px; }
+  button.sec { background: #2a2a30; border: 1px solid #3a3a44; color: #aaa; }
+  button.sec:hover { background: #35353d; color: #eee; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; }
   .dot.on { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
   .dot.err { background: #e5534b; }
-  #status { font-size: 13px; color: #999; }
-  .crumbs { margin: 8px 0; font-size: 14px; }
+  #status { font-size: 13px; color: #999; flex: 1; }
+  
+  /* 直取 / 边下边播快速面板 */
+  .quick-panel { background: #18191f; border: 1px solid #2f3342; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+  .quick-panel h2 { font-size: 14px; margin: 0 0 8px; color: #a2c4e8; display: flex; align-items: center; justify-content: space-between; }
+  .quick-row { display: flex; gap: 8px; align-items: center; }
+  .quick-row input { flex: 1; background: #22232a; border: 1px solid #3a3c48; color: #fff; border-radius: 6px; padding: 7px 10px; font-size: 13px; }
+  .quick-tip { font-size: 11px; color: #777; margin-top: 6px; }
+
+  .crumbs { margin: 12px 0 6px; font-size: 14px; }
   .crumbs a { color: #7ab3e0; cursor: pointer; text-decoration: none; margin-right: 2px; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #24242a; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 6px; }
+  td, th { text-align: left; padding: 7px 10px; border-bottom: 1px solid #24242a; }
   tr:hover td { background: #1c1c22; }
   a.name { color: #cde3f7; cursor: pointer; text-decoration: none; }
-  td.size { color: #888; white-space: nowrap; }
+  td.size { color: #888; white-space: nowrap; font-size: 12px; }
   td.act { text-align: right; white-space: nowrap; }
-  td.act button { padding: 3px 10px; font-size: 12px; background: #2c2c33; }
-  dialog { background: #16161a; color: #ddd; border: 1px solid #333; border-radius: 10px; max-width: 92vw; }
-  dialog::backdrop { background: rgba(0,0,0,.65); }
-  dialog img, dialog video { max-width: 88vw; max-height: 78vh; display: block; margin-bottom: 8px; background: #000; }
+  td.act button { padding: 4px 10px; font-size: 12px; margin-left: 4px; }
+  
+  dialog { background: #16161a; color: #ddd; border: 1px solid #3a3a44; border-radius: 10px; max-width: 94vw; max-height: 90vh; padding: 16px; }
+  dialog::backdrop { background: rgba(0,0,0,.75); }
+  dialog video, dialog img { max-width: 88vw; max-height: 75vh; display: block; margin: 8px auto 12px; background: #000; border-radius: 4px; }
+  .dialog-footer { display: flex; justify-content: space-between; align-items: center; }
   .empty { color: #777; padding: 24px 0; text-align: center; }
 </style>
 </head>
 <body>
-<h1><span class="dot" id="dot"></span> peerfs <span id="status">未连接</span></h1>
+<h1>
+  <span class="dot" id="dot"></span>
+  peerfs <span class="badge" style="background:#1d3b2b;color:#4caf50;font-weight:bold;">v2.4.12</span>
+  <span class="badge" id="rootBadge" style="background:#262633;color:#a2c4e8;">挂载目录: 加载中...</span>
+  <span class="badge" id="poolBadge">Para-Conns 就绪</span>
+  <span id="status">未连接</span>
+</h1>
 
+<!-- 连接参数栏 -->
 <div class="bar">
-  <input id="host" placeholder="信令 host" title="信令服务器 host（同机部署时=本页地址的 host）">
+  <input id="host" placeholder="信令 host" title="信令服务器 host">
   <input id="port" type="number" placeholder="port" title="信令端口">
   <label style="font-size:13px"><input type="checkbox" id="secure"> TLS</label>
-  <input id="key" placeholder="key" value="peerjs" style="width:80px">
-  <input id="peerId" placeholder="节点 peer id" title="后端节点的 PeerJS ID">
-  <input id="token" placeholder="token(可选)" title="数据面 hello 校验 token">
-  <button id="btnConn">连接</button>
+  <input id="key" placeholder="key" value="peerjs" style="width:70px">
+  <input id="peerId" value="__TARGET_PEER_ID__" placeholder="节点 peer id" title="目标节点 PeerJS ID">
+  <input id="token" placeholder="token(可选)">
+  <input id="conns" type="number" value="64" title="并行通道数量" style="width:50px">
+  <button id="btnConn">连接节点</button>
 </div>
 
-<div class="crumbs" id="crumbs"></div>
-<table id="tbl" style="display:none">
-  <thead><tr><th>名称</th><th>大小</th><th></th></tr></thead>
-  <tbody id="rows"></tbody>
-</table>
-<div class="empty" id="empty">连接节点后浏览文件</div>
+<!-- 快速直取 / 边下边播面板（核心：无需遍历目录即可直接获取或播放） -->
+<div class="quick-panel" id="quickPanel">
+  <h2>
+    <span>⚡ 直接获取 / 边下边播</span>
+    <span style="font-size:11px;color:#888;">支持任意路径直接输入，免去逐层 list</span>
+  </h2>
+  <div class="quick-row">
+    <input id="directPath" placeholder="输入文件相对路径，如: sample.mp4 或 hello.txt">
+    <button id="btnPlayStream" style="background:#2e7d32">▶ 边下边播</button>
+    <button id="btnDownloadDirect" class="sec">⬇ 下载文件</button>
+    <button id="btnStatDirect" class="sec">ℹ 查看信息</button>
+  </div>
+  <div class="quick-tip">
+    💡 边下边播已启用 Service Worker 虚拟 Range 代理，秒开大文件，支持进度条任意拖动与 Seek。
+  </div>
+</div>
 
+<!-- 目录浏览区域（依然完整保留并暴露） -->
+<div id="browsePanel">
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+    <div class="crumbs" id="crumbs"></div>
+    <button id="btnRefresh" class="sec" style="padding:4px 10px; font-size:12px;">🔄 刷新列表</button>
+  </div>
+  <table id="tbl">
+    <thead><tr><th>名称</th><th>大小</th><th style="text-align:right">操作</th></tr></thead>
+    <tbody id="rows">
+      <tr><td colspan="3" style="text-align:center;color:#888;padding:24px;">正在连接 WebRTC 并加载文件列表...</td></tr>
+    </tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">暂无文件</div>
+</div>
+
+<!-- 实时运行日志控制台 (免 F12 查看) -->
+<div style="margin-top:20px;background:#141418;border:1px solid #282832;border-radius:8px;padding:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+    <span style="font-size:12px;font-weight:bold;color:#888;">📡 实时运行日志 (免 F12 调试)</span>
+    <button onclick="document.getElementById('clientLogs').innerHTML=''" class="sec" style="padding:2px 8px;font-size:11px;">清空</button>
+  </div>
+  <div id="clientLogs" style="max-height:160px;overflow-y:auto;font-family:monospace;font-size:12px;color:#bbb;line-height:1.6;"></div>
+</div>
+
+<!-- 播放 / 预览弹窗 -->
 <dialog id="dlg">
+  <div id="dlgTitle" style="font-size:14px;font-weight:bold;margin-bottom:8px"></div>
   <div id="dlgBody"></div>
-  <button onclick="document.getElementById('dlg').close()">关闭</button>
+  <div class="dialog-footer">
+    <div id="dlgInfo" style="font-size:12px;color:#888"></div>
+    <button onclick="closeDialog()" class="sec">关闭</button>
+  </div>
 </dialog>
 
 <script src="bridge.js"></script>
@@ -70,19 +129,29 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
   var $ = function (id) { return document.getElementById(id); };
   var fs = null, cwd = '/';
 
-  // 配置优先级：URL 参数 > 节点注入 config > 默认
-  // 节点注入的 sig.host="" 表示「内嵌信令，用同源 location.host」
+  // 注册 Service Worker 实现虚拟 HTTP 206 边下边播
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js', { scope: '/__peerfs/' }).then(function (reg) {
+      try { reg.update(); } catch (e) {}
+      console.log('[peerfs] Service Worker registered with scope:', reg.scope);
+      logMsg('Service Worker 虚拟流媒体管道已就绪', '#73daca');
+    }).catch(function (err) {
+      console.warn('[peerfs] Service Worker register failed:', err);
+      logMsg('Service Worker 注册失败 (回退至纯 DataChannel 模式): ' + err.message, '#e0af68');
+    });
+  }
+
   async function loadConfig() {
-    var cfg = {};
-    try {
-      var r = await fetch('config.json');
-      if (r.ok) cfg = await r.json();
-    } catch (e) { /* 静态托管场景无 config.json */ }
+    var cfg = (typeof window.__PEERFS__ === 'object' && window.__PEERFS__ !== null) ? window.__PEERFS__ : {};
+    if (!cfg.peerId) {
+      try {
+        var r = await fetch('config.json');
+        if (r.ok) cfg = await r.json();
+      } catch (e) {}
+    }
     var sig = (cfg.signaling != null) ? cfg.signaling : {};
     var q = new URLSearchParams(location.search);
-    // 如果 sig.host 是空字符串（内嵌信令标志），且 URL 参数没覆盖，则用页面 host
     var useSameHost = (sig.host === '' && !q.has('host'));
-    // location.port 在 80/443 时返回空字符串
     var pagePort = location.port || (location.protocol === 'https:' ? 443 : 80);
     return {
       host: q.get('host') || (useSameHost ? location.hostname : sig.host) || '0.peerjs.com',
@@ -91,19 +160,41 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
       key: q.get('key') || sig.key || 'peerjs',
       peerId: q.get('peer') || cfg.peerId || '',
       token: localStorage.getItem('peerfs_token') || '',
+      conns: +(q.get('conns') || 64),
+      root: cfg.root || '',
     };
   }
 
   function fillForm(c) {
-    $('host').value = c.host; $('port').value = c.port;
-    $('secure').checked = c.secure; $('key').value = c.key;
+    if (c.root) $('rootBadge').textContent = '挂载目录: ' + c.root;
+    $('host').value = c.host;
+    $('port').value = c.port;
+    $('secure').checked = c.secure;
+    $('key').value = c.key;
     if (c.peerId) $('peerId').value = c.peerId;
     if (c.token) $('token').value = c.token;
+    if (c.conns) $('conns').value = c.conns;
+  }
+
+  function logMsg(msg, color) {
+    var el = $('clientLogs');
+    if (!el) return;
+    var d = new Date();
+    var timeStr = [d.getHours(), d.getMinutes(), d.getSeconds()].map(function(n) { return n < 10 ? '0' + n : n; }).join(':');
+    var div = document.createElement('div');
+    div.style.color = color || '#aaa';
+    div.textContent = '[' + timeStr + '] ' + msg;
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
   }
 
   function status(txt, cls) {
     $('status').textContent = txt;
     $('dot').className = 'dot' + (cls ? ' ' + cls : '');
+    if (txt) {
+      var col = cls === 'err' ? '#f7768e' : (cls === 'on' ? '#9ece6a' : '#7aa2f7');
+      logMsg(txt, col);
+    }
   }
 
   function fmtSize(n) {
@@ -118,6 +209,7 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
     if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 'svg'].indexOf(ext) >= 0) return 'image';
     if (['mp4', 'webm', 'mkv', 'mov', 'm4v'].indexOf(ext) >= 0) return 'video';
     if (['mp3', 'ogg', 'wav', 'flac', 'm4a'].indexOf(ext) >= 0) return 'audio';
+    if (['txt', 'md', 'log', 'json', 'js', 'go', 'html', 'css', 'xml', 'sh', 'yaml', 'yml'].indexOf(ext) >= 0) return 'text';
     return 'other';
   }
 
@@ -134,10 +226,15 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
     parts.forEach(function (seg) { acc += '/' + seg; mk(seg, acc); });
   }
 
+  // 浏览目录（依然暴露）
   async function browse(path) {
+    if (!fs) return;
     try {
+      status('正在列出 ' + path + '...', '');
       var entries = await fs.list(path);
+      logMsg('收到目录 ' + path + ' 共 ' + entries.length + ' 项: ' + entries.map(function (e) { return e.name; }).join(', '), '#9ece6a');
       cwd = path; crumbs(path);
+      status('已连接到 ' + fs.peerId + ' (' + fs.workers.length + ' 通道)', 'on');
       $('tbl').style.display = ''; $('empty').style.display = 'none';
       var rows = $('rows'); rows.innerHTML = '';
       entries.sort(function (a, b) { return (b.dir - a.dir) || a.name.localeCompare(b.name); });
@@ -146,66 +243,215 @@ window.__PEERFS__ = __PEERFS_CONFIG__;
         var full = (path === '/' ? '' : path) + '/' + e.name;
         var nameTd = document.createElement('td');
         var a = document.createElement('a'); a.className = 'name'; a.textContent = (e.dir ? '📁 ' : '') + e.name;
-        a.onclick = function () { e.dir ? browse(full) : openFile(e.name, full); };
+        a.onclick = function () { e.dir ? browse(full) : playOrOpen(full, e.name); };
         nameTd.appendChild(a);
         var sizeTd = document.createElement('td'); sizeTd.className = 'size';
         sizeTd.textContent = e.dir ? '' : fmtSize(e.size);
         var actTd = document.createElement('td'); actTd.className = 'act';
-        var k = kind(e.name);
-        if (!e.dir && k !== 'other') {
-          var b = document.createElement('button'); b.textContent = '预览';
-          b.onclick = function () { openFile(e.name, full); };
-          actTd.appendChild(b);
+
+        if (!e.dir) {
+          var k = kind(e.name);
+          if (k === 'video' || k === 'audio') {
+            var btnStream = document.createElement('button');
+            btnStream.textContent = '▶ 播放';
+            btnStream.style.background = '#2e7d32';
+            btnStream.onclick = function () { playOrOpen(full, e.name); };
+            actTd.appendChild(btnStream);
+          } else if (k === 'image') {
+            var btnView = document.createElement('button');
+            btnView.textContent = '预览';
+            btnView.onclick = function () { playOrOpen(full, e.name); };
+            actTd.appendChild(btnView);
+          } else if (k === 'text') {
+            var btnText = document.createElement('button');
+            btnText.textContent = '查看';
+            btnText.onclick = function () { playOrOpen(full, e.name); };
+            actTd.appendChild(btnText);
+          }
+          var btnDl = document.createElement('button');
+          btnDl.textContent = '⬇';
+          btnDl.className = 'sec';
+          btnDl.title = '下载';
+          btnDl.onclick = function () { fs.download(full, e.name); };
+          actTd.appendChild(btnDl);
         }
+
         tr.appendChild(nameTd); tr.appendChild(sizeTd); tr.appendChild(actTd);
         rows.appendChild(tr);
       });
+      if (entries.length === 0) {
+        $('tbl').style.display = 'none'; $('empty').style.display = '';
+      }
     } catch (err) {
       status('list 失败: ' + err.message, 'err');
     }
   }
 
-  async function openFile(name, full) {
-    var dlg = $('dlg'), body = $('dlgBody');
-    body.textContent = '加载中… (' + name + ')';
+  // 直接播放 / 预览逻辑（利用 Service Worker 边下边播或内存直接呈现）
+  async function playOrOpen(filePath, displayName) {
+    var name = displayName || filePath.split('/').pop();
+    var k = kind(name);
+    logMsg('点开文件: ' + filePath + ' (类型: ' + k + ')', '#e0af68');
+    var dlg = $('dlg');
+    $('dlgTitle').textContent = name;
+    $('dlgBody').innerHTML = '<div style="padding:20px;text-align:center">正在加载通道数据...</div>';
+    $('dlgInfo').textContent = filePath;
     dlg.showModal();
-    try {
-      var k = kind(name), url = await fs.url(full);
-      body.innerHTML = '';
-      if (k === 'image') {
-        var img = new Image(); img.src = url; body.appendChild(img);
-      } else {
-        var v = document.createElement(k === 'audio' ? 'audio' : 'video');
-        v.src = url; v.controls = true; if (k === 'video') { v.autoplay = true; }
-        body.appendChild(v);
+
+    if (k === 'video' || k === 'audio') {
+      $('dlgBody').innerHTML = '<div style="padding:24px;text-align:center">⏳ 正在通过 WebRTC DataChannel 读取数据并生成纯内存 Blob...</div>';
+      try {
+        var u = await fs.url(filePath);
+        var media = document.createElement(k);
+        media.controls = true;
+        media.autoplay = true;
+        media.style.width = '100%';
+        media.src = u;
+        $('dlgBody').innerHTML = '';
+        $('dlgBody').appendChild(media);
+        media.play().catch(function () {});
+        logMsg('WebRTC 数据通道传输完毕，纯内存 Blob 就绪播放: ' + filePath, '#9ece6a');
+      } catch (e) {
+        $('dlgBody').innerHTML = '<div style="color:#e5534b;padding:20px;">DataChannel 读取失败: ' + e.message + '</div>';
+        logMsg('读取失败: ' + e.message, '#e5534b');
       }
-    } catch (err) {
-      body.textContent = '加载失败: ' + err.message;
+    } else if (k === 'image') {
+      $('dlgBody').innerHTML = '<div style="padding:20px;text-align:center">正在通过 DataChannel 加载图片...</div>';
+      try {
+        var url = await fs.url(filePath);
+        $('dlgBody').innerHTML = '<img src="' + url + '" style="max-width:88vw;max-height:75vh;display:block;margin:auto;border-radius:4px;">';
+      } catch (e) {
+        $('dlgBody').innerHTML = '<div style="color:#e5534b;padding:20px;">加载失败: ' + e.message + '</div>';
+      }
+    } else if (k === 'text') {
+      $('dlgBody').innerHTML = '<div style="padding:20px;text-align:center">正在通过 DataChannel 读取文本内容...</div>';
+      try {
+        var text = await fs.readText(filePath);
+        var pre = document.createElement('pre');
+        pre.style.cssText = 'max-height:70vh;overflow:auto;background:#18181f;padding:14px;border-radius:6px;font-family:monospace;font-size:13px;white-space:pre-wrap;word-break:break-all;color:#eee;border:1px solid #333;margin:0;';
+        pre.textContent = text;
+        $('dlgBody').innerHTML = '';
+        $('dlgBody').appendChild(pre);
+      } catch (e) {
+        $('dlgBody').innerHTML = '<div style="color:#e5534b;padding:20px;">读取失败: ' + e.message + '</div>';
+      }
+    } else {
+      $('dlgBody').innerHTML = '<div style="text-align:center;padding:24px;">' +
+        '<div style="font-size:36px;margin-bottom:8px;">📄</div>' +
+        '<div style="margin-bottom:16px;color:#aaa;">该文件为二进制格式，不支持内联展示</div>' +
+        '<button id="btnDlgDl" style="padding:8px 18px;font-size:14px;">⬇ 下载到本地</button>' +
+        '</div>';
+      $('btnDlgDl').onclick = function () {
+        fs.download(filePath, name);
+      };
     }
   }
 
-  async function connect() {
+  window.closeDialog = function () {
+    var dlg = $('dlg');
+    $('dlgBody').innerHTML = '';
+    dlg.close();
+  };
+
+  // 绑定连接按钮
+  $('btnConn').onclick = async function () {
+    if (fs) {
+      fs.close();
+      fs = null;
+    }
+    var targetPeerId = $('peerId').value.trim();
+    if (!targetPeerId && window.__PEERFS__ && window.__PEERFS__.peerId) {
+      targetPeerId = window.__PEERFS__.peerId;
+      $('peerId').value = targetPeerId;
+    }
+    if (!targetPeerId) {
+      status('连接失败: peerId 不能为空，请确认输入框填写了节点 ID', 'err');
+      return;
+    }
+
     var c = {
-      host: $('host').value.trim(), port: +$('port').value,
-      secure: $('secure').checked, key: $('key').value.trim(),
-      peerId: $('peerId').value.trim(), token: $('token').value,
+      host: $('host').value.trim() || location.hostname || 'localhost',
+      port: +$('port').value || +(location.port || (location.protocol === 'https:' ? 443 : 80)),
+      secure: $('secure').checked,
+      key: $('key').value.trim() || 'peerjs',
+      peerId: targetPeerId,
+      token: $('token').value.trim(),
+      conns: +$('conns').value || 4,
+      logger: logMsg,
     };
-    localStorage.setItem('peerfs_token', c.token);
-    if (fs) { try { fs.close(); } catch (e) {} fs = null; }
-    status('连接中…');
+    if (c.token) localStorage.setItem('peerfs_token', c.token);
+    else localStorage.removeItem('peerfs_token');
+
+    status('正在建立 ' + c.conns + ' 条并行 WebRTC 连接...', '');
     try {
-      fs = await new PeerFS(c).connect();
-      status('已连接 → ' + c.peerId, 'on');
-      browse('/');
-    } catch (err) {
-      status('连接失败: ' + err.message, 'err');
+      fs = new PeerFS(c);
+      window.peerfs = fs; // 暴露全局供控制台使用
+      fs.onWorkerReady = function (ready, total) {
+        $('poolBadge').textContent = ready + '/' + total + ' 通道已就绪';
+        if (ready === total) {
+          status('已连入 ' + c.peerId + ' (全部 ' + total + ' 条通道就绪)', 'on');
+        }
+      };
+      fs.onDisconnect = function () {
+        $('poolBadge').textContent = '⚠️ 正在保活重连...';
+        status('连接已断开，正在自动保活重连中...', 'err');
+      };
+      fs.onReconnect = function () {
+        $('poolBadge').textContent = fs.workers.length + '/' + c.conns + ' 通道已就绪';
+        status('已重新保活连入 ' + c.peerId + ' (' + fs.workers.length + ' 通道就绪)', 'on');
+        browse(cwd);
+      };
+      await fs.connect();
+      status('已连入 ' + c.peerId + ' (' + fs.workers.length + '/' + c.conns + ' 通道已就绪)', 'on');
+      $('poolBadge').textContent = fs.workers.length + '/' + c.conns + ' 通道已就绪';
+      browse(cwd);
+    } catch (e) {
+      status('连接失败: ' + e.message, 'err');
     }
-  }
+  };
 
-  $('btnConn').onclick = connect;
-  $('token').addEventListener('keydown', function (e) { if (e.key === 'Enter') connect(); });
+  // 绑定直取按钮
+  $('btnPlayStream').onclick = function () {
+    var p = $('directPath').value.trim();
+    if (!p) return alert('请输入文件路径');
+    playOrOpen(p, p.split('/').pop());
+  };
 
-  loadConfig().then(function (c) { fillForm(c); if (c.peerId) connect(); });
+  $('btnDownloadDirect').onclick = function () {
+    var p = $('directPath').value.trim();
+    if (!p) return alert('请输入文件路径');
+    if (!fs) return alert('请先连接节点');
+    status('正在下载 ' + p + '...', '');
+    fs.download(p).then(function () {
+      status('下载完成: ' + p, 'on');
+    }).catch(function (e) {
+      status('下载失败: ' + e.message, 'err');
+    });
+  };
+
+  $('btnStatDirect').onclick = async function () {
+    var p = $('directPath').value.trim();
+    if (!p) return alert('请输入文件路径');
+    if (!fs) return alert('请先连接节点');
+    try {
+      var info = await fs.stat(p);
+      alert('文件: ' + info.path + '\n大小: ' + fmtSize(info.size) + ' (' + info.size + ' 字节)');
+    } catch (e) {
+      alert('获取信息失败: ' + e.message);
+    }
+  };
+
+  $('btnRefresh').onclick = function () {
+    browse(cwd);
+  };
+
+  loadConfig().then(function (c) {
+    fillForm(c);
+    // 如果 URL 已提供 peerId 则自动连接
+    if (c.peerId) {
+      $('btnConn').click();
+    }
+  });
 })();
 </script>
 </body>
