@@ -8,7 +8,9 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/compress v1.19.2
+	github.com/pion/ice/v4 v4.2.7
 	github.com/pion/webrtc/v4 v4.2.15
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.58.0
@@ -27,7 +29,6 @@ require (
 	github.com/go-playground/validator/v10 v10.30.1 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
@@ -37,7 +38,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
 	github.com/pion/dtls/v3 v3.1.4 // indirect
-	github.com/pion/ice/v4 v4.2.7 // indirect
 	github.com/pion/interceptor v0.1.45 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/mdns/v2 v2.1.0 // indirect
@@ -62,3 +62,8 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 )
+
+// peerfs-chat 原本用本地 ./local/signalserver 替换 go-peerserver(本地版比发布版
+// v0.1.0 多 peerColls/peerStats,即节点 uptime/上下行统计)。合并进根模块后 replace
+// 改为模块级,同时惠及 pkg/peerfs.MountSignaling(media-node 的 /discover/nodes)。
+replace github.com/Hana-ame/go-peerserver => ./peerfs-chat/local/signalserver

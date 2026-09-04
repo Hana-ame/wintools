@@ -227,27 +227,87 @@ func (s *Server) readLoop(cl *client) {
 }
 
 // route 路由消息：dst 在线转发，不在线入队（LEAVE/EXPIRE 除外）。
+//
+// 两处对标 peers/peerjs-server 的修复（src/messageHandler/handlers/transmission）：
+//
+//  1. send 失败不再静默丢弃。旧实现 `_ = dst.send(m)`：目标 socket 已半开但还
+//     没从 clients 表摘除时（对端崩溃、NAT 映射消失、连接半开未 FIN），
+//     OFFER/ANSWER/CANDIDATE 会被吞掉，发起方永久卡在等握手。这里摘除死连接
+//     并向发起方补发 LEAVE 让其停止重试（官方原文 "Tell other side to stop
+//     trying."，见 TransmissionHandler 的 catch 分支）。
+//  2. send 前释放 s.mu。send 内部 WriteJSON 带 10s 写超时（见下方 send()），
+//     一个慢/死客户端会持锁 10s 卡死整个信令服务器的路由。本文件 removeClient
+//     已是正确范式：先收集、释放锁、再逐个 send。
 func (s *Server) route(m Message) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	dst := s.clients[m.Dst]
 	if dst != nil {
-		_ = dst.send(m)
+		s.mu.Unlock() // 出锁后再写，避免持 s.mu 阻塞在慢客户端上
+		if err := dst.send(m); err == nil {
+			return
+		}
+		s.handleDeadDst(dst, m)
 		return
 	}
-	if m.Type == "LEAVE" || m.Type == "EXPIRE" {
-		return
-	}
-	if m.Dst == "" {
+	s.mu.Unlock()
+
+	if m.Type == "LEAVE" || m.Type == "EXPIRE" || m.Dst == "" {
 		return
 	}
 	// 入队：目标上线后补发（OFFER/ANSWER/CANDIDATE）
 	// H3：队列无上限 → OOM。超 maxQueuedPerDst 丢最旧。
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	q := append(s.queues[m.Dst], queuedMsg{msg: m, expire: time.Now().Add(s.queueTTL)})
 	if len(q) > maxQueuedPerDst {
 		q = q[len(q)-maxQueuedPerDst:]
 	}
 	s.queues[m.Dst] = q
+}
+
+// handleDeadDst 处理"在 clients 表里但发送失败"的目标：摘除表项、关连接、
+// 广播 LEAVE。
+//
+// 只摘表项而不做全量广播会留缺口：dst 的 readLoop 退出时 removeClient 会因
+// s.clients[cl.id] != cl 的守卫直接返回（该守卫本来是为"ID 被新连接顶替"
+// 而设），于是其他正在等这个 dst 的 peer 收不到任何通知，只能干等自己的
+// 握手超时。所以这里复用 removeClient 的广播范式：先收集 victims、释放锁、
+// 再逐个 send。
+//
+// 另外定向补发一份带 Dst 的 LEAVE 给消息发起方：让它明确知道是哪条连接
+// 失败了，可以据此放弃重试。对应官方 TransmissionHandler 的
+// handle(client, {type: LEAVE, src: dstId, dst: srcId})。
+//
+// 目标 dst 的离线队列保留不动 —— dst 可能带着相同 ID+token 重连，队列仍可补发。
+func (s *Server) handleDeadDst(dst *client, m Message) {
+	s.mu.Lock()
+	if cur, ok := s.clients[m.Dst]; !ok || cur != dst {
+		s.mu.Unlock()
+		return // 已被别的流程摘除/顶替，交给那边的清理
+	}
+	delete(s.clients, m.Dst)
+	var victims []*client
+	for _, c := range s.clients {
+		if c != dst {
+			victims = append(victims, c)
+		}
+	}
+	s.mu.Unlock()
+
+	dst.closeConn()
+	leave := Message{Type: "LEAVE", Src: m.Dst}
+	for _, c := range victims {
+		_ = c.send(leave)
+	}
+	if m.Src == "" || m.Src == m.Dst {
+		return
+	}
+	s.mu.Lock()
+	src := s.clients[m.Src]
+	s.mu.Unlock()
+	if src != nil {
+		_ = src.send(Message{Type: "LEAVE", Src: m.Dst, Dst: m.Src})
+	}
 }
 
 // flushQueue 客户端上线后补发离线队列（含过期清理）。

@@ -347,6 +347,7 @@ func (p *Peer) newDataConnection(remote, connectionId, label string, serializati
 		serialization: serialization,
 		reliable:      reliable,
 		closeCh:       make(chan struct{}),
+		openCh:        make(chan struct{}),
 	}
 	p.mu.Lock()
 	p.conns[connectionId] = dc
@@ -367,6 +368,7 @@ func (p *Peer) Connect(ctx context.Context, remote string) (*DataConnection, err
 		return nil, err
 	}
 	dc.pc = pc
+	dc.wireICEWatchdog()
 
 	// serialization 必须声明 "raw": 浏览器 peerjs 会沿用 offerer 声明的序列化
 	// 方式,默认 "binary" 是 BinaryPack 编码,Go 侧裸字节对不上;raw 模式下
@@ -418,6 +420,24 @@ func (p *Peer) Connect(ctx context.Context, remote string) (*DataConnection, err
 		}),
 	})
 	p.Debugf("offer sent to %s conn=%s", remote, connectionId)
+
+	// 修复：旧实现发完 OFFER 立即 `return dc, nil`，ctx 参数从头到尾没被读过
+	// —— 调用方（cmd/webrtc-proxy 传 30s 的 connectCtx、integration_test 传
+	// 30s）以为在限制握手时长，实际目标不可达时会拿回一个永不 open 的 dc
+	// 继续往下用。这里等到 DC 真正建立，超时/取消则关掉连接并返回错误。
+	//
+	// 参照同文件 Peer.Open 的既有写法：select ctx.Done() / deadline / msgs
+	// 三路，Open 早就做对了，Connect 是漏网的那一个。
+	// ctx 为 nil 时退化为旧行为（直接返回），避免 nil interface 调用 panic。
+	if ctx != nil {
+		select {
+		case <-dc.openCh:
+			return dc, nil
+		case <-ctx.Done():
+			dc.Close()
+			return nil, ctx.Err()
+		}
+	}
 	return dc, nil
 }
 
@@ -473,9 +493,34 @@ func (p *Peer) handleMessage(m ServerMessage) {
 		if dc != nil {
 			dc.handleCandidate(payload.Candidate)
 		}
-	case "LEAVE":
-		if dc != nil {
-			dc.Close()
+	case "LEAVE", "EXPIRE":
+		// 修复：旧实现用 p.conns[payload.ConnectionId] 查连接，但服务端构造
+		// LEAVE/EXPIRE 时**没有 payload**（只带 type/src），ConnectionId 恒为
+		// 空串，p.conns[""] 永远查不到 → 这两类消息被静默忽略，对端掉线时
+		// 本端 DataConnection 一直挂着（含 ICE 未完成的僵尸连接），既不关
+		// 也不通知上层。
+		//
+		// 正确匹配键是 m.Src（离开的 peer id）。官方 peerjs 1.5.4 的
+		// _handleMessage 原文：
+		//   case O.Leave:  this._cleanupPeer(r), this._connections.delete(r);   // r = e.src
+		//   case O.Expire: this.emitError(E.PeerUnavailable, ...);
+		// 即两个分支都按 src 定位对端；Go 侧统一到"关掉与该 src 相关的所有
+		// 连接"，EXPIRE 的语义（目标不可用/排队消息过期）同样成立。
+		//
+		// 不能持 p.mu 调 dc.Close()：Close 内部会抢 dc.peer.mu
+		// （见 connection.go 的 Close），同锁重入会死锁。先收集再出锁关闭。
+		if src := m.Src; src != "" {
+			p.mu.Lock()
+			var left []*DataConnection
+			for _, c := range p.conns {
+				if c.Remote() == src {
+					left = append(left, c)
+				}
+			}
+			p.mu.Unlock()
+			for _, c := range left {
+				c.Close()
+			}
 		}
 	}
 }
