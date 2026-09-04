@@ -17,11 +17,11 @@
   - `cmd/capture-proxy`:zen 家族三重整合单入口(旧 zen-proxy + local-proxy-detected + local-proxy + scripts/capture_proxy.go 合体),只保留 provider 角色(multi 角色已删)。CLI 独立可跑:`--listen` `--mode auto|v4|v6` `--out 抓包目录` `--detect` `--cert/--key` `--ban`;抓包 / /mode 切换 / /status / /stats API / ?stack= / gzip 请求体 / 3 次递进冷却全部保留。从 v1.9.0 tag 恢复,逻辑与 v2.0.0 zen_provider.go 一致(后者只是库化,无新改进)。
   - `cmd/ech-proxy`:zen.l.moonchan.xyz 入口与 zen_provider.go 已删,只做站点反代。ip-proxy 不受影响。
 - **v2.0.0 已完成: zen 家族并入 ech-proxy + ip-proxy**(v2.2.2 回滚,见上)。旧 `cmd/zen-proxy`、`cmd/local-proxy-detected`、`cmd/zen-multi`、`scripts/capture_proxy.go` 已删,内容仍在 v1.9.0 tag 存档(cmd/capture-proxy)。
-- **peerfs-chat 已并入根 go.mod(不再是独立 module,记住!)**:原 `peerfs-chat/go.mod`(`module peerjs-demo`)和 go.sum 已删,`server`/`goclient` 现在是根模块的包 —— 构建运行一律从仓库根 `go run ./peerfs-chat/server`、`go build ./peerfs-chat/goclient`,**不要 `cd peerfs-chat`**。原模块里的 `replace go-peerserver => ./local/signalserver` 已上提到根 go.mod(模块级 replace,同时惠及 `pkg/peerfs.MountSignaling`)。`peerfs-chat/local/signalserver/` 保留它自己的 go.mod 是必要的:它是 replace 的目标,必须声明 `module github.com/Hana-ame/go-peerserver`。**本地版比发布版 v0.1.0 多 `peerColls`/`peerStats`(节点 uptime + 上下行统计),别手滑换成发布版或删掉这个 replace**。
+- **peerfs 已抽象为 2 binary + 1 web 入口(记住!)**:`cmd/peerfs-server`(standalone 信令服务器)、`cmd/peerfs-node`(peer 节点,`-signal` 标志控制是否内嵌信令)。Web 入口在 `pkg/peerfs/web/`(bridge.js + index.html + sw.js + peerjs.min.js),由 `pkg/peerfs/console.go` 的 `embed.FS` serve。旧入口 `peerfs-chat/server`、`peerfs-chat/goclient`、`peerfs-chat/web`、`cmd/media-node` 已删。`peerfs-chat/local/signalserver/` 保留它自己的 go.mod 是必要的:它是根 `go.mod` 的 `replace` 目标,必须声明 `module github.com/Hana-ame/go-peerserver`。**本地版比发布版 v0.1.0 多 `peerColls`/`peerStats`(节点 uptime + 上下行统计),别手滑换成发布版或删掉这个 replace**。
 
 ## 项目结构
 - `cmd/*` 为多个独立可执行程序(ech-proxy / capture-proxy / ip-proxy / kv-store / localdns / webrtc-proxy / opencode-proxy 等),CI 全部 build。
-- `peerfs-chat/` — 浏览器↔Go 节点 P2P 传文件原型(`server` 自建信令 + `goclient` 文件节点 + `web` 页面),已并入根模块,见关键约定。
+- `peerfs-chat/` — 仅保留 `local/signalserver/`(信令服务器实现,被 `cmd/peerfs-server` 和 `cmd/peerfs-node` 共用)。旧 `server`/`goclient`/`web` 已删,见关键约定。
 - `pkg/proxyheaders` — 请求/响应头透传工具。
 - `pkg/netdial` — **Termux/Android 环境网络坑的公共修复**(重要):
   - Termux 无 `/etc/resolv.conf`,Go 纯解析器默认走 `[::1]:53` 会失败(`connection refused`),必须固定公共 DNS(8.8.8.8/1.1.1.1/223.5.5.5/114.114.114.114)。

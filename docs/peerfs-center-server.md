@@ -2,7 +2,7 @@
 
 本文档介绍如何编译、部署和运维 **PeerFS 独立中心化服务器（Central Hub Server）**。
 
-中心化服务器负责为所有的边缘媒体节点（`media-node`）和浏览器客户端提供 **WebSocket 信令交换、节点集中注册、心跳维护、以及全网节点分发发现**。
+中心化服务器负责为所有的边缘媒体节点（`peerfs-node`）和浏览器客户端提供 **WebSocket 信令交换、节点集中注册、心跳维护、以及全网节点分发发现**。
 
 ---
 
@@ -23,7 +23,7 @@
                │ 集中注册与信令协商                      │ 节点发现与信令拉取
                ▼                                        ▼
     ┌───────────────────────┐              ┌────────────────────────┐
-    │  边缘节点 media-node   │ ◄══════════► │    前端用户网页 / APP   │
+    │  边缘节点 peerfs-node   │ ◄══════════► │    前端用户网页 / APP   │
     │  (-config-url 指定中心)│   WebRTC P2P │  (拉取全网列表直连播放) │
     └───────────────────────┘   (100% 数据) └────────────────────────┘
 ```
@@ -34,8 +34,8 @@
 
 | 方案 | 适用场景 | 对应程序入口 |
 | :--- | :--- | :--- |
-| **方案 A：独立纯信令与发现中心（推荐）** | 生产环境独立部署在轻量云主机（如 1 核 1G），专职负责信令与发现 | [peerfs-chat/server/main.go](file:///home/luminovoez/wintools/peerfs-chat/server/main.go) |
-| **方案 B：一体化 Hub 节点（媒体+中心）** | 既想当中心信令服务器，又同时挂载了本地媒体文件供他人播放 | [cmd/media-node/main.go](file:///home/luminovoez/wintools/cmd/media-node/main.go) |
+| **方案 A：独立纯信令与发现中心（推荐）** | 生产环境独立部署在轻量云主机（如 1 核 1G），专职负责信令与发现 | [cmd/peerfs-server/main.go](file:///home/luminovoez/wintools/cmd/peerfs-server/main.go) |
+| **方案 B：一体化 Hub 节点（媒体+中心）** | 既想当中心信令服务器，又同时挂载了本地媒体文件供他人播放 | [cmd/peerfs-node/main.go](file:///home/luminovoez/wintools/cmd/peerfs-node/main.go) |
 
 ---
 
@@ -45,7 +45,7 @@
 在服务器或本地执行编译：
 ```bash
 # 进入 wintools 仓库根目录
-go build -o peerfs-server ./peerfs-chat/server
+go build -o peerfs-server ./cmd/peerfs-server
 ```
 
 ### 3.2 命令行启动与参数详解
@@ -164,10 +164,10 @@ sudo nginx -t && sudo systemctl reload nginx
 中心服务器上线后（假设公网地址为 `hub.your-domain.com`）：
 
 ### 5.1 边缘媒体节点连接中心（集中注册）
-在你的家庭 NAS、本地工作站、或者其他云服务器上启动 `media-node`：
+在你的家庭 NAS、本地工作站、或者其他云服务器上启动 `peerfs-node`：
 ```bash
 # 启动时指定 -config-url 指向中心服务器的发现与信令端点
-./media-node \
+./peerfs-node \
   -dir /data/movies \
   -name nas-home \
   -signal=false \

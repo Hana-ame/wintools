@@ -32,7 +32,7 @@ wintools/                          单 Go 模块（go.mod，peerfs-chat 已并�
 
 | 程序 | 文件 | 行数 | 说明 |
 |---|---|---|---|
-| **`media-node`** | `cmd/media-node/main.go` | 124 | Go peer 节点入口。`-signal` 标志控制是否内嵌信令服务器；`-root` 指定文件根目录；`-shost`/`-sport` 指定远程信令地址 |
+| **`peerfs-node`** | `cmd/peerfs-node/main.go` | 124 | Go peer 节点入口。`-signal` 标志控制是否内嵌信令服务器；`-root` 指定文件根目录；`-shost`/`-sport` 指定远程信令地址 |
 | **`peerfs-proxy`** | `cmd/peerfs-proxy/main.go` | 325 | peerfs 代理入口 |
 
 ### 其他程序
@@ -100,8 +100,8 @@ wintools/                          单 Go 模块（go.mod，peerfs-chat 已并�
 
 ## 4. `peerfs-chat/` — peerfs 原型
 
-> 已并入根模块（原 `peerfs-chat/go.mod` 已删）。构建运行一律从仓库根：
-> `go run ./peerfs-chat/server`、`go build ./peerfs-chat/goclient`。
+> 仅保留 `local/signalserver/`（信令服务器实现）。旧 `server`/`goclient`/`web` 已删。
+> 构建运行从仓库根：`go run ./cmd/peerfs-server`、`go run ./cmd/peerfs-node`。
 
 ### 4.1 信令服务器
 
@@ -175,9 +175,9 @@ wintools/                          单 Go 模块（go.mod，peerfs-chat 已并�
 | **Go peer**（文件服务） | `pkg/peerfs/node.go` | 492 |
 | **Go peer**（信令挂载） | `pkg/peerfs/signaling.go` | 40 |
 | **信令服务器** | `peerfs-chat/local/signalserver/signalserver.go` | 485 |
-| **Go 入口** | `cmd/media-node/main.go` | 124 |
-| **Go 客户端** | `peerfs-chat/goclient/main.go` | 498 |
-| **standalone 信令入口** | `peerfs-chat/server/main.go` | 48 |
+| **Go 入口** | `cmd/peerfs-node/main.go` | 124 |
+| **Go 客户端** | `已删除` | 498 |
+| **standalone 信令入口** | `cmd/peerfs-server/main.go` | 48 |
 | **Web peer** | `pkg/peerfs/web/bridge.js` | 801 |
 | **Web UI** | `pkg/peerfs/web/index.html` | 493 |
 | **Service Worker** | `pkg/peerfs/web/sw.js` | 185 |
@@ -187,8 +187,8 @@ wintools/                          单 Go 模块（go.mod，peerfs-chat 已并�
 
 | 模式 | 进程 | 涉及文件 |
 |---|---|---|
-| **Standalone 信令 + Go 节点** | `peerfs-chat/server`（信令）+ `cmd/media-node -signal=false`（节点） | `peerfs-chat/server/main.go` + `cmd/media-node/main.go` + `pkg/peerfs/*` + `pkg/peerjs/*` |
-| **内嵌信令（单进程）** | `cmd/media-node -signal`（信令 + 节点 + 页面） | `cmd/media-node/main.go` + `pkg/peerfs/signaling.go` + `pkg/peerfs/node.go` + `pkg/peerjs/*` |
+| **Standalone 信令 + Go 节点** | `cmd/peerfs-server`（信令）+ `cmd/peerfs-node -signal=false`（节点） | `cmd/peerfs-server/main.go` + `cmd/peerfs-node/main.go` + `pkg/peerfs/*` + `pkg/peerjs/*` |
+| **内嵌信令（单进程）** | `cmd/peerfs-node -signal`（信令 + 节点 + 页面） | `cmd/peerfs-node/main.go` + `pkg/peerfs/signaling.go` + `pkg/peerfs/node.go` + `pkg/peerjs/*` |
 
 ### 8.3 按协议流
 

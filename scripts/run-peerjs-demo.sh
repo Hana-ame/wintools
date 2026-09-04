@@ -4,7 +4,7 @@
 # 启动的组件:
 #   1. peerfs-chat server     信令服务器 + 浏览器页面      :8000
 #   2. peerfs-chat goclient   文件服务节点 (go-peer)       ws://127.0.0.1:8000/peerjs
-#   3. media-node             单二进制演示 (内嵌信令)      :8100 -> /__peerfs/
+#   3. peerfs-node             单二进制演示 (内嵌信令)      :8100 -> /__peerfs/
 #   4. peerfs-proxy           twimg ECH 代理节点          ws://127.0.0.1:8000/peerjs
 #   5. webrtc-proxy serve     经 PeerJS 公共云 serve 端    (target http://127.0.0.1:8000)
 #   6. webrtc-proxy client    经 PeerJS 公共云 client 端   http://127.0.0.1:8080
@@ -56,18 +56,18 @@ check_port() {
   fi
 }
 check_port $SIG_PORT "peerfs-chat server" || exit 1
-check_port $MN_PORT "media-node" || exit 1
+check_port $MN_PORT "peerfs-node" || exit 1
 [[ $NO_WEBRTC -eq 0 ]] && (check_port $WR_CLIENT_PORT "webrtc-proxy client" || exit 1)
 
 # ---- 构建 ----
 mkdir -p "$BUILD_DIR" "$GOCACHE"
 echo "==> 构建 5 个 peerjs 相关二进制 (GOCACHE=$GOCACHE)"
 (cd "$ROOT" && \
-  GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/media-node"   ./cmd/media-node        && \
+  GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/peerfs-node"   ./cmd/peerfs-node        && \
   GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/peerfs-proxy" ./cmd/peerfs-proxy      && \
   GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/webrtc-proxy" ./cmd/webrtc-proxy      && \
-  GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/server"       ./peerfs-chat/server    && \
-  GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/goclient"     ./peerfs-chat/goclient)
+  GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/server"       ./cmd/peerfs-server    && \
+  GOCACHE="$GOCACHE" go build -o "$BUILD_DIR/goclient"     ./cmd/peerfs-node)
 
 # ---- 演示媒体 ----
 if [[ ! -d "$MEDIA_DIR/img" ]]; then
@@ -93,11 +93,11 @@ run() { # name logfile args...
 
 echo "==> 启动组件"
 run "peerfs-chat server" "$BUILD_DIR/server.log" \
-  "$BUILD_DIR/server" -addr "0.0.0.0:$SIG_PORT" -web "$ROOT/peerfs-chat/web"
+  "$BUILD_DIR/server" -addr "0.0.0.0:$SIG_PORT" -web "$ROOT/pkg/peerfs/web"
 run "goclient(go-peer)" "$BUILD_DIR/goclient.log" \
   "$BUILD_DIR/goclient" -dir "$MEDIA_DIR" -id go-peer -server "ws://127.0.0.1:$SIG_PORT/peerjs"
-run "media-node" "$BUILD_DIR/media-node.log" \
-  "$BUILD_DIR/media-node" -listen "0.0.0.0:$MN_PORT" -dir "$MEDIA_DIR" -name demo
+run "peerfs-node" "$BUILD_DIR/peerfs-node.log" \
+  "$BUILD_DIR/peerfs-node" -listen "0.0.0.0:$MN_PORT" -dir "$MEDIA_DIR" -name demo
 [[ $NO_PROXY -eq 0 ]] && run "peerfs-proxy(twimg)" "$BUILD_DIR/peerfs-proxy.log" \
   "$BUILD_DIR/peerfs-proxy" -id twimg-proxy -shost 127.0.0.1 -sport "$SIG_PORT"
 if [[ $NO_WEBRTC -eq 0 ]]; then
@@ -126,7 +126,7 @@ echo " 所有 peerjs 项目已就绪,在 Windows 浏览器打开:"
 echo "--------------------------------------------------------------"
 echo " 1) peerfs-chat 全家桶(K8S 五合一演示)"
 echo "    http://localhost:$SIG_PORT/      (信令+页面,可连 go-peer / twimg-proxy)"
-echo " 2) media-node 单二进制演示(内嵌信令,离线零外网依赖)"
+echo " 2) peerfs-node 单二进制演示(内嵌信令,离线零外网依赖)"
 echo "    http://localhost:$MN_PORT/__peerfs/"
 [[ $NO_WEBRTC -eq 0 ]] && echo " 3) webrtc-proxy 隧道(经 PeerJS 公共云打通 :$SIG_PORT 服务)"
 [[ $NO_WEBRTC -eq 0 ]] && echo "    http://localhost:$WR_CLIENT_PORT/   (curl 直测: curl http://127.0.0.1:$WR_CLIENT_PORT/)"

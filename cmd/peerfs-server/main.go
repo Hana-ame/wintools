@@ -1,5 +1,12 @@
-// PeerServer: 自托管 PeerJS 信令服务器 + 内置房间发现.
-// 使用 go-peerserver 库, 挂载信令端点 + 发现端点 + 静态文件.
+// peerfs-server — standalone PeerJS signaling server + discovery + web.
+//
+// 持久信令服务器：所有 peer（Go 节点 + Web 浏览器）连到这里做发现与握手，
+// 数据面走 P2P WebRTC DataChannel，不经过本服务器。
+//
+// Usage:
+//
+//	go run ./cmd/peerfs-server -addr :8000 -key mykey -web ./pkg/peerfs/web
+//	go run ./cmd/peerfs-server -addr :8000 -key mykey -tokens SECRET1,SECRET2
 package main
 
 import (
@@ -14,8 +21,8 @@ import (
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8000", "listen address")
 	key := flag.String("key", "peerjs", "API key (client 必须一致)")
-	web := flag.String("web", "./web", "静态文件目录")
-	tokens := flag.String("tokens", "", "信令 token 白名单（逗号分隔；空 = 不限制）")
+	web := flag.String("web", "", "静态文件目录（浏览器页面）；空 = 不 serve 静态文件")
+	tokens := flag.String("tokens", "", "信令 token 白名单（逗号分隔）；空 = 不限制")
 	flag.Parse()
 
 	var opts []signalserver.Option
@@ -31,19 +38,25 @@ func main() {
 			opts = append(opts, signalserver.WithTokenWhitelist(clean))
 		}
 	}
+
 	srv := signalserver.NewServer(*key, opts...)
 	srv.Start()
 
 	mux := http.NewServeMux()
-	// PeerJS 信令端点
+
+	// PeerJS signaling endpoints
 	mux.HandleFunc("/peerjs", srv.HandleWS)
 	mux.HandleFunc("/peerjs/id", srv.HandleID)
-	// 发现端点
+
+	// Discovery endpoints
 	mux.HandleFunc("/discover/announce", srv.HandleAnnounce)
 	mux.HandleFunc("/discover/nodes", srv.HandleNodes)
-	// 静态文件（浏览器页面）
-	mux.Handle("/", http.FileServer(http.Dir(*web)))
 
-	log.Printf("[server] peerserver listening on %s (key=%s, web=%s)", *addr, *key, *web)
+	// Static web files (optional)
+	if *web != "" {
+		mux.Handle("/", http.FileServer(http.Dir(*web)))
+	}
+
+	log.Printf("[peerfs-server] listening on %s (key=%q, web=%q)", *addr, *key, *web)
 	_ = http.ListenAndServe(*addr, mux)
 }
