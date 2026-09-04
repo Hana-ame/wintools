@@ -33,20 +33,21 @@ import (
 
 func main() {
 	var (
-		root      = flag.String("root", ".", "文件服务根目录")
-		listen    = flag.String("listen", "0.0.0.0:9000", "HTTP 监听（控制台页 + 可选内嵌信令）")
-		name      = flag.String("name", "", "节点 peer id 后缀，最终 id = peerfs-<name>；空 = 借随机 id")
-		token     = flag.String("token", "", "数据面 hello 校验 token；空 = 不校验")
+		root   = flag.String("root", ".", "文件服务根目录")
+		listen = flag.String("listen", "0.0.0.0:9000", "HTTP 监听（控制台页 + 可选内嵌信令）")
+		name   = flag.String("name", "", "节点 peer id 后缀，最终 id = peerfs-<name>；空 = 借随机 id")
+		token  = flag.String("token", "", "数据面 hello 校验 token；空 = 不校验")
 
-		signal  = flag.Bool("signal", false, "内嵌自托管信令服务器（调试用；生产用 -signal=false 连远端）")
-		key     = flag.String("key", "peerjs", "信令 API key（浏览器端必须一致）")
-		stoken  = flag.String("stoken", "", "信令 token 白名单（逗号分隔）；空 = 不限制")
+		signal = flag.Bool("signal", false, "内嵌自托管信令服务器（调试用；生产用 -signal=false 连远端）")
+		key    = flag.String("key", "peerjs", "信令 API key（浏览器端必须一致）")
+		stoken = flag.String("stoken", "", "信令 token 白名单（逗号分隔）；空 = 不限制")
 
-		shost   = flag.String("shost", "", "信令 host（-signal=false 时；空 = 公共云 0.peerjs.com）")
-		sport   = flag.Int("sport", 443, "信令 port（-signal=false 时）")
-		ssecure = flag.Bool("ssecure", true, "信令 wss（-signal=false 时）")
-		debug   = flag.Bool("debug", false, "信令详细日志")
+		shost     = flag.String("shost", "", "信令 host（-signal=false 时；空 = 公共云 0.peerjs.com）")
+		sport     = flag.Int("sport", 443, "信令 port（-signal=false 时）")
+		ssecure   = flag.Bool("ssecure", true, "信令 wss（-signal=false 时）")
+		debug     = flag.Bool("debug", false, "信令详细日志")
 		configURL = flag.String("config-url", os.Getenv("PEERFS_CONFIG_URL"), "中心配置/注册URL")
+		maxConns  = flag.Int("max-conns", 100, "最大并发连接数；超限直接关连接（防 DDoS）")
 	)
 	flag.Parse()
 
@@ -82,6 +83,7 @@ func main() {
 		Signaling: sig,
 		Debug:     *debug,
 		ConfigURL: *configURL,
+		MaxConns:  *maxConns,
 	})
 	node.MountConsole(mux)
 
