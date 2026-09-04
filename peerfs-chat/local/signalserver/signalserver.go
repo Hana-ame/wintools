@@ -17,29 +17,37 @@ package signalserver
 
 import (
 	"crypto/rand"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+//go:embed dashboard.html
+var dashboardFS embed.FS
+
 type Server struct {
-	key          string
-	path         string
-	queueTTL     time.Duration // 离线队列存活时间（OFFER 过期用）
-	heartbeatTTL time.Duration // 发现的心跳过期时间
+	key            string
+	path           string
+	queueTTL       time.Duration   // 离线队列存活时间（OFFER 过期用）
+	heartbeatTTL   time.Duration   // 发现的心跳过期时间
 	tokenWhitelist map[string]bool // 允许的信令 token（nil/空 = 不限制）
 
-	mu      sync.Mutex
-	clients map[string]*client              // id → 在线连接
-	queues  map[string][]queuedMsg          // dst → 待转发消息
-	disc    map[string]map[string]time.Time // collection → peerId → lastSeen
-	peerColls map[string][]string // peerId -> collections
-	peerStats  map[string]*PeerStats  // peerId -> stats
+	startedAt time.Time // 服务器启动时间
+	msgCount  int64     // 总转发消息数（原子访问）
+
+	mu        sync.Mutex
+	clients   map[string]*client              // id → 在线连接
+	queues    map[string][]queuedMsg          // dst → 待转发消息
+	disc      map[string]map[string]time.Time // collection → peerId → lastSeen
+	peerColls map[string][]string             // peerId -> collections
+	peerStats map[string]*PeerStats           // peerId -> stats
 }
 
 // Option 信令服务器配置项。
@@ -134,11 +142,12 @@ func NewServer(key string, opts ...Option) *Server {
 		path:         "",
 		queueTTL:     30 * time.Second,
 		heartbeatTTL: 90 * time.Second,
+		startedAt:    time.Now(),
 		clients:      make(map[string]*client),
 		queues:       make(map[string][]queuedMsg),
 		disc:         make(map[string]map[string]time.Time),
 		peerColls:    make(map[string][]string),
-		peerStats:     make(map[string]*PeerStats),
+		peerStats:    make(map[string]*PeerStats),
 	}
 	for _, o := range opts {
 		o(s)
@@ -244,6 +253,7 @@ func (s *Server) route(m Message) {
 	if dst != nil {
 		s.mu.Unlock() // 出锁后再写，避免持 s.mu 阻塞在慢客户端上
 		if err := dst.send(m); err == nil {
+			atomic.AddInt64(&s.msgCount, 1)
 			return
 		}
 		s.handleDeadDst(dst, m)
@@ -349,31 +359,25 @@ func (s *Server) removeClient(cl *client) {
 	}
 }
 
-// HandleAnnounce POST /discover/announce {peerId, collections[]} 节点登记房间。
-// 与信令连接解耦（节点可通过任意 HTTP 入口上报），lastSeen 由心跳刷新。
-// M15：无界 decode 风险——限制 body 大小（1KB 足够：peerId + 少量 collection hash）
-// 与 collection 数量（单节点关注房间数有限）。
+// HandleAnnounce POST /discover/announce 节点登记。
+// 支持上报负载信息 (LoadInfo) 以便 Consumer 进行负载均衡。
 func (s *Server) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10) // 增加到 4KB 以容纳 LoadInfo
 	var body struct {
-		PeerID      string   `json:"peerId"`
-		Collections []string `json:"collections"`
-		NodeType      string   `json:"nodeType,omitempty"`
-		Uptime        int64    `json:"uptime,omitempty"`
-		UploadBytes   int64    `json:"uploadBytes,omitempty"`
-		DownloadBytes int64    `json:"downloadBytes,omitempty"`
+		PeerID      string         `json:"peerId"`
+		Collections []string       `json:"collections"`
+		NodeType    string         `json:"nodeType,omitempty"` // e.g., "go-persistent", "web-temp"
+		LoadInfo    map[string]any `json:"loadInfo,omitempty"` // e.g., {"connections": 5, "cpu": 0.2}
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PeerID == "" {
 		http.Error(w, "peerId required", http.StatusBadRequest)
 		return
 	}
-	const maxCollectionsPerAnnounce = 64
-	if len(body.Collections) > maxCollectionsPerAnnounce {
-		http.Error(w, "too many collections", http.StatusBadRequest)
-		return
-	}
+
 	now := time.Now()
 	s.mu.Lock()
+
+	// 1. 更新发现索引 (按 Collection)
 	for _, coll := range body.Collections {
 		coll = strings.TrimSpace(coll)
 		if coll == "" {
@@ -386,47 +390,82 @@ func (s *Server) HandleAnnounce(w http.ResponseWriter, r *http.Request) {
 		}
 		peers[body.PeerID] = now
 	}
-	// Store peer collections
-	// Store peer stats
-	if body.NodeType != "" || body.Uptime > 0 || body.UploadBytes > 0 || body.DownloadBytes > 0 {
-		s.peerStats[body.PeerID] = &PeerStats{
-			NodeType:      body.NodeType,
-			Uptime:        body.Uptime,
-			UploadBytes:   body.UploadBytes,
-			DownloadBytes: body.DownloadBytes,
-		}
+
+	// 2. 更新节点元数据和负载
+	stats := s.peerStats[body.PeerID]
+	if stats == nil {
+		stats = &PeerStats{}
+		s.peerStats[body.PeerID] = stats
 	}
+	stats.NodeType = body.NodeType
+	stats.LastSeen = now
+	stats.LoadInfo = body.LoadInfo
+
 	if len(body.Collections) > 0 {
 		s.peerColls[body.PeerID] = body.Collections
 	}
 	s.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ok":true}`))
 }
 
-// HandleNodes GET /discover/nodes?coll= → 在线节点列表（心跳过期剔除）。
+// HandleLeave POST /discover/leave 节点优雅下线。
+func (s *Server) HandleLeave(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PeerID string `json:"peerId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PeerID == "" {
+		http.Error(w, "peerId required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	// 从所有 collection 中移除
+	for _, peers := range s.disc {
+		delete(peers, body.PeerID)
+	}
+	delete(s.peerStats, body.PeerID)
+	delete(s.peerColls, body.PeerID)
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
+// HandleNodes GET /discover/nodes?coll=&type= → 在线节点列表（心跳过期剔除）。
+// 支持按 type 过滤，方便 Web Consumer 只获取 Go 骨干节点。
 func (s *Server) HandleNodes(w http.ResponseWriter, r *http.Request) {
 	coll := r.URL.Query().Get("coll")
+	nodeType := r.URL.Query().Get("type")
 	cutoff := time.Now().Add(-s.heartbeatTTL)
 	s.mu.Lock()
 	var out []NodeInfo
-	if coll == "" {
-		seen := make(map[string]int64)
-		for _, peers := range s.disc {
-			for id, last := range peers {
-				if last.After(cutoff) {
-					if _, ok := seen[id]; !ok {
-						seen[id] = last.Unix()
-								out = append(out, NodeInfo{PeerID: id, LastSeen: last.Unix(), NodeType: func() string { if s.peerStats[id] != nil { return s.peerStats[id].NodeType }; return "" }(), Collections: s.peerColls[id], Uptime: func() int64 { if s.peerStats[id] != nil { return s.peerStats[id].Uptime }; return 0 }(), UploadBytes: func() int64 { if s.peerStats[id] != nil { return s.peerStats[id].UploadBytes }; return 0 }(), DownloadBytes: func() int64 { if s.peerStats[id] != nil { return s.peerStats[id].DownloadBytes }; return 0 }()})
-					}
-				}
-			}
+	seen := make(map[string]bool)
+
+	for c, peers := range s.disc {
+		if coll != "" && c != coll {
+			continue
 		}
-	} else {
-		peers := s.disc[coll]
 		for id, last := range peers {
-			if last.After(cutoff) {
-						out = append(out, NodeInfo{PeerID: id, LastSeen: last.Unix(), NodeType: func() string { if s.peerStats[id] != nil { return s.peerStats[id].NodeType }; return "" }(), Collections: s.peerColls[id], Uptime: func() int64 { if s.peerStats[id] != nil { return s.peerStats[id].Uptime }; return 0 }(), UploadBytes: func() int64 { if s.peerStats[id] != nil { return s.peerStats[id].UploadBytes }; return 0 }(), DownloadBytes: func() int64 { if s.peerStats[id] != nil { return s.peerStats[id].DownloadBytes }; return 0 }()})
+			if last.After(cutoff) && !seen[id] {
+				stats := s.peerStats[id]
+				// 类型过滤
+				if nodeType != "" && (stats == nil || stats.NodeType != nodeType) {
+					continue
+				}
+
+				seen[id] = true
+				info := NodeInfo{
+					PeerID:   id,
+					LastSeen: last.Unix(),
+				}
+				if stats != nil {
+					info.NodeType = stats.NodeType
+					info.Collections = s.peerColls[id]
+					info.LoadInfo = stats.LoadInfo
+				}
+				out = append(out, info)
 			}
 		}
 	}
@@ -435,22 +474,98 @@ func (s *Server) HandleNodes(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"nodes": out})
 }
 
-// NodeInfo 发现响应条目。
-type PeerStats struct {
-	NodeType      string `json:"nodeType,omitempty"`
-	Uptime        int64  `json:"uptime,omitempty"`
-	UploadBytes   int64  `json:"uploadBytes,omitempty"`
-	DownloadBytes int64  `json:"downloadBytes,omitempty"`
+// HandleStatus GET /status → 服务器状态快照（dashboard 轮询用）。
+func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	clientCount := len(s.clients)
+	queueCount := len(s.queues)
+	totalQueued := 0
+	for _, q := range s.queues {
+		totalQueued += len(q)
+	}
+	// 收集活跃发现节点
+	var discoveredNodes []NodeInfo
+	seen := make(map[string]bool)
+	cutoff := time.Now().Add(-s.heartbeatTTL)
+	for _, peers := range s.disc {
+		for id, last := range peers {
+			if last.After(cutoff) && !seen[id] {
+				seen[id] = true
+				stats := s.peerStats[id]
+				info := NodeInfo{PeerID: id, LastSeen: last.Unix()}
+				if stats != nil {
+					info.NodeType = stats.NodeType
+					info.Collections = s.peerColls[id]
+					info.LoadInfo = stats.LoadInfo
+				}
+				discoveredNodes = append(discoveredNodes, info)
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	uptime := time.Since(s.startedAt).Seconds()
+	resp := map[string]any{
+		"key":         s.key,
+		"uptimeSec":   int64(uptime),
+		"uptimeStr":   formatDuration(uptime),
+		"clients":     clientCount,
+		"queues":      queueCount,
+		"totalQueued": totalQueued,
+		"discovered":  len(discoveredNodes),
+		"nodes":       discoveredNodes,
+		"msgCount":    atomic.LoadInt64(&s.msgCount),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// formatDuration 秒数转人可读时长。
+func formatDuration(seconds float64) string {
+	d := time.Duration(seconds) * time.Second
+	if d < time.Minute {
+		return fmt.Sprintf("%.0fs", seconds)
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%.1fm", seconds/60)
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%.1fh", seconds/3600)
+	}
+	return fmt.Sprintf("%.1fd", seconds/86400)
+}
+
+// HandleDashboard GET / → dashboard HTML（内嵌）。
+func (s *Server) HandleDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	b, err := dashboardFS.ReadFile("dashboard.html")
+	if err != nil {
+		http.Error(w, "dashboard not found", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	_, _ = w.Write(b)
+}
+
+// PeerStats 节点统计与负载信息。
+type PeerStats struct {
+	NodeType string         `json:"nodeType,omitempty"`
+	Uptime   int64          `json:"uptime,omitempty"`
+	LoadInfo map[string]any `json:"loadInfo,omitempty"` // 新增：通用负载指标
+	LastSeen time.Time      `json:"-"`                  // 内部使用，不直接序列化
+}
+
+// NodeInfo 发现响应条目。
 type NodeInfo struct {
-	PeerID        string    `json:"peerId"`
-	LastSeen      int64     `json:"lastSeen"`
-	NodeType      string    `json:"nodeType,omitempty"`
-	Collections   []string  `json:"collections,omitempty"`
-	Uptime        int64     `json:"uptime,omitempty"`
-	UploadBytes   int64     `json:"uploadBytes,omitempty"`
-	DownloadBytes int64     `json:"downloadBytes,omitempty"`
+	PeerID      string         `json:"peerId"`
+	LastSeen    int64          `json:"lastSeen"`
+	NodeType    string         `json:"nodeType,omitempty"`
+	Collections []string       `json:"collections,omitempty"`
+	LoadInfo    map[string]any `json:"loadInfo,omitempty"` // 新增：透传负载信息给 Consumer
 }
 
 // wsError 升级失败（HTTP 层）。

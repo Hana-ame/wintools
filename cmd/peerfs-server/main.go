@@ -52,11 +52,22 @@ func main() {
 	mux.HandleFunc("/discover/announce", srv.HandleAnnounce)
 	mux.HandleFunc("/discover/nodes", srv.HandleNodes)
 
-	// Static web files (optional)
-	if *web != "" {
+	// Server status API (dashboard polls this)
+	mux.HandleFunc("/status", srv.HandleStatus)
+
+	// Dashboard at / (only if -web is not set; -web takes precedence)
+	if *web == "" {
+		mux.HandleFunc("/", srv.HandleDashboard)
+	} else {
 		mux.Handle("/", http.FileServer(http.Dir(*web)))
 	}
 
-	log.Printf("[peerfs-server] listening on %s (key=%q, web=%q)", *addr, *key, *web)
+	log.Printf("[peerfs-server] listening on %s (key=%q, web=%q, dashboard=%q)",
+		*addr, *key, *web, func() string {
+			if *web == "" {
+				return "on"
+			}
+			return "off"
+		}())
 	_ = http.ListenAndServe(*addr, mux)
 }
