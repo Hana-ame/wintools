@@ -243,6 +243,7 @@ func router(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. 带域名前缀（域前置）：/pbs.twimg.com/media/xxx.png
 	for prefix, target := range cdnMap {
 		if strings.HasPrefix(path, "/"+prefix+"/") || path == "/"+prefix {
 			echProxyHandler(w, r, target, strings.TrimPrefix(path, "/"+prefix))
@@ -250,12 +251,15 @@ func router(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 2. API 路由：/api/users/xxx
 	if strings.HasPrefix(path, "/api/") {
 		apiProxyHandler(w, r, apiHost, strings.TrimPrefix(path, "/api"))
 		return
 	}
 
-	http.NotFound(w, r)
+	// 3. 无域名前缀（直接路径）：/media/xxx.png, /video/xxx.mp4
+	// 默认转发到 pbs.twimg.com
+	echProxyHandler(w, r, "pbs.twimg.com", path)
 }
 
 func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
@@ -264,7 +268,12 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		return
 	}
 
-	targetURL := "https://" + targetHost + "/" + path
+	// 构建目标 URL（避免双斜杠）
+	targetURL := "https://" + targetHost + strings.TrimPrefix(path, "/")
+	// 保留查询参数
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
 	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
@@ -317,7 +326,11 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 }
 
 func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
-	targetURL := "https://" + targetHost + path
+	// 构建目标 URL（避免双斜杠）
+	targetURL := "https://" + targetHost + strings.TrimPrefix(path, "/")
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
 	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
