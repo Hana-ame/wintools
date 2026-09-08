@@ -1,6 +1,7 @@
 package com.hanaame.twitterpic;
 
 import android.content.Intent;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -32,7 +33,7 @@ public class MainActivity extends AppCompatActivity {
         logView = new TextView(this);
         logView.setPadding(16, 16, 16, 16);
         logView.setTextSize(12);
-        logView.setFontFamily("monospace");
+        logView.setTypeface(Typeface.MONOSPACE);
         scrollView.addView(logView);
         setContentView(scrollView);
 
