@@ -71,8 +71,12 @@ jobs:
           cd cmd/ech-proxy-android/android
           ./gradlew assembleRelease --no-daemon
 
+      - name: List APK output
+        run: |
+          find cmd/ech-proxy-android/android/app/build/outputs -name "*.apk" -type f
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: twitter-pic-android
-          path: cmd/ech-proxy-android/android/app/build/outputs/apk/release/app-release.apk
+          path: cmd/ech-proxy-android/android/app/build/outputs/apk/release/*.apk
