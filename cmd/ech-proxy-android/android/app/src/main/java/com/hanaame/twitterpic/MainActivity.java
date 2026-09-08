@@ -38,10 +38,10 @@ public class MainActivity extends AppCompatActivity {
 
         handler = new Handler(Looper.getMainLooper());
 
-        // 加载 ECH 代理库
+        // 加载 JNI 包装库（会自动加载 libechproxy.so）
         try {
-            System.loadLibrary("echproxy");
-            appendLog("libechproxy.so loaded");
+            System.loadLibrary("jni-wrapper");
+            appendLog("libjni-wrapper.so loaded");
         } catch (UnsatisfiedLinkError e) {
             appendLog("ERROR: " + e.getMessage());
             return;
