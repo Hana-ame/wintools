@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Twitter Pic</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; }
+.container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+header h1 { font-size: 20px; color: #7c9cff; }
+.search-box { flex: 1; min-width: 200px; display: flex; gap: 8px; }
+.search-box input { flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid #333; background: #222; color: #eee; font-size: 14px; }
+.search-box button { padding: 8px 16px; border-radius: 6px; border: none; background: #7c9cff; color: #fff; cursor: pointer; font-size: 14px; }
+.search-box button:hover { background: #6b8ae8; }
+.status { font-size: 12px; color: #888; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+.card { background: #222; border-radius: 8px; overflow: hidden; cursor: pointer; transition: transform 0.2s; }
+.card:hover { transform: scale(1.02); }
+.card img { width: 100%; height: 180px; object-fit: cover; display: block; background: #111; }
+.card .info { padding: 8px; font-size: 12px; }
+.card .info .name { color: #7c9cff; font-weight: 600; }
+.card .info .count { color: #888; }
+.user-section { margin-bottom: 24px; }
+.user-section h2 { font-size: 16px; margin-bottom: 8px; color: #ccc; }
+.user-avatar { width: 40px; height: 40px; border-radius: 50%; background: #333; object-fit: cover; }
+.user-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+.media-item { position: relative; }
+.media-item img { width: 100%; height: 200px; object-fit: cover; border-radius: 6px; background: #111; }
+.media-item video { width: 100%; height: 200px; object-fit: cover; border-radius: 6px; background: #000; }
+.media-item .date { font-size: 10px; color: #888; padding: 4px 0; }
+.loading { text-align: center; padding: 40px; color: #888; }
+.error { color: #ff6b6b; padding: 8px; }
+.empty { text-align: center; padding: 40px; color: #666; }
+.back-btn { display: inline-block; margin-bottom: 12px; padding: 6px 12px; border-radius: 4px; background: #333; color: #ccc; cursor: pointer; font-size: 13px; }
+.back-btn:hover { background: #444; }
+@media (max-width: 600px) {
+  .grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+  .card img { height: 120px; }
+  .media-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .media-item img, .media-item video { height: 140px; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Twitter Pic</h1>
+    <div class="search-box">
+      <input type="text" id="search" placeholder="搜索用户名或昵称..." />
+      <button onclick="search()">搜索</button>
+    </div>
+    <span class="status" id="status"></span>
+  </header>
+  <div id="content"><div class="loading">加载中...</div></div>
+</div>
+<script>
+const API_BASE = '/api/twitter';
+
+async function search() {
+  const q = document.getElementById('search').value.trim();
+  if (!q) return;
+  setStatus('搜索中...');
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">搜索中...</div>';
+  try {
+    const [byUser, byNick] = await Promise.all([
+      fetchJson(`${API_BASE}/?by=username&search=${encodeURIComponent(q)}`),
+      fetchJson(`${API_BASE}/?by=nick&search=${encodeURIComponent(q)}`)
+    ]);
+    const seen = new Set();
+    const users = [...(byUser || []), ...(byNick || [])].filter(u => !seen.has(u.username) && seen.add(u.username));
+    if (users.length === 0) {
+      content.innerHTML = '<div class="empty">未找到用户</div>';
+    } else {
+      content.innerHTML = users.map(u => `
+        <div class="card" onclick="showUser('${u.username}')">
+          <img src="${proxyUrl(u.avatar)}" onerror="this.src=''" alt="" />
+          <div class="info">
+            <div class="name">${escapeHtml(u.nick || u.username)}</div>
+            <div class="count">@${escapeHtml(u.username)}${u.total_urls ? ' · ' + u.total_urls + ' 张' : ''}</div>
+          </div>
+        </div>
+      `).join('');
+    }
+  } catch (e) {
+    content.innerHTML = `<div class="error">搜索失败: ${escapeHtml(e.message)}</div>`;
+  }
+  setStatus('');
+}
+
+async function showUser(username) {
+  setStatus('加载用户数据...');
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">加载中...</div>';
+  try {
+    const data = await fetchJson(`${API_BASE}/${username}.json.gz?t=${new Date().toISOString().split('T')[0]}`);
+    const info = data.account_info;
+    const timeline = data.timeline || [];
+    content.innerHTML = `
+      <div class="back-btn" onclick="showDefaultList()">← 返回</div>
+      <div class="user-section">
+        <div class="user-header">
+          <img class="user-avatar" src="${proxyUrl(info.profile_image)}" onerror="this.src=''" alt="" />
+          <div>
+            <div style="font-weight:600">${escapeHtml(info.nick || username)}</div>
+            <div style="color:#888;font-size:12px">@${escapeHtml(username)} · ${data.total_urls || timeline.length} 张</div>
+          </div>
+        </div>
+        <div class="media-grid">
+          ${timeline.map(item => {
+            const isVideo = item.type === 'video' || item.type === 'animated_gif';
+            const mediaUrl = proxyUrl(item.url);
+            if (isVideo) {
+              return `<div class="media-item">
+                <video src="${mediaUrl}" controls preload="metadata"></video>
+                ${item.date ? `<div class="date">${escapeHtml(item.date)}</div>` : ''}
+              </div>`;
+            }
+            return `<div class="media-item">
+              <img src="${mediaUrl}" onerror="this.src=''" alt="" />
+              ${item.date ? `<div class="date">${escapeHtml(item.date)}</div>` : ''}
+            </div>`;
+          }).join('')}
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    content.innerHTML = `<div class="error">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
+  setStatus('');
+}
+
+async function showDefaultList() {
+  setStatus('加载用户列表...');
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="loading">加载中...</div>';
+  try {
+    const users = await fetchJson(`${API_BASE}/?list=users`);
+    if (!users || users.length === 0) {
+      content.innerHTML = '<div class="empty">用户列表为空</div>';
+    } else {
+      content.innerHTML = users.map(u => `
+        <div class="card" onclick="showUser('${u.username}')">
+          <img src="${proxyUrl(u.avatar)}" onerror="this.src=''" alt="" />
+          <div class="info">
+            <div class="name">${escapeHtml(u.nick || u.username)}</div>
+            <div class="count">@${escapeHtml(u.username)}${u.total_urls ? ' · ' + u.total_urls + ' 张' : ''}</div>
+          </div>
+        </div>
+      `).join('');
+    }
+  } catch (e) {
+    content.innerHTML = `<div class="error">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
+  setStatus('');
+}
+
+function proxyUrl(url) {
+  if (!url) return '';
+  try {
+    const u = new URL(url);
+    return '/' + u.host + u.pathname + u.search;
+  } catch {
+    return url;
+  }
+}
+
+async function fetchJson(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return str.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+showDefaultList();
+</script>
+</body>
+</html>

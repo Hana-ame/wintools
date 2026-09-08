@@ -1,0 +1,72 @@
+name: ech-proxy-android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cmd/ech-proxy-android/**"
+      - "pkg/ech/**"
+      - "go.mod"
+      - "go.sum"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android NDK
+        run: |
+          NDK_VERSION="r27"
+          curl -L -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q /tmp/ndk.zip -d /tmp/
+          echo "/tmp/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build ECH shared library (arm64)
+        run: |
+          cd cmd/ech-proxy-android
+          CGO_ENABLED=1 \
+          GOOS=android \
+          GOARCH=arm64 \
+          CC=aarch64-linux-android21-clang \
+          go build -buildmode=c-shared -ldflags="-s -w" -o libechproxy.so .
+          ls -lh libechproxy.so
+
+      - name: Copy library to Android project
+        run: |
+          mkdir -p cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
+          cp cmd/ech-proxy-android/libechproxy.so cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Gradle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gradle
+
+      - name: Build APK
+        run: |
+          cd cmd/ech-proxy-android/android
+          gradle assembleRelease --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: twitter-pic-android
+          path: cmd/ech-proxy-android/android/app/build/outputs/apk/release/app-release.apk
