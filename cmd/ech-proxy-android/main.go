@@ -258,8 +258,8 @@ func router(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. 无域名前缀（直接路径）：/media/xxx.png, /video/xxx.mp4
-	// 默认转发到 pbs.twimg.com
-	echProxyHandler(w, r, "pbs.twimg.com", path)
+	// 默认转发到 video-cf.twimg.com
+	echProxyHandler(w, r, "video-cf.twimg.com", path)
 }
 
 func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
