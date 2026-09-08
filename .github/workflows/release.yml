@@ -130,6 +130,10 @@ jobs:
           gradle wrapper --gradle-version 8.5
 
       - name: Build APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
         run: |
           cd cmd/ech-proxy-android/android
           ./gradlew assembleRelease --no-daemon

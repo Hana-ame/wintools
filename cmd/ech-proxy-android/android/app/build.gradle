@@ -16,10 +16,27 @@ android {
         }
     }
 
+    // 签名配置（从环境变量读取，CI 使用 GitHub Secrets）
+    signingConfigs {
+        release {
+            storeFile file("${rootProject.projectDir}/release.keystore")
+            storePassword "${System.getenv('KEYSTORE_PASSWORD') ?: 'android'}"
+            keyAlias "${System.getenv('KEY_ALIAS') ?: 'release'}"
+            keyPassword "${System.getenv('KEY_PASSWORD') ?: 'android'}"
+            v1SigningEnabled true  // minSdk 21 需要 v1
+            v2SigningEnabled true  // Android 7.0+
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+        debug {
+            applicationIdSuffix ".debug"
+            signingConfig signingConfigs.release  // 开发时使用 release 签名
         }
     }
 
