@@ -108,7 +108,7 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	echReady = true
 	log.Printf("ECH ready")
 
-	// 3. 获取 TLS 证书（参考 ech-proxy，每次启动都下载）
+	// 3. 获取 TLS 证书（每次启动都下载，参考 ech-proxy）
 	proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
 	upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
 
@@ -139,7 +139,7 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 			return 0
 		}
 		tlsCert = &cert
-		log.Printf("Certificate loaded")
+		log.Printf("Certificate loaded (*.l.moonchan.xyz)")
 	}
 
 	// 4. 监听端口（优先 8443，失败则随机）
@@ -164,9 +164,12 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	// 6. 启动 HTTPS（如果证书可用）
+	// 6. 启动 HTTPS 或 HTTP
 	if tlsCert != nil {
+		// HTTPS 模式：浏览器访问 https://twimg.l.moonchan.xyz:8443/
+		// 需要 DNS 解析 twimg.l.moonchan.xyz 到 127.0.0.1
 		log.Printf("Listening HTTPS on 127.0.0.1:%d", proxyPort)
+		log.Printf("Access: https://twimg.l.moonchan.xyz:%d/", proxyPort)
 		proxyServer.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{*tlsCert},
 			MinVersion:   tls.VersionTLS12,
@@ -178,7 +181,9 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 			}
 		}()
 	} else {
-		log.Printf("Listening HTTP on 127.0.0.1:%d (no TLS cert)", proxyPort)
+		// HTTP 模式：浏览器访问 http://127.0.0.1:8443/
+		log.Printf("Listening HTTP on 127.0.0.1:%d", proxyPort)
+		log.Printf("Access: http://127.0.0.1:%d/", proxyPort)
 		go func() {
 			if err := proxyServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 				log.Printf("server error: %v", err)

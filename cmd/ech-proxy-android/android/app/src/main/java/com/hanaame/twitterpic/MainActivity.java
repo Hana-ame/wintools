@@ -110,9 +110,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void openBrowser(int port) {
-        // 使用 HTTPS（从 GitHub 下载证书）
-        String url = "https://127.0.0.1:" + port + "/";
+        // HTTPS 模式：访问 twimg.l.moonchan.xyz（需要 DNS 解析到 127.0.0.1）
+        String url = "https://twimg.l.moonchan.xyz:" + port + "/";
         appendLog("Opening browser: " + url);
+        appendLog("Note: DNS must resolve twimg.l.moonchan.xyz to 127.0.0.1");
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
             startActivity(intent);
