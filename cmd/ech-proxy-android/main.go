@@ -15,20 +15,14 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"crypto/tls"
 	_ "embed"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"C"
 
