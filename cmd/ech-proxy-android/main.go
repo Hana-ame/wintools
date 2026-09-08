@@ -6,6 +6,7 @@
 //   StopProxy()                             - 停止代理
 //   GetProxyPort() uint16                   - 获取当前端口
 //   IsEchReady() int                        - 检查 ECH 是否就绪
+//   GetLogs() *C.char                       - 获取日志（调用者负责释放）
 //
 // 构建（Android）：
 //   GOOS=android GOARCH=arm64 CC=aarch64-linux-android21-clang \
@@ -14,13 +15,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	_ "embed"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -48,12 +52,38 @@ var (
 	proxyServer *http.Server
 	proxyPort   uint16
 	echReady    bool
+
+	logMu       sync.RWMutex
+	logBuffer   []string
+	maxLogLines = 500
 )
+
+// 自定义日志 writer
+type logWriter struct{}
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	line := strings.TrimRight(string(p), "\n")
+	logMu.Lock()
+	logBuffer = append(logBuffer, line)
+	if len(logBuffer) > maxLogLines {
+		logBuffer = logBuffer[len(logBuffer)-maxLogLines:]
+	}
+	logMu.Unlock()
+	return len(p), nil
+}
+
+func init() {
+	log.SetOutput(&logWriter{})
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+}
 
 //export StartProxy
 func StartProxy(bootstrapIP *C.char) uint16 {
 	proxyMu.Lock()
 	defer proxyMu.Unlock()
+
+	logBuffer = nil
+	logBuffer = append(logBuffer, "=== Starting proxy ===")
 
 	if proxyServer != nil {
 		proxyServer.Close()
@@ -62,27 +92,31 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 
 	bootstrap := C.GoString(bootstrapIP)
 	if bootstrap != "" {
+		log.Printf("ECH: DoH=moonchan.xyz, bootstrapIP=%s", bootstrap)
 		cloudflare_ech.SetDoHConfig("moonchan.xyz", bootstrap)
 	} else {
+		log.Printf("ECH: DoH=https://moonchan.xyz/doh")
 		cloudflare_ech.SetDohURL("https://moonchan.xyz/doh")
 	}
 
+	log.Printf("Initializing ECH client...")
 	req, _ := http.NewRequest("HEAD", "https://pbs.twimg.com/favicon.ico", nil)
 	resp, err := cloudflare_ech.Do(req)
 	if err != nil {
-		log.Printf("[proxy] ECH init failed: %v", err)
+		log.Printf("ECH init failed: %v", err)
 		return 0
 	}
 	resp.Body.Close()
 	echReady = true
-	log.Printf("[proxy] ECH ready")
+	log.Printf("ECH ready")
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		log.Printf("[proxy] listen failed: %v", err)
+		log.Printf("listen failed: %v", err)
 		return 0
 	}
 	proxyPort = uint16(ln.Addr().(*net.TCPAddr).Port)
+	log.Printf("Listening on 127.0.0.1:%d", proxyPort)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", router)
@@ -94,12 +128,12 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	}
 
 	go func() {
-		log.Printf("[proxy] listening on 127.0.0.1:%d", proxyPort)
 		if err := proxyServer.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("[proxy] server error: %v", err)
+			log.Printf("server error: %v", err)
 		}
 	}()
 
+	log.Printf("Proxy started")
 	return proxyPort
 }
 
@@ -113,7 +147,7 @@ func StopProxy() {
 		proxyServer = nil
 		proxyPort = 0
 		echReady = false
-		log.Printf("[proxy] stopped")
+		log.Printf("Proxy stopped")
 	}
 }
 
@@ -130,6 +164,15 @@ func IsEchReady() C.int {
 		return 1
 	}
 	return 0
+}
+
+//export GetLogs
+func GetLogs() *C.char {
+	logMu.RLock()
+	defer logMu.RUnlock()
+
+	logs := strings.Join(logBuffer, "\n")
+	return C.CString(logs)
 }
 
 func router(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +207,7 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 
 	targetURL := "https://" + targetHost + "/" + path
-	log.Printf("[proxy] → %s (from %s)", targetURL, r.RemoteAddr)
+	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
 	if err != nil {
@@ -176,7 +219,7 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 
 	resp, err := cloudflare_ech.Do(req)
 	if err != nil {
-		log.Printf("[proxy] ECH error: %v", err)
+		log.Printf("ECH error: %v", err)
 		http.Error(w, "ECH fetch failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -217,7 +260,7 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 
 func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
 	targetURL := "https://" + targetHost + path
-	log.Printf("[api] → %s (from %s)", targetURL, r.RemoteAddr)
+	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
 	if err != nil {
@@ -229,7 +272,7 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[api] error: %v", err)
+		log.Printf("API error: %v", err)
 		http.Error(w, "API fetch failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
