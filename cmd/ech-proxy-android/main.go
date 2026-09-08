@@ -15,6 +15,7 @@
 package main
 
 import (
+	"crypto/tls"
 	_ "embed"
 	"fmt"
 	"log"
@@ -27,6 +28,7 @@ import (
 	"C"
 
 	cloudflare_ech "github.com/Hana-ame/wintools/pkg/ech"
+	echproxy "github.com/Hana-ame/wintools/pkg/echproxy"
 )
 
 //go:embed web/index.html
@@ -84,6 +86,7 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		proxyServer = nil
 	}
 
+	// 1. 配置 ECH
 	bootstrap := C.GoString(bootstrapIP)
 	if bootstrap != "" {
 		log.Printf("ECH: DoH=moonchan.xyz, bootstrapIP=%s", bootstrap)
@@ -93,6 +96,7 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		cloudflare_ech.SetDohURL("https://moonchan.xyz/doh")
 	}
 
+	// 2. 初始化 ECH
 	log.Printf("Initializing ECH client...")
 	req, _ := http.NewRequest("HEAD", "https://pbs.twimg.com/favicon.ico", nil)
 	resp, err := cloudflare_ech.Do(req)
@@ -104,13 +108,101 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	echReady = true
 	log.Printf("ECH ready")
 
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	// 3. 获取 TLS 证书（参考 ech-proxy）
+	proxyBase := "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
+	upstreamConfigURL := fmt.Sprintf(proxyBase, "certs/l.moonchan.xyz/upstream.json")
+
+	log.Printf("Loading upstream config: %s", upstreamConfigURL)
+	cfg, err := echproxy.LoadConfig(upstreamConfigURL)
 	if err != nil {
-		log.Printf("listen failed: %v", err)
-		return 0
+		log.Printf("Failed to load config: %v", err)
+		// 降级到 HTTP 模式
+		return startHTTPProxy()
+	}
+
+	var tlsCert *tls.Certificate
+	if cfg.CertPath != "" && cfg.KeyPath != "" {
+		log.Printf("Fetching certificate: %s", cfg.CertPath)
+		certPEM, err := echproxy.FetchBytes(cfg.CertPath)
+		if err != nil {
+			log.Printf("Failed to fetch cert: %v", err)
+			return startHTTPProxy()
+		}
+		log.Printf("Fetching key: %s", cfg.KeyPath)
+		keyPEM, err := echproxy.FetchBytes(cfg.KeyPath)
+		if err != nil {
+			log.Printf("Failed to fetch key: %v", err)
+			return startHTTPProxy()
+		}
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			log.Printf("Failed to parse cert: %v", err)
+			return startHTTPProxy()
+		}
+		tlsCert = &cert
+		log.Printf("Certificate loaded")
+	}
+
+	// 4. 监听端口（优先 8443，失败则随机）
+	ln, err := net.Listen("tcp4", "127.0.0.1:8443")
+	if err != nil {
+		log.Printf("Port 8443 in use, trying random port...")
+		ln, err = net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			log.Printf("listen failed: %v", err)
+			return 0
+		}
 	}
 	proxyPort = uint16(ln.Addr().(*net.TCPAddr).Port)
-	log.Printf("Listening on 127.0.0.1:%d", proxyPort)
+
+	// 5. 配置 HTTP 服务器
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", router)
+
+	proxyServer = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// 6. 启动 HTTPS 或 HTTP
+	if tlsCert != nil {
+		log.Printf("Listening HTTPS on 127.0.0.1:%d", proxyPort)
+		proxyServer.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{*tlsCert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		tlsLn := tls.NewListener(ln, proxyServer.TLSConfig)
+		go func() {
+			if err := proxyServer.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
+				log.Printf("server error: %v", err)
+			}
+		}()
+	} else {
+		log.Printf("Listening HTTP on 127.0.0.1:%d (no TLS cert)", proxyPort)
+		go func() {
+			if err := proxyServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Printf("server error: %v", err)
+			}
+		}()
+	}
+
+	log.Printf("Proxy started on port %d", proxyPort)
+	return proxyPort
+}
+
+// startHTTPProxy 降级到 HTTP 模式
+func startHTTPProxy() uint16 {
+	ln, err := net.Listen("tcp4", "127.0.0.1:8443")
+	if err != nil {
+		ln, err = net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			log.Printf("listen failed: %v", err)
+			return 0
+		}
+	}
+	proxyPort = uint16(ln.Addr().(*net.TCPAddr).Port)
+	log.Printf("Listening HTTP on 127.0.0.1:%d", proxyPort)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", router)
@@ -127,7 +219,6 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		}
 	}()
 
-	log.Printf("Proxy started")
 	return proxyPort
 }
 
