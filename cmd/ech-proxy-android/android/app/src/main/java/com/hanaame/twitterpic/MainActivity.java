@@ -110,8 +110,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void openBrowser(int port) {
-        // 使用 HTTPS（如果代理支持 TLS）
-        String url = "https://127.0.0.1:" + port + "/";
+        // 使用 HTTP（本地通信，证书域名不匹配）
+        String url = "http://127.0.0.1:" + port + "/";
         appendLog("Opening browser: " + url);
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
