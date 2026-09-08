@@ -28,6 +28,7 @@ jobs:
             name=$(basename "$cmd")
             # skip CGo shared library (needs C cross-compiler)
             [ "$name" = "ech-shared" ] && continue
+            [ "$name" = "ech-proxy-android" ] && continue  # Android 单独构建
             ext=""
             [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
             mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
@@ -74,8 +75,67 @@ jobs:
           name: vcshost.dll
           path: echshared.dll
 
+  # Android APK 构建（Go c-shared + JNI wrapper + Java App）
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android NDK
+        run: |
+          NDK_VERSION="r27"
+          curl -L -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q /tmp/ndk.zip -d /tmp/
+          echo "/tmp/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build ECH shared library (arm64)
+        run: |
+          cd cmd/ech-proxy-android
+          CGO_ENABLED=1 \
+          GOOS=android \
+          GOARCH=arm64 \
+          CC=aarch64-linux-android21-clang \
+          go build -buildmode=c-shared -ldflags="-s -w" -o libechproxy.so .
+          ls -lh libechproxy.so
+
+      - name: Copy library to Android project
+        run: |
+          mkdir -p cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
+          cp cmd/ech-proxy-android/libechproxy.so cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Gradle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gradle
+
+      - name: Build APK
+        run: |
+          cd cmd/ech-proxy-android/android
+          gradle assembleRelease --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: cmd/ech-proxy-android/android/app/build/outputs/apk/release/app-release.apk
+
   release:
-    needs: [build, build-shared]
+    needs: [build, build-shared, build-android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -93,6 +153,10 @@ jobs:
           {
             echo "## 每个 exe 的功能"
             cat RELEASE.md
+            echo ""
+            echo "## Android APK"
+            echo "Twitter Pic Android 客户端，使用 ECH 代理访问 Twitter CDN。"
+            echo "下载 app-release.apk 安装到手机。"
           } > release_body.md
           gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md
 
