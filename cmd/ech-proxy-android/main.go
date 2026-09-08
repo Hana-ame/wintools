@@ -34,13 +34,8 @@ import (
 //go:embed web/index.html
 var indexHTML string
 
-// Twitter CDN 域名映射
-var cdnMap = map[string]string{
-	"pbs.twimg.com":       "pbs.twimg.com",
-	"video-cf.twimg.com": "video-cf.twimg.com",
-	"abs.twimg.com":       "abs.twimg.com",
-}
-
+// Twitter CDN 域名
+const defaultCdnHost = "video-cf.twimg.com"
 const apiHost = "x.moonchan.xyz"
 
 var (
@@ -243,23 +238,14 @@ func router(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. 带域名前缀（域前置）：/pbs.twimg.com/media/xxx.png
-	for prefix, target := range cdnMap {
-		if strings.HasPrefix(path, "/"+prefix+"/") || path == "/"+prefix {
-			echProxyHandler(w, r, target, strings.TrimPrefix(path, "/"+prefix))
-			return
-		}
-	}
-
-	// 2. API 路由：/api/users/xxx
+	// API 路由：/api/users/xxx
 	if strings.HasPrefix(path, "/api/") {
 		apiProxyHandler(w, r, apiHost, strings.TrimPrefix(path, "/api"))
 		return
 	}
 
-	// 3. 无域名前缀（直接路径）：/media/xxx.png, /video/xxx.mp4
-	// 默认转发到 video-cf.twimg.com
-	echProxyHandler(w, r, "video-cf.twimg.com", path)
+	// 默认路由：转发到 video-cf.twimg.com
+	echProxyHandler(w, r, defaultCdnHost, path)
 }
 
 func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
