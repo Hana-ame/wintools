@@ -63,10 +63,12 @@ var (
 	maxConns    int32 = 100
 	errorCount  int64
 
-	// 超时配置（注意：不设 WriteTimeout，
-	// 否则慢速大文件/视频下载会被砍断——与原版 ech-proxy 一致）
-	readTimeout = 10 * time.Second
-	idleTimeout = 120 * time.Second
+	// 超时配置
+	// WriteTimeout: 30 分钟兜底——足够慢速大视频下载完，
+	// 又能防止挂死连接永久占用资源。
+	readTimeout  = 10 * time.Second
+	writeTimeout = 30 * time.Minute
+	idleTimeout  = 120 * time.Second
 )
 
 // 自定义日志 writer
@@ -176,6 +178,7 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	proxyServer = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: readTimeout,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
 	}
 
@@ -326,14 +329,15 @@ func router(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
-			"cdnHost":     defaultCdnHost,
-			"port":        proxyPort,
-			"echReady":    echReady,
-			"tlsEnabled":  true,
-			"maxLogLines": maxLogLines,
-			"maxConns":    maxConns,
-			"readTimeout": readTimeout.String(),
-			"idleTimeout": idleTimeout.String(),
+			"cdnHost":      defaultCdnHost,
+			"port":         proxyPort,
+			"echReady":     echReady,
+			"tlsEnabled":   true,
+			"maxLogLines":  maxLogLines,
+			"maxConns":     maxConns,
+			"readTimeout":  readTimeout.String(),
+			"writeTimeout": writeTimeout.String(),
+			"idleTimeout":  idleTimeout.String(),
 		})
 		return
 	}
