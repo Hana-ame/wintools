@@ -382,8 +382,8 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		return
 	}
 
-	// 构建目标 URL（避免双斜杠）
-	targetURL := "https://" + targetHost + strings.TrimPrefix(path, "/")
+	// 构建目标 URL
+	targetURL := "https://" + targetHost + path
 	// 保留查询参数
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
