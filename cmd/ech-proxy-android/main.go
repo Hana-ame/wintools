@@ -20,6 +20,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -60,14 +61,36 @@ var (
 	statsMu      sync.Mutex
 	reqCount     int64
 	bytesSent    int64
+	bytesCached  int64
+	cacheHits    int64
+	cacheMisses  int64
 	activeConns  int32
 	maxConns     int32 = 100
+	errorCount   int64
 
 	// 超时配置
 	readTimeout  = 10 * time.Second
 	writeTimeout = 120 * time.Second
 	idleTimeout  = 120 * time.Second
+
+	// 缓存配置
+	cacheMu      sync.RWMutex
+	cache        = make(map[string]*cacheEntry)
+	maxCacheSize = 50 * 1024 * 1024 // 50MB
+	maxCacheItems = 100
+	cacheTTL     = 5 * time.Minute
+
+	// 重试配置
+	maxRetries = 2
 )
+
+// 缓存条目
+type cacheEntry struct {
+	statusCode int
+	headers    http.Header
+	body       []byte
+	timestamp  time.Time
+}
 
 // 自定义日志 writer
 type logWriter struct{}
@@ -175,9 +198,19 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 
 	proxyServer = &http.Server{
 		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 	}
+
+	// 启动缓存清理 goroutine
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanupCache()
+		}
+	}()
 
 	// 6. 启动 HTTPS 或 HTTP
 	if tlsCert != nil {
@@ -251,6 +284,56 @@ func GetLogs() *C.char {
 
 	logs := strings.Join(logBuffer, "\n")
 	return C.CString(logs)
+}
+
+// 清理过期缓存
+func cleanupCache() {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	now := time.Now()
+	for k, v := range cache {
+		if now.Sub(v.timestamp) > cacheTTL {
+			delete(cache, k)
+		}
+	}
+}
+
+// 从缓存获取
+func getFromCache(key string) *cacheEntry {
+	cacheMu.RLock()
+	defer cacheMu.RUnlock()
+	return cache[key]
+}
+
+// 存入缓存
+func putToCache(key string, entry *cacheEntry) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	// 检查总大小
+	totalSize := 0
+	for _, v := range cache {
+		totalSize += len(v.body)
+	}
+	if totalSize+len(entry.body) > maxCacheSize {
+		return // 超出缓存限制
+	}
+
+	// 检查条目数
+	if len(cache) >= maxCacheItems {
+		return // 超出条目限制
+	}
+
+	cache[key] = entry
+}
+
+// 清理缓存
+func clearCache() {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	cache = make(map[string]*cacheEntry)
+	log.Printf("Cache cleared")
 }
 
 func router(w http.ResponseWriter, r *http.Request) {
@@ -345,19 +428,93 @@ func router(w http.ResponseWriter, r *http.Request) {
 		statsMu.Lock()
 		reqCount := reqCount
 		bytesSent := bytesSent
+		bytesCached := bytesCached
+		cacheHits := cacheHits
+		cacheMisses := cacheMisses
+		errorCount := errorCount
 		statsMu.Unlock()
+
+		cacheMu.RLock()
+		cacheCount := len(cache)
+		cacheSize := 0
+		for _, v := range cache {
+			cacheSize += len(v.body)
+		}
+		cacheMu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
 			"requestCount":  reqCount,
 			"bytesSent":     bytesSent,
+			"bytesCached":   bytesCached,
+			"cacheHits":     cacheHits,
+			"cacheMisses":   cacheMisses,
+			"cacheCount":    cacheCount,
+			"cacheSize":     cacheSize,
+			"errorCount":    errorCount,
 			"activeConns":   atomic.LoadInt32(&activeConns),
 			"maxConns":      maxConns,
 			"uptime":        time.Since(startTime).String(),
 			"echReady":      echReady,
 			"port":          proxyPort,
 		})
+		return
+	}
+
+	// Prometheus 指标：/metrics
+	if path == "/metrics" {
+		statsMu.Lock()
+		reqCount := reqCount
+		bytesSent := bytesSent
+		cacheHits := cacheHits
+		cacheMisses := cacheMisses
+		errorCount := errorCount
+		statsMu.Unlock()
+
+		cacheMu.RLock()
+		cacheCount := len(cache)
+		cacheSize := 0
+		for _, v := range cache {
+			cacheSize += len(v.body)
+		}
+		cacheMu.RUnlock()
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "# HELP proxy_requests_total Total requests\n")
+		fmt.Fprintf(w, "# TYPE proxy_requests_total counter\n")
+		fmt.Fprintf(w, "proxy_requests_total %d\n", reqCount)
+		fmt.Fprintf(w, "# HELP proxy_bytes_sent_total Total bytes sent\n")
+		fmt.Fprintf(w, "# TYPE proxy_bytes_sent_total counter\n")
+		fmt.Fprintf(w, "proxy_bytes_sent_total %d\n", bytesSent)
+		fmt.Fprintf(w, "# HELP proxy_cache_hits_total Cache hits\n")
+		fmt.Fprintf(w, "# TYPE proxy_cache_hits_total counter\n")
+		fmt.Fprintf(w, "proxy_cache_hits_total %d\n", cacheHits)
+		fmt.Fprintf(w, "# HELP proxy_cache_misses_total Cache misses\n")
+		fmt.Fprintf(w, "# TYPE proxy_cache_misses_total counter\n")
+		fmt.Fprintf(w, "proxy_cache_misses_total %d\n", cacheMisses)
+		fmt.Fprintf(w, "# HELP proxy_cache_entries Cache entries count\n")
+		fmt.Fprintf(w, "# TYPE proxy_cache_entries gauge\n")
+		fmt.Fprintf(w, "proxy_cache_entries %d\n", cacheCount)
+		fmt.Fprintf(w, "# HELP proxy_cache_size_bytes Cache size in bytes\n")
+		fmt.Fprintf(w, "# TYPE proxy_cache_size_bytes gauge\n")
+		fmt.Fprintf(w, "proxy_cache_size_bytes %d\n", cacheSize)
+		fmt.Fprintf(w, "# HELP proxy_errors_total Total errors\n")
+		fmt.Fprintf(w, "# TYPE proxy_errors_total counter\n")
+		fmt.Fprintf(w, "proxy_errors_total %d\n", errorCount)
+		fmt.Fprintf(w, "# HELP proxy_active_connections Active connections\n")
+		fmt.Fprintf(w, "# TYPE proxy_active_connections gauge\n")
+		fmt.Fprintf(w, "proxy_active_connections %d\n", atomic.LoadInt32(&activeConns))
+		return
+	}
+
+	// 缓存清理：POST /cache/clear
+	if path == "/cache/clear" && r.Method == http.MethodPost {
+		clearCache()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
 		return
 	}
 
@@ -385,8 +542,35 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
 
+	// 检查缓存
+	cacheKey := targetURL
+	if entry := getFromCache(cacheKey); entry != nil {
+		statsMu.Lock()
+		cacheHits++
+		bytesCached += int64(len(entry.body))
+		statsMu.Unlock()
+
+		log.Printf("  Cache HIT")
+		for k, vs := range entry.headers {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.Header().Set("X-Cache", "HIT")
+		w.WriteHeader(entry.statusCode)
+		w.Write(entry.body)
+		return
+	}
+
+	statsMu.Lock()
+	cacheMisses++
+	statsMu.Unlock()
+
 	req, err := http.NewRequest(r.Method, targetURL, nil)
 	if err != nil {
+		statsMu.Lock()
+		errorCount++
+		statsMu.Unlock()
 		log.Printf("Error: %v", err)
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
@@ -414,10 +598,27 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 	}
 
-	resp, err := cloudflare_ech.Do(req)
-	if err != nil {
-		log.Printf("ECH error: %v", err)
-		http.Error(w, "ECH fetch failed: "+err.Error(), http.StatusBadGateway)
+	// 重试机制
+	var resp *http.Response
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("  Retry %d/%d", attempt, maxRetries)
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+
+		resp, lastErr = cloudflare_ech.Do(req)
+		if resp != nil {
+			break
+		}
+	}
+
+	if resp == nil {
+		statsMu.Lock()
+		errorCount++
+		statsMu.Unlock()
+		log.Printf("ECH error: %v", lastErr)
+		http.Error(w, "ECH fetch failed: "+lastErr.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -428,6 +629,28 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	if resp.StatusCode == http.StatusNotModified {
 		w.WriteHeader(http.StatusNotModified)
 		return
+	}
+
+	// 读取响应体
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		statsMu.Lock()
+		errorCount++
+		statsMu.Unlock()
+		log.Printf("Read error: %v", err)
+		http.Error(w, "failed to read response: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// 存入缓存（只缓存 200 OK 且小于 5MB 的响应）
+	if resp.StatusCode == http.StatusOK && len(body) < 5*1024*1024 {
+		putToCache(cacheKey, &cacheEntry{
+			statusCode: resp.StatusCode,
+			headers:    resp.Header.Clone(),
+			body:       body,
+			timestamp:  time.Now(),
+		})
+		log.Printf("  Cache MISS (cached)")
 	}
 
 	// 转发响应头（跳过 hop-by-hop 头）
@@ -446,35 +669,23 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 
 	// 设置 CORS 头
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range, ETag, Last-Modified, Cache-Control")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range, ETag, Last-Modified, Cache-Control, X-Cache")
+	w.Header().Set("X-Cache", "MISS")
 
 	w.WriteHeader(resp.StatusCode)
 
-	// 流式传输响应体 + 字节统计
-	buf := make([]byte, 64*1024)
-	var totalBytes int64
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			totalBytes += int64(n)
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				log.Printf("Write error: %v", werr)
-				return
-			}
-		}
-		if err != nil {
-			if err.Error() == "EOF" {
-				statsMu.Lock()
-				bytesSent += totalBytes
-				statsMu.Unlock()
-				if totalBytes > 0 {
-					log.Printf("  Bytes: %d", totalBytes)
-				}
-				return
-			}
-			log.Printf("Read error: %v", err)
-			return
-		}
+	// 写入响应体
+	if _, err := w.Write(body); err != nil {
+		log.Printf("Write error: %v", err)
+		return
+	}
+
+	// 统计
+	statsMu.Lock()
+	bytesSent += int64(len(body))
+	statsMu.Unlock()
+	if len(body) > 0 {
+		log.Printf("  Bytes: %d", len(body))
 	}
 }
 
