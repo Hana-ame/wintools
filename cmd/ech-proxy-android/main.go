@@ -57,12 +57,12 @@ var (
 	maxLogLines = 500
 
 	// 统计信息
-	statsMu      sync.Mutex
-	reqCount     int64
-	bytesSent    int64
-	activeConns  int32
-	maxConns     int32 = 100
-	errorCount   int64
+	statsMu     sync.Mutex
+	reqCount    int64
+	bytesSent   int64
+	activeConns int32
+	maxConns    int32 = 100
+	errorCount  int64
 
 	// 超时配置
 	readTimeout  = 10 * time.Second
@@ -303,13 +303,13 @@ func router(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":      "ok",
-			"ech":         echReady,
-			"port":        proxyPort,
-			"version":     version,
+			"status":       "ok",
+			"ech":          echReady,
+			"port":         proxyPort,
+			"version":      version,
 			"requestCount": reqCount,
-			"bytesSent":   bytesSent,
-			"activeConns": atomic.LoadInt32(&activeConns),
+			"bytesSent":    bytesSent,
+			"activeConns":  atomic.LoadInt32(&activeConns),
 		})
 		return
 	}
@@ -337,8 +337,8 @@ func router(w http.ResponseWriter, r *http.Request) {
 			"tlsEnabled":  true,
 			"maxLogLines": maxLogLines,
 			"maxConns":    maxConns,
-			"readTimeout":  readTimeout.String(),
-			"idleTimeout":  idleTimeout.String(),
+			"readTimeout": readTimeout.String(),
+			"idleTimeout": idleTimeout.String(),
 		})
 		return
 	}
@@ -354,14 +354,14 @@ func router(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
-			"requestCount":  reqCount,
-			"bytesSent":     bytesSent,
-			"errorCount":    errorCount,
-			"activeConns":   atomic.LoadInt32(&activeConns),
-			"maxConns":      maxConns,
-			"uptime":        time.Since(startTime).String(),
-			"echReady":      echReady,
-			"port":          proxyPort,
+			"requestCount": reqCount,
+			"bytesSent":    bytesSent,
+			"errorCount":   errorCount,
+			"activeConns":  atomic.LoadInt32(&activeConns),
+			"maxConns":     maxConns,
+			"uptime":       time.Since(startTime).String(),
+			"echReady":     echReady,
+			"port":         proxyPort,
 		})
 		return
 	}
@@ -474,17 +474,6 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		return
 	}
 
-	// 读取响应体
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		statsMu.Lock()
-		errorCount++
-		statsMu.Unlock()
-		log.Printf("Read error: %v", err)
-		http.Error(w, "failed to read response: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
 	// 转发响应头（跳过 hop-by-hop 头）
 	hopByHop := map[string]bool{
 		"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
@@ -505,18 +494,27 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 
 	w.WriteHeader(resp.StatusCode)
 
-	// 写入响应体
-	if _, err := w.Write(body); err != nil {
-		log.Printf("Write error: %v", err)
+	// HEAD 请求：只返回响应头，不读取 body
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	// 流式传输响应体（边读边写，大文件不占内存）
+	n, copyErr := io.Copy(w, resp.Body)
+	if copyErr != nil {
+		statsMu.Lock()
+		errorCount++
+		statsMu.Unlock()
+		log.Printf("Stream error: %v", copyErr)
 		return
 	}
 
 	// 统计
 	statsMu.Lock()
-	bytesSent += int64(len(body))
+	bytesSent += n
 	statsMu.Unlock()
-	if len(body) > 0 {
-		log.Printf("  Bytes: %d", len(body))
+	if n > 0 {
+		log.Printf("  Bytes: %d", n)
 	}
 }
 
