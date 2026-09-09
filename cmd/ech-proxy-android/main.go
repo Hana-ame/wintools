@@ -20,7 +20,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -499,14 +498,25 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		return
 	}
 
-	// 流式传输响应体（边读边写，大文件不占内存）
-	n, copyErr := io.Copy(w, resp.Body)
-	if copyErr != nil {
-		statsMu.Lock()
-		errorCount++
-		statsMu.Unlock()
-		log.Printf("Stream error: %v", copyErr)
-		return
+	// 流式转发（与原版 ech-proxy 一致）：边读边写并 flush，
+	// 避免缓冲导致的首字节延迟，视频拖动播放更流畅。
+	buf := make([]byte, 32*1024)
+	var n int64
+	for {
+		nr, rerr := resp.Body.Read(buf)
+		if nr > 0 {
+			if _, werr := w.Write(buf[:nr]); werr != nil {
+				log.Printf("Write error: %v", werr)
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			n += int64(nr)
+		}
+		if rerr != nil {
+			break
+		}
 	}
 
 	// 统计
