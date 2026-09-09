@@ -25,7 +25,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"C"
@@ -56,12 +55,10 @@ var (
 	maxLogLines = 500
 
 	// 统计信息
-	statsMu     sync.Mutex
-	reqCount    int64
-	bytesSent   int64
-	activeConns int32
-	maxConns    int32 = 100
-	errorCount  int64
+	statsMu    sync.Mutex
+	reqCount   int64
+	bytesSent  int64
+	errorCount int64
 
 	// 超时配置
 	// WriteTimeout: 30 分钟兜底——足够慢速大视频下载完，
@@ -259,14 +256,6 @@ func GetLogs() *C.char {
 func router(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
-	// 并发限制
-	active := atomic.AddInt32(&activeConns, 1)
-	defer atomic.AddInt32(&activeConns, -1)
-	if active > maxConns {
-		http.Error(w, "too many connections", http.StatusServiceUnavailable)
-		return
-	}
-
 	// 统计
 	statsMu.Lock()
 	reqCount++
@@ -307,7 +296,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 			"version":      version,
 			"requestCount": reqCount,
 			"bytesSent":    bytesSent,
-			"activeConns":  atomic.LoadInt32(&activeConns),
 		})
 		return
 	}
@@ -334,7 +322,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 			"echReady":     echReady,
 			"tlsEnabled":   true,
 			"maxLogLines":  maxLogLines,
-			"maxConns":     maxConns,
 			"readTimeout":  readTimeout.String(),
 			"writeTimeout": writeTimeout.String(),
 			"idleTimeout":  idleTimeout.String(),
@@ -356,8 +343,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 			"requestCount": reqCount,
 			"bytesSent":    bytesSent,
 			"errorCount":   errorCount,
-			"activeConns":  atomic.LoadInt32(&activeConns),
-			"maxConns":     maxConns,
 			"uptime":       time.Since(startTime).String(),
 			"echReady":     echReady,
 			"port":         proxyPort,
@@ -384,9 +369,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP proxy_errors_total Total errors\n")
 		fmt.Fprintf(w, "# TYPE proxy_errors_total counter\n")
 		fmt.Fprintf(w, "proxy_errors_total %d\n", errorCount)
-		fmt.Fprintf(w, "# HELP proxy_active_connections Active connections\n")
-		fmt.Fprintf(w, "# TYPE proxy_active_connections gauge\n")
-		fmt.Fprintf(w, "proxy_active_connections %d\n", atomic.LoadInt32(&activeConns))
 		return
 	}
 
