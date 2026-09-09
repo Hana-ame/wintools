@@ -17,6 +17,7 @@ package main
 import (
 	"crypto/tls"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -37,6 +38,10 @@ var indexHTML string
 // Twitter CDN 域名
 const defaultCdnHost = "video-cf.twimg.com"
 const apiHost = "x.moonchan.xyz"
+
+// 版本信息（构建时注入）
+var version = "2.5.1"
+var buildTime = "unknown"
 
 var (
 	proxyMu     sync.Mutex
@@ -231,10 +236,62 @@ func GetLogs() *C.char {
 func router(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
+	// CORS 支持
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if path == "/" || path == "" {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, indexHTML)
+		return
+	}
+
+	// 健康检查：/healthz
+	if path == "/healthz" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"ech":     echReady,
+			"port":    proxyPort,
+			"version": version,
+		})
+		return
+	}
+
+	// 版本信息：/version
+	if path == "/version" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"version":   version,
+			"buildTime": buildTime,
+			"host":      defaultCdnHost,
+			"apiHost":   apiHost,
+		})
+		return
+	}
+
+	// 配置信息：/config
+	if path == "/config" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"cdnHost":    defaultCdnHost,
+			"apiHost":    apiHost,
+			"port":       proxyPort,
+			"echReady":   echReady,
+			"tlsEnabled": true,
+			"maxLogLines": maxLogLines,
+		})
 		return
 	}
 
@@ -264,11 +321,25 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
 	if err != nil {
+		log.Printf("Error: %v", err)
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// 设置请求头
 	req.Header.Set("Referer", "https://x.com")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (TwitterPic)")
+
+	// 转发 Range 请求（视频播放支持）
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+		log.Printf("  Range: %s", rangeHeader)
+	}
+
+	// 转发 If-Range（缓存验证）
+	if ifRange := r.Header.Get("If-Range"); ifRange != "" {
+		req.Header.Set("If-Range", ifRange)
+	}
 
 	resp, err := cloudflare_ech.Do(req)
 	if err != nil {
@@ -278,6 +349,9 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 	defer resp.Body.Close()
 
+	log.Printf("  Status: %d", resp.StatusCode)
+
+	// 转发响应头（跳过 hop-by-hop 头）
 	hopByHop := map[string]bool{
 		"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
 		"Proxy-Authorization": true, "Te": true, "Trailer": true,
@@ -292,20 +366,26 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 	}
 
-	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		w.Header().Set("Content-Length", cl)
-	}
+	// 设置 CORS 头
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range")
 
 	w.WriteHeader(resp.StatusCode)
+
+	// 流式传输响应体
 	buf := make([]byte, 64*1024)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
+				log.Printf("Write error: %v", werr)
 				return
 			}
 		}
 		if err != nil {
+			if err.Error() == "EOF" {
+				return
+			}
+			log.Printf("Read error: %v", err)
 			return
 		}
 	}
@@ -321,6 +401,7 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
 	if err != nil {
+		log.Printf("Error: %v", err)
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -335,21 +416,32 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 	defer resp.Body.Close()
 
+	log.Printf("  Status: %d", resp.StatusCode)
+
+	// 转发响应头
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
+
 	w.WriteHeader(resp.StatusCode)
+
+	// 流式传输响应体
 	buf := make([]byte, 64*1024)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
+				log.Printf("Write error: %v", werr)
 				return
 			}
 		}
 		if err != nil {
+			if err.Error() == "EOF" {
+				return
+			}
+			log.Printf("Read error: %v", err)
 			return
 		}
 	}
