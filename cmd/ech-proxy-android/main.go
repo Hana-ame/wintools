@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	_ "embed"
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"C"
@@ -42,6 +44,7 @@ const apiHost = "x.moonchan.xyz"
 // 版本信息（构建时注入）
 var version = "2.5.1"
 var buildTime = "unknown"
+var startTime = time.Now()
 
 var (
 	proxyMu     sync.Mutex
@@ -52,6 +55,18 @@ var (
 	logMu       sync.RWMutex
 	logBuffer   []string
 	maxLogLines = 500
+
+	// 统计信息
+	statsMu      sync.Mutex
+	reqCount     int64
+	bytesSent    int64
+	activeConns  int32
+	maxConns     int32 = 100
+
+	// 超时配置
+	readTimeout  = 10 * time.Second
+	writeTimeout = 120 * time.Second
+	idleTimeout  = 120 * time.Second
 )
 
 // 自定义日志 writer
@@ -201,7 +216,12 @@ func StopProxy() {
 	defer proxyMu.Unlock()
 
 	if proxyServer != nil {
-		proxyServer.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := proxyServer.Shutdown(ctx); err != nil {
+			log.Printf("Shutdown error: %v", err)
+		}
 		proxyServer = nil
 		proxyPort = 0
 		echReady = false
@@ -236,10 +256,24 @@ func GetLogs() *C.char {
 func router(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
+	// 并发限制
+	active := atomic.AddInt32(&activeConns, 1)
+	defer atomic.AddInt32(&activeConns, -1)
+	if active > maxConns {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+
+	// 统计
+	statsMu.Lock()
+	reqCount++
+	statsMu.Unlock()
+
 	// CORS 支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range, If-Range, If-Modified-Since, If-None-Match")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Type, Cache-Control, ETag, Last-Modified")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 
 	if r.Method == http.MethodOptions {
@@ -256,13 +290,21 @@ func router(w http.ResponseWriter, r *http.Request) {
 
 	// 健康检查：/healthz
 	if path == "/healthz" {
+		statsMu.Lock()
+		reqCount := reqCount
+		bytesSent := bytesSent
+		statsMu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":  "ok",
-			"ech":     echReady,
-			"port":    proxyPort,
-			"version": version,
+			"status":      "ok",
+			"ech":         echReady,
+			"port":        proxyPort,
+			"version":     version,
+			"requestCount": reqCount,
+			"bytesSent":   bytesSent,
+			"activeConns": atomic.LoadInt32(&activeConns),
 		})
 		return
 	}
@@ -285,12 +327,36 @@ func router(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
-			"cdnHost":    defaultCdnHost,
-			"apiHost":    apiHost,
-			"port":       proxyPort,
-			"echReady":   echReady,
-			"tlsEnabled": true,
+			"cdnHost":     defaultCdnHost,
+			"apiHost":     apiHost,
+			"port":        proxyPort,
+			"echReady":    echReady,
+			"tlsEnabled":  true,
 			"maxLogLines": maxLogLines,
+			"maxConns":    maxConns,
+			"readTimeout":  readTimeout.String(),
+			"idleTimeout":  idleTimeout.String(),
+		})
+		return
+	}
+
+	// 统计信息：/stats
+	if path == "/stats" {
+		statsMu.Lock()
+		reqCount := reqCount
+		bytesSent := bytesSent
+		statsMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"requestCount":  reqCount,
+			"bytesSent":     bytesSent,
+			"activeConns":   atomic.LoadInt32(&activeConns),
+			"maxConns":      maxConns,
+			"uptime":        time.Since(startTime).String(),
+			"echReady":      echReady,
+			"port":          proxyPort,
 		})
 		return
 	}
@@ -341,6 +407,13 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		req.Header.Set("If-Range", ifRange)
 	}
 
+	// 转发缓存头（If-Modified-Since, If-None-Match）
+	for _, h := range []string{"If-Modified-Since", "If-None-Match", "Cache-Control"} {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+
 	resp, err := cloudflare_ech.Do(req)
 	if err != nil {
 		log.Printf("ECH error: %v", err)
@@ -350,6 +423,12 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	defer resp.Body.Close()
 
 	log.Printf("  Status: %d", resp.StatusCode)
+
+	// 304 Not Modified 直接返回
+	if resp.StatusCode == http.StatusNotModified {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 
 	// 转发响应头（跳过 hop-by-hop 头）
 	hopByHop := map[string]bool{
@@ -367,15 +446,17 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 
 	// 设置 CORS 头
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range, ETag, Last-Modified, Cache-Control")
 
 	w.WriteHeader(resp.StatusCode)
 
-	// 流式传输响应体
+	// 流式传输响应体 + 字节统计
 	buf := make([]byte, 64*1024)
+	var totalBytes int64
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
+			totalBytes += int64(n)
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				log.Printf("Write error: %v", werr)
 				return
@@ -383,6 +464,12 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 		if err != nil {
 			if err.Error() == "EOF" {
+				statsMu.Lock()
+				bytesSent += totalBytes
+				statsMu.Unlock()
+				if totalBytes > 0 {
+					log.Printf("  Bytes: %d", totalBytes)
+				}
 				return
 			}
 			log.Printf("Read error: %v", err)
