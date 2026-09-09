@@ -40,7 +40,6 @@ var indexHTML string
 
 // Twitter CDN 域名
 const defaultCdnHost = "video-cf.twimg.com"
-const apiHost = "x.moonchan.xyz"
 
 // 版本信息（构建时注入）
 var version = "2.5.1"
@@ -61,9 +60,6 @@ var (
 	statsMu      sync.Mutex
 	reqCount     int64
 	bytesSent    int64
-	bytesCached  int64
-	cacheHits    int64
-	cacheMisses  int64
 	activeConns  int32
 	maxConns     int32 = 100
 	errorCount   int64
@@ -73,24 +69,9 @@ var (
 	writeTimeout = 120 * time.Second
 	idleTimeout  = 120 * time.Second
 
-	// 缓存配置
-	cacheMu      sync.RWMutex
-	cache        = make(map[string]*cacheEntry)
-	maxCacheSize = 50 * 1024 * 1024 // 50MB
-	maxCacheItems = 100
-	cacheTTL     = 5 * time.Minute
-
 	// 重试配置
 	maxRetries = 2
 )
-
-// 缓存条目
-type cacheEntry struct {
-	statusCode int
-	headers    http.Header
-	body       []byte
-	timestamp  time.Time
-}
 
 // 自定义日志 writer
 type logWriter struct{}
@@ -203,15 +184,6 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		IdleTimeout:       idleTimeout,
 	}
 
-	// 启动缓存清理 goroutine
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			cleanupCache()
-		}
-	}()
-
 	// 6. 启动 HTTPS 或 HTTP
 	if tlsCert != nil {
 		// HTTPS 模式：浏览器访问 https://twimg.l.moonchan.xyz:8443/
@@ -286,56 +258,6 @@ func GetLogs() *C.char {
 	return C.CString(logs)
 }
 
-// 清理过期缓存
-func cleanupCache() {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-
-	now := time.Now()
-	for k, v := range cache {
-		if now.Sub(v.timestamp) > cacheTTL {
-			delete(cache, k)
-		}
-	}
-}
-
-// 从缓存获取
-func getFromCache(key string) *cacheEntry {
-	cacheMu.RLock()
-	defer cacheMu.RUnlock()
-	return cache[key]
-}
-
-// 存入缓存
-func putToCache(key string, entry *cacheEntry) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-
-	// 检查总大小
-	totalSize := 0
-	for _, v := range cache {
-		totalSize += len(v.body)
-	}
-	if totalSize+len(entry.body) > maxCacheSize {
-		return // 超出缓存限制
-	}
-
-	// 检查条目数
-	if len(cache) >= maxCacheItems {
-		return // 超出条目限制
-	}
-
-	cache[key] = entry
-}
-
-// 清理缓存
-func clearCache() {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	cache = make(map[string]*cacheEntry)
-	log.Printf("Cache cleared")
-}
-
 func router(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
@@ -400,7 +322,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 			"version":   version,
 			"buildTime": buildTime,
 			"host":      defaultCdnHost,
-			"apiHost":   apiHost,
 		})
 		return
 	}
@@ -411,7 +332,6 @@ func router(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
 			"cdnHost":     defaultCdnHost,
-			"apiHost":     apiHost,
 			"port":        proxyPort,
 			"echReady":    echReady,
 			"tlsEnabled":  true,
@@ -428,30 +348,14 @@ func router(w http.ResponseWriter, r *http.Request) {
 		statsMu.Lock()
 		reqCount := reqCount
 		bytesSent := bytesSent
-		bytesCached := bytesCached
-		cacheHits := cacheHits
-		cacheMisses := cacheMisses
 		errorCount := errorCount
 		statsMu.Unlock()
-
-		cacheMu.RLock()
-		cacheCount := len(cache)
-		cacheSize := 0
-		for _, v := range cache {
-			cacheSize += len(v.body)
-		}
-		cacheMu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
 			"requestCount":  reqCount,
 			"bytesSent":     bytesSent,
-			"bytesCached":   bytesCached,
-			"cacheHits":     cacheHits,
-			"cacheMisses":   cacheMisses,
-			"cacheCount":    cacheCount,
-			"cacheSize":     cacheSize,
 			"errorCount":    errorCount,
 			"activeConns":   atomic.LoadInt32(&activeConns),
 			"maxConns":      maxConns,
@@ -467,18 +371,8 @@ func router(w http.ResponseWriter, r *http.Request) {
 		statsMu.Lock()
 		reqCount := reqCount
 		bytesSent := bytesSent
-		cacheHits := cacheHits
-		cacheMisses := cacheMisses
 		errorCount := errorCount
 		statsMu.Unlock()
-
-		cacheMu.RLock()
-		cacheCount := len(cache)
-		cacheSize := 0
-		for _, v := range cache {
-			cacheSize += len(v.body)
-		}
-		cacheMu.RUnlock()
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		w.WriteHeader(http.StatusOK)
@@ -488,39 +382,12 @@ func router(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP proxy_bytes_sent_total Total bytes sent\n")
 		fmt.Fprintf(w, "# TYPE proxy_bytes_sent_total counter\n")
 		fmt.Fprintf(w, "proxy_bytes_sent_total %d\n", bytesSent)
-		fmt.Fprintf(w, "# HELP proxy_cache_hits_total Cache hits\n")
-		fmt.Fprintf(w, "# TYPE proxy_cache_hits_total counter\n")
-		fmt.Fprintf(w, "proxy_cache_hits_total %d\n", cacheHits)
-		fmt.Fprintf(w, "# HELP proxy_cache_misses_total Cache misses\n")
-		fmt.Fprintf(w, "# TYPE proxy_cache_misses_total counter\n")
-		fmt.Fprintf(w, "proxy_cache_misses_total %d\n", cacheMisses)
-		fmt.Fprintf(w, "# HELP proxy_cache_entries Cache entries count\n")
-		fmt.Fprintf(w, "# TYPE proxy_cache_entries gauge\n")
-		fmt.Fprintf(w, "proxy_cache_entries %d\n", cacheCount)
-		fmt.Fprintf(w, "# HELP proxy_cache_size_bytes Cache size in bytes\n")
-		fmt.Fprintf(w, "# TYPE proxy_cache_size_bytes gauge\n")
-		fmt.Fprintf(w, "proxy_cache_size_bytes %d\n", cacheSize)
 		fmt.Fprintf(w, "# HELP proxy_errors_total Total errors\n")
 		fmt.Fprintf(w, "# TYPE proxy_errors_total counter\n")
 		fmt.Fprintf(w, "proxy_errors_total %d\n", errorCount)
 		fmt.Fprintf(w, "# HELP proxy_active_connections Active connections\n")
 		fmt.Fprintf(w, "# TYPE proxy_active_connections gauge\n")
 		fmt.Fprintf(w, "proxy_active_connections %d\n", atomic.LoadInt32(&activeConns))
-		return
-	}
-
-	// 缓存清理：POST /cache/clear
-	if path == "/cache/clear" && r.Method == http.MethodPost {
-		clearCache()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
-		return
-	}
-
-	// API 路由：/api/users/xxx
-	if strings.HasPrefix(path, "/api/") {
-		apiProxyHandler(w, r, apiHost, strings.TrimPrefix(path, "/api"))
 		return
 	}
 
@@ -541,30 +408,6 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		targetURL += "?" + r.URL.RawQuery
 	}
 	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
-
-	// 检查缓存
-	cacheKey := targetURL
-	if entry := getFromCache(cacheKey); entry != nil {
-		statsMu.Lock()
-		cacheHits++
-		bytesCached += int64(len(entry.body))
-		statsMu.Unlock()
-
-		log.Printf("  Cache HIT")
-		for k, vs := range entry.headers {
-			for _, v := range vs {
-				w.Header().Add(k, v)
-			}
-		}
-		w.Header().Set("X-Cache", "HIT")
-		w.WriteHeader(entry.statusCode)
-		w.Write(entry.body)
-		return
-	}
-
-	statsMu.Lock()
-	cacheMisses++
-	statsMu.Unlock()
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
 	if err != nil {
@@ -642,17 +485,6 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		return
 	}
 
-	// 存入缓存（只缓存 200 OK 且小于 5MB 的响应）
-	if resp.StatusCode == http.StatusOK && len(body) < 5*1024*1024 {
-		putToCache(cacheKey, &cacheEntry{
-			statusCode: resp.StatusCode,
-			headers:    resp.Header.Clone(),
-			body:       body,
-			timestamp:  time.Now(),
-		})
-		log.Printf("  Cache MISS (cached)")
-	}
-
 	// 转发响应头（跳过 hop-by-hop 头）
 	hopByHop := map[string]bool{
 		"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
@@ -669,8 +501,7 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 
 	// 设置 CORS 头
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range, ETag, Last-Modified, Cache-Control, X-Cache")
-	w.Header().Set("X-Cache", "MISS")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range, ETag, Last-Modified, Cache-Control")
 
 	w.WriteHeader(resp.StatusCode)
 
@@ -686,62 +517,6 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	statsMu.Unlock()
 	if len(body) > 0 {
 		log.Printf("  Bytes: %d", len(body))
-	}
-}
-
-func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
-	// 构建目标 URL（避免双斜杠）
-	targetURL := "https://" + targetHost + strings.TrimPrefix(path, "/")
-	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
-	}
-	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
-
-	req, err := http.NewRequest(r.Method, targetURL, nil)
-	if err != nil {
-		log.Printf("Error: %v", err)
-		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (TwitterPic)")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("API error: %v", err)
-		http.Error(w, "API fetch failed: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	log.Printf("  Status: %d", resp.StatusCode)
-
-	// 转发响应头
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-
-	w.WriteHeader(resp.StatusCode)
-
-	// 流式传输响应体
-	buf := make([]byte, 64*1024)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				log.Printf("Write error: %v", werr)
-				return
-			}
-		}
-		if err != nil {
-			if err.Error() == "EOF" {
-				return
-			}
-			log.Printf("Read error: %v", err)
-			return
-		}
 	}
 }
 
