@@ -63,13 +63,10 @@ var (
 	maxConns    int32 = 100
 	errorCount  int64
 
-	// 超时配置
-	readTimeout  = 10 * time.Second
-	writeTimeout = 120 * time.Second
-	idleTimeout  = 120 * time.Second
-
-	// 重试配置
-	maxRetries = 2
+	// 超时配置（注意：不设 WriteTimeout，
+	// 否则慢速大文件/视频下载会被砍断——与原版 ech-proxy 一致）
+	readTimeout = 10 * time.Second
+	idleTimeout = 120 * time.Second
 )
 
 // 自定义日志 writer
@@ -179,7 +176,6 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	proxyServer = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: readTimeout,
-		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
 	}
 
@@ -440,27 +436,14 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 	}
 
-	// 重试机制
-	var resp *http.Response
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			log.Printf("  Retry %d/%d", attempt, maxRetries)
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-		}
-
-		resp, lastErr = cloudflare_ech.Do(req)
-		if resp != nil {
-			break
-		}
-	}
-
-	if resp == nil {
+	// 执行 ECH 请求（与原版 ech-proxy 一致：单次调用，不重试）
+	resp, err := cloudflare_ech.Do(req)
+	if err != nil {
 		statsMu.Lock()
 		errorCount++
 		statsMu.Unlock()
-		log.Printf("ECH error: %v", lastErr)
-		http.Error(w, "ECH fetch failed: "+lastErr.Error(), http.StatusBadGateway)
+		log.Printf("ECH error: %v", err)
+		http.Error(w, "ECH fetch failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
