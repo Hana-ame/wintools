@@ -36,8 +36,14 @@ import (
 //go:embed web/index.html
 var indexHTML string
 
-// Twitter CDN 域名
+// Twitter CDN 域名（fallback，当 upstream.json 未匹配时）
 const defaultCdnHost = "video-cf.twimg.com"
+
+// 上游配置（从 upstream.json 加载）
+var (
+	upstreamCfg  echproxy.UpstreamMap
+	blockedHosts []string
+)
 
 // 版本信息（构建时注入）
 var version = "2.5.1"
@@ -156,6 +162,11 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		log.Printf("Certificate loaded (*.l.moonchan.xyz)")
 	}
 
+	// 保存上游配置供 router 使用
+	upstreamCfg = cfg.Upstreams
+	blockedHosts = cfg.BlockedHosts
+	log.Printf("Upstream config loaded: %d entries, %d blocked", len(upstreamCfg), len(blockedHosts))
+
 	// 4. 监听端口（优先 8443，失败则随机）
 	ln, err := net.Listen("tcp4", "127.0.0.1:8443")
 	if err != nil {
@@ -255,17 +266,13 @@ func GetLogs() *C.char {
 
 func router(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-
-	// 统计
-	statsMu.Lock()
-	reqCount++
-	statsMu.Unlock()
+	host := r.Host
 
 	// CORS 支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range, If-Range, If-Modified-Since, If-None-Match")
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Type, Cache-Control, ETag, Last-Modified")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range, If-Range, If-Modified-Since, If-None-Match, Cookie")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Type, Cache-Control, ETag, Last-Modified, Set-Cookie")
 	w.Header().Set("Access-Control-Max-Age", "86400")
 
 	if r.Method == http.MethodOptions {
@@ -273,29 +280,16 @@ func router(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if path == "/" || path == "" {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, indexHTML)
-		return
-	}
-
 	// 健康检查：/healthz
 	if path == "/healthz" {
-		statsMu.Lock()
-		reqCount := reqCount
-		bytesSent := bytesSent
-		statsMu.Unlock()
-
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":       "ok",
-			"ech":          echReady,
-			"port":         proxyPort,
-			"version":      version,
-			"requestCount": reqCount,
-			"bytesSent":    bytesSent,
+			"status":    "ok",
+			"ech":       echReady,
+			"port":      proxyPort,
+			"version":   version,
+			"upstreams": len(upstreamCfg),
 		})
 		return
 	}
@@ -307,88 +301,70 @@ func router(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{
 			"version":   version,
 			"buildTime": buildTime,
-			"host":      defaultCdnHost,
 		})
 		return
 	}
 
-	// 配置信息：/config
-	if path == "/config" {
-		w.Header().Set("Content-Type", "application/json")
+	// 根路径返回网页
+	if path == "/" || path == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]any{
-			"cdnHost":      defaultCdnHost,
-			"port":         proxyPort,
-			"echReady":     echReady,
-			"tlsEnabled":   true,
-			"maxLogLines":  maxLogLines,
-			"readTimeout":  readTimeout.String(),
-			"writeTimeout": writeTimeout.String(),
-			"idleTimeout":  idleTimeout.String(),
-		})
+		fmt.Fprint(w, indexHTML)
 		return
 	}
 
-	// 统计信息：/stats
-	if path == "/stats" {
-		statsMu.Lock()
-		reqCount := reqCount
-		bytesSent := bytesSent
-		errorCount := errorCount
-		statsMu.Unlock()
+	// 根据 Host 匹配上游配置
+	var uc echproxy.UpstreamConfig
+	var matched bool
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]any{
-			"requestCount": reqCount,
-			"bytesSent":    bytesSent,
-			"errorCount":   errorCount,
-			"uptime":       time.Since(startTime).String(),
-			"echReady":     echReady,
-			"port":         proxyPort,
-		})
+	// 1. 精确匹配
+	if cfg, ok := upstreamCfg[host]; ok {
+		uc = cfg
+		matched = true
+	}
+
+	// 2. 通配符匹配（如 iwara-xxx.l.moonchan.xyz → xxx.iwara.tv）
+	if !matched {
+		var wc echproxy.UpstreamConfig
+		wc, matched = echproxy.MatchWildcardForTest(upstreamCfg, host)
+		if matched {
+			uc = wc
+		}
+	}
+
+	// 3. 未匹配 → 404
+	if !matched {
+		http.NotFound(w, r)
 		return
 	}
 
-	// Prometheus 指标：/metrics
-	if path == "/metrics" {
-		statsMu.Lock()
-		reqCount := reqCount
-		bytesSent := bytesSent
-		errorCount := errorCount
-		statsMu.Unlock()
-
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "# HELP proxy_requests_total Total requests\n")
-		fmt.Fprintf(w, "# TYPE proxy_requests_total counter\n")
-		fmt.Fprintf(w, "proxy_requests_total %d\n", reqCount)
-		fmt.Fprintf(w, "# HELP proxy_bytes_sent_total Total bytes sent\n")
-		fmt.Fprintf(w, "# TYPE proxy_bytes_sent_total counter\n")
-		fmt.Fprintf(w, "proxy_bytes_sent_total %d\n", bytesSent)
-		fmt.Fprintf(w, "# HELP proxy_errors_total Total errors\n")
-		fmt.Fprintf(w, "# TYPE proxy_errors_total counter\n")
-		fmt.Fprintf(w, "proxy_errors_total %d\n", errorCount)
-		return
+	// 检查 blocked hosts
+	for _, bh := range blockedHosts {
+		if host == bh || strings.HasSuffix(host, "."+bh) {
+			http.Error(w, "blocked", http.StatusForbidden)
+			return
+		}
 	}
 
-	// 默认路由：转发到 video-cf.twimg.com
-	echProxyHandler(w, r, defaultCdnHost, path)
+	// 转发到上游
+	echProxyHandler(w, r, uc)
 }
 
-func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
+func echProxyHandler(w http.ResponseWriter, r *http.Request, uc echproxy.UpstreamConfig) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	targetHost := uc.Host
+	path := r.URL.Path
+
 	// 构建目标 URL
 	targetURL := "https://" + targetHost + path
-	// 保留查询参数
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
 	}
-	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
+	log.Printf("→ %s (host=%s from %s)", targetURL, r.Host, r.RemoteAddr)
 
 	req, err := http.NewRequest(r.Method, targetURL, nil)
 	if err != nil {
@@ -401,28 +377,38 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	}
 
 	// 设置请求头
-	req.Header.Set("Referer", "https://x.com")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (TwitterPic)")
+	if uc.Referer != "" {
+		req.Header.Set("Referer", uc.Referer)
+	} else {
+		req.Header.Set("Referer", "https://"+targetHost+"/")
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	// 注入固定 Cookie（如 exhentai）
+	if uc.Cookie != "" {
+		req.Header.Set("Cookie", uc.Cookie)
+	}
+
+	// 转发客户端 Cookie（如果没有固定 Cookie）
+	if uc.Cookie == "" {
+		if cookie := r.Header.Get("Cookie"); cookie != "" {
+			req.Header.Set("Cookie", cookie)
+		}
+	}
 
 	// 转发 Range 请求（视频播放支持）
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
-		log.Printf("  Range: %s", rangeHeader)
 	}
 
-	// 转发 If-Range（缓存验证）
-	if ifRange := r.Header.Get("If-Range"); ifRange != "" {
-		req.Header.Set("If-Range", ifRange)
-	}
-
-	// 转发缓存头（If-Modified-Since, If-None-Match）
+	// 转发缓存验证头
 	for _, h := range []string{"If-Modified-Since", "If-None-Match", "Cache-Control"} {
 		if v := r.Header.Get(h); v != "" {
 			req.Header.Set(h, v)
 		}
 	}
 
-	// 执行 ECH 请求（与原版 ech-proxy 一致：单次调用，不重试）
+	// 执行 ECH 请求
 	resp, err := cloudflare_ech.Do(req)
 	if err != nil {
 		statsMu.Lock()
@@ -457,18 +443,16 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 	}
 
-	// 设置 CORS 头
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range, ETag, Last-Modified, Cache-Control")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Range, ETag, Last-Modified, Cache-Control, Set-Cookie")
 
 	w.WriteHeader(resp.StatusCode)
 
-	// HEAD 请求：只返回响应头，不读取 body
+	// HEAD 请求：只返回响应头
 	if r.Method == http.MethodHead {
 		return
 	}
 
-	// 流式转发（与原版 ech-proxy 一致）：边读边写并 flush，
-	// 避免缓冲导致的首字节延迟，视频拖动播放更流畅。
+	// 流式转发（与原版 ech-proxy 一致）：边读边写并 flush
 	buf := make([]byte, 32*1024)
 	var n int64
 	for {
