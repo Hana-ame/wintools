@@ -65,12 +65,18 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: 11076708
-          # 逗号分隔，不能给含分号的包名加引号——setup-android 会把引号
-          # 当成包名的一部分，报 Failed to find package '"platforms;android-34"'
-          # （2026-10-04 实测）。
-          packages: platform-tools,platforms;android-34,build-tools;34.0.0
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: true
+
+      # 不用 setup-android 的 packages 参数：它把整串当作单个包名传给
+      # sdkmanager（实测报 Failed to find package
+      # 'platform-tools,platforms;android-34,build-tools;34.0.0'，2026-10-04）。
+      # 改为显式逐包安装，行为可控。
+      - name: Install Android packages
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Download Gradle 8.5
         run: |
