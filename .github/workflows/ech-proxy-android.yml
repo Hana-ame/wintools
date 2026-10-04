@@ -54,6 +54,13 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # 默认的 cmdline-tools/16.0 是预览版，其 'tools' 包已下线，
+          # sdkmanager 会报 "Warning: Failed to find package 'tools'" 并以
+          # exit code 1 中止（2026-10-04 实测连续两次）。钉到稳定版。
+          cmdline-tools-version: 11076708
+          packages: 'platform-tools "platforms;android-34" "build-tools;34.0.0"'
+          accept-android-sdk-licenses: true
 
       - name: Download Gradle 8.5
         run: |
