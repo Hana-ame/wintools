@@ -26,7 +26,7 @@
 | 维度 | peerfs 现状 | 证据 |
 |---|---|---|
 | WebRTC 栈 | `pion/webrtc/v4`，自写 PeerJS 信令客户端 | `pkg/peerjs/peer.go:1` |
-| 信令 | 公共云 `0.peerjs.com` 或自托管 peerserver（`replace` 到 `./peerfs-chat/local/signalserver`） | `go.mod:69` |
+| 信令 | 公共云 `0.peerjs.com` 或自托管 peerserver（`require github.com/Hana-ame/go-peerserver v0.2.0`，无 replace；本仓副本已于 2026-10-04 删除） | `go.mod:6` |
 | 分片 | **64KB 裸二进制块，无逐块头** | `pkg/peerfs/node.go:40` |
 | 流控 | `BufferedAmount > 64KB` 轮询退避（200µs→5ms 倍增） | `pkg/peerjs/connection.go:88,409-425` |
 | 并发 | 1 条 PeerConnection + **64 条 DataChannel（DCEP RFC 8832）**，每通道 lock-step 单请求 | `pkg/peerfs/web/bridge.js:161-221` |
@@ -142,10 +142,14 @@ export enum MessageType {
 
 `heartbeat/index.ts` 只做一件事：`client.setLastPing(Date.now())`。
 
-### 4.2 wintools `peerfs-chat/local/signalserver` vs 官方
+### 4.2 信令服务器（`github.com/Hana-ame/go-peerserver`）vs 官方
 
-**wintools 版已经超越官方**：
-| 能力 | 官方 v2 | wintools 本地版 |
+> 历史记录：此处原为 wintools 本地副本 vs 官方的对比。该副本已于 2026-10-04
+> 删除，能力全部并入上游独立仓 `go-peerserver` v0.2.0，故下表的「wintools 本地版」
+> 已成为过去式，现指该独立仓自身。
+
+**信令服务器已经超越官方**：
+| 能力 | 官方 v2 | go-peerserver（单一真相源） |
 |---|---|---|
 | 离线队列上限 | ❌ **无界** | ✅ `maxQueuedPerDst = 100`（`signalserver.go:71`，超了丢最旧 `:247-248`） |
 | 队列条目过期 | ❌ | ✅ 30s TTL（`:135`）+ `sweepQueues()` 周期清扫（`:74-100`，注释明确 "H3 修复"） |

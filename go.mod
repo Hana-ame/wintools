@@ -3,7 +3,7 @@ module github.com/Hana-ame/wintools
 go 1.26.7
 
 require (
-	github.com/Hana-ame/go-peerserver v0.1.0
+	github.com/Hana-ame/go-peerserver v0.2.0
 	github.com/andybalholm/brotli v1.2.2
 	github.com/coder/websocket v1.8.15
 	github.com/gin-gonic/gin v1.12.0
@@ -63,7 +63,11 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 )
 
-// peerfs-chat 原本用本地 ./local/signalserver 替换 go-peerserver(本地版比发布版
-// v0.1.0 多 peerColls/peerStats,即节点 uptime/上下行统计)。合并进根模块后 replace
-// 改为模块级,同时惠及 pkg/peerfs.MountSignaling(media-node 的 /discover/nodes)。
-replace github.com/Hana-ame/go-peerserver => ./peerfs-chat/local/signalserver
+// 信令服务器只有一份代码：独立仓 github.com/Hana-ame/go-peerserver
+// （peerdrive 主仓 back/signalserver 的镜像，唯一发版处）。
+// 本仓原有的 peerfs-chat/local/signalserver 副本已删除。
+//
+// 必须 >= v0.2.0：v0.1.0 只有 4 个 handler，缺 HandleLeave /
+// HandleStatus / HandleDashboard，而 cmd/peerfs-server 与
+// pkg/peerfs.MountSignaling 直接依赖这三者（挂 /discover/leave、
+// /status 与 dashboard）。无 replace 指向本地副本，换机器同样可用。

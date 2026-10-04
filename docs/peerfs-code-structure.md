@@ -174,7 +174,7 @@ wintools/                          单 Go 模块（go.mod，peerfs-chat 已并�
 | **Go peer**（传输） | `pkg/peerjs/connection.go` | 500 |
 | **Go peer**（文件服务） | `pkg/peerfs/node.go` | 492 |
 | **Go peer**（信令挂载） | `pkg/peerfs/signaling.go` | 40 |
-| **信令服务器** | `peerfs-chat/local/signalserver/signalserver.go` | 485 |
+| **信令服务器** | 外部模块 `github.com/Hana-ame/go-peerserver`（v0.2.0，799 行；本仓副本已于 2026-10-04 删除） | — |
 | **Go 入口** | `cmd/peerfs-node/main.go` | 124 |
 | **Go 客户端** | `已删除` | 498 |
 | **standalone 信令入口** | `cmd/peerfs-server/main.go` | 48 |
