@@ -52,15 +52,22 @@ jobs:
           mkdir -p cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
           cp cmd/ech-proxy-android/libechproxy.so cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
 
+      - name: Accept Android SDK licenses
+        run: |
+          # setup-android 的 accept-android-sdk-licenses 作用于它自己安装的
+          # cmdline-tools；runner 预置 SDK 的许可需在此先接受，否则 sdkmanager
+          # --licenses 停在 "Review licenses that have not been accepted (y/N)?"
+          # 等输入，非交互环境下 exit 1（2026-10-04 实测三次同一位置失败）。
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # 默认的 cmdline-tools/16.0 是预览版，其 'tools' 包已下线，
-          # sdkmanager 会报 "Warning: Failed to find package 'tools'" 并以
-          # exit code 1 中止（2026-10-04 实测连续两次）。钉到稳定版。
           cmdline-tools-version: 11076708
           packages: 'platform-tools "platforms;android-34" "build-tools;34.0.0"'
           accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: true
 
       - name: Download Gradle 8.5
         run: |
