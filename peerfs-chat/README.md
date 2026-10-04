@@ -224,13 +224,13 @@ ws://host:port/peerjs?key=peerjs&id=<myId>&token=<random>&version=1.5.4
 ### 运行
 
 ```bash
-cd /mnt/d/Workplace/wintools/peerfs-chat
+cd /mnt/d/Workplace/wintools   # 根模块:peerfs-chat 已并入(不再有独立 go.mod)
 
 # 终端 1：信令服务器
-GOCACHE=/tmp/gocache go run ./server -addr 0.0.0.0:8000 -web ./web
+GOCACHE=/tmp/gocache go run ./cmd/peerfs-server -addr 0.0.0.0:8000 -web pkg/peerfs/web
 
 # 终端 2：Go 客户端（文件服务）
-GOCACHE=/tmp/gocache go run ./goclient \
+GOCACHE=/tmp/gocache go run ./cmd/peerfs-node \
   -dir ~/Downloads \
   -id go-peer \
   -server ws://127.0.0.1:8000/peerjs

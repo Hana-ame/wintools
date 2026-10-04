@@ -110,6 +110,9 @@ func (n *Node) serveConsoleAssets(w http.ResponseWriter, r *http.Request) {
 			"root":      n.cfg.Root,
 			"signaling": n.signalingJSON(),
 		}
+		if n.cfg.Token != "" {
+			resp["token"] = n.cfg.Token
+		}
 		if n.cfg.ConfigURL != "" {
 			resp["configUrl"] = n.cfg.ConfigURL
 		}

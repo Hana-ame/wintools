@@ -1,5 +1,7 @@
 github.com/Hana-ame/go-peerserver v0.1.0 h1:kwuis96mM8xXfxSybu2w7Bz2ADb0+QvlfRae2rIBGHU=
 github.com/Hana-ame/go-peerserver v0.1.0/go.mod h1:m3Zc3VjJy6HzlmeW4DEjsDqptpN6ruRQPg6+CsiSv6Y=
+github.com/Hana-ame/go-peerserver v0.2.0 h1:sQCyaELpjLl3hrh1EBVd9PnGVIZjZbORXpE7r4J4S80=
+github.com/Hana-ame/go-peerserver v0.2.0/go.mod h1:m3Zc3VjJy6HzlmeW4DEjsDqptpN6ruRQPg6+CsiSv6Y=
 github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtnceM=
 github.com/andybalholm/brotli v1.2.2/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/bytedance/gopkg v0.1.3 h1:TPBSwH8RsouGCBcMBktLt1AymVo2TVsBVCY4b6TnZ/M=

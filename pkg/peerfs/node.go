@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -43,16 +44,16 @@ const (
 
 // Header 是文本帧上承载的 JSON 控制头。
 type Header struct {
-	Type    string  `json:"type"`              // hello|list|read|entries|meta|done|err
-	Token   string  `json:"token,omitempty"`   // hello
-	Path    string  `json:"path,omitempty"`    // list/read
-	Offset  int64   `json:"offset,omitempty"`  // read
-	Size    int64   `json:"size,omitempty"`    // read；-1 = 读到文件尾
-	Total    int64   `json:"total,omitempty"`   // meta
-	FileSize int64   `json:"fileSize,omitempty"`// meta: 完整文件大小
-	ReqID    string  `json:"reqId,omitempty"`   // 除 hello 外必带
-	Msg      string  `json:"msg,omitempty"`     // err
-	Entries  []Entry `json:"entries,omitempty"` // entries
+	Type     string  `json:"type"`               // hello|list|read|entries|meta|done|err
+	Token    string  `json:"token,omitempty"`    // hello
+	Path     string  `json:"path,omitempty"`     // list/read
+	Offset   int64   `json:"offset,omitempty"`   // read
+	Size     int64   `json:"size,omitempty"`     // read；-1 = 读到文件尾
+	Total    int64   `json:"total,omitempty"`    // meta
+	FileSize int64   `json:"fileSize,omitempty"` // meta: 完整文件大小
+	ReqID    string  `json:"reqId,omitempty"`    // 除 hello 外必带
+	Msg      string  `json:"msg,omitempty"`      // err
+	Entries  []Entry `json:"entries,omitempty"`  // entries
 }
 
 // UnmarshalJSON 为 Header 提供默认值：未传 size 时默认 -1（读到文件尾）。
@@ -88,7 +89,9 @@ type Config struct {
 	Token     string    // hello 校验；空 = 不校验（信令白名单足够时可不设）
 	Signaling Signaling // 连哪个信令服务器
 	Debug     bool
-	ConfigURL string    // 中心配置与分发 URL（可拉取配置、集中注册、分发全网节点）
+	ConfigURL string // 中心配置与分发 URL（可拉取配置、集中注册、分发全网节点）
+	// MaxConns 最大并发连接数；0 = 默认 100。超限直接关连接，防 DDoS。
+	MaxConns int
 	// ICEHook 可选：透传给 pkg/peerjs（测试注入 loopback、部署换 TURN）。
 	ICEHook func(*webrtc.Configuration, *webrtc.SettingEngine)
 }
@@ -102,6 +105,9 @@ type Node struct {
 	hubNodesMu sync.RWMutex
 	hubNodes   []map[string]any
 
+	connMu    sync.Mutex
+	connCount int
+
 	startOnce sync.Once
 	startErr  error
 }
@@ -110,7 +116,35 @@ func New(cfg Config) *Node {
 	if cfg.Root == "" {
 		cfg.Root = "."
 	}
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = 100
+	}
 	return &Node{cfg: cfg, root: http.Dir(cfg.Root)}
+}
+
+// isPathSafe 检查请求路径是否在 Root 内（防路径穿越 + symlink 逃逸）。
+// 在 http.Dir 之上加一层显式检查，defense in depth。
+func (n *Node) isPathSafe(requestedPath string) bool {
+	// 1. 清理路径，统一为正斜杠
+	cleaned := path.Clean("/" + requestedPath)
+	if cleaned == "/" {
+		cleaned = "."
+	}
+	// 2. 禁止 ..
+	if strings.Contains(cleaned, "..") {
+		return false
+	}
+	// 3. 拼出完整路径，检查是否以 Root 为前缀
+	fullPath := filepath.Join(n.cfg.Root, filepath.FromSlash(cleaned))
+	rootAbs, err := filepath.Abs(n.cfg.Root)
+	if err != nil {
+		return false
+	}
+	fullAbs, err := filepath.Abs(fullPath)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(fullAbs, rootAbs)
 }
 
 // ID 返回信令注册成功后的 peer id。
@@ -317,8 +351,20 @@ type frameWriter interface {
 
 func (n *Node) onConn(dc *peerjs.DataConnection) {
 	remote := dc.Remote()
+
+	// 连接数限制：超限直接关（防 DDoS / 资源耗尽）
+	n.connMu.Lock()
+	n.connCount++
+	exceeded := n.connCount > n.cfg.MaxConns
+	n.connMu.Unlock()
+	if exceeded {
+		log.Printf("[peerfs] %s rejected: max connections reached (%d)", remote, n.cfg.MaxConns)
+		dc.Close()
+		return
+	}
+
 	st := &connState{n: n, remote: remote}
-	log.Printf("[peerfs] incoming connection from %s", remote)
+	log.Printf("[peerfs] incoming connection from %s (active=%d/%d)", remote, n.connCount, n.cfg.MaxConns)
 
 	// hello 门禁：超时未通过认证直接关连接（防任意网页猜到 ID 就能读文件）。
 	t := time.AfterFunc(helloTimeout, func() {
@@ -329,7 +375,10 @@ func (n *Node) onConn(dc *peerjs.DataConnection) {
 	})
 	dc.OnClose(func() {
 		t.Stop()
-		log.Printf("[peerfs] connection closed: %s", remote)
+		n.connMu.Lock()
+		n.connCount--
+		n.connMu.Unlock()
+		log.Printf("[peerfs] connection closed: %s (active=%d)", remote, n.connCount)
 	})
 	dc.OnMessageKind(func(m peerjs.Message) { st.onMessage(dc, m) })
 }
@@ -375,6 +424,11 @@ func (st *connState) onMessage(dc frameWriter, m peerjs.Message) {
 
 func (st *connState) handleList(dc frameWriter, h Header) {
 	name := path.Clean("/" + h.Path)
+	// 路径沙箱：defense in depth（http.Dir 之上加显式检查）
+	if !st.n.isPathSafe(h.Path) {
+		st.replyErr(dc, h.ReqID, "path escape denied: "+h.Path)
+		return
+	}
 	f, err := st.n.root.Open(name)
 	if err != nil {
 		st.replyErr(dc, h.ReqID, err.Error())
@@ -413,6 +467,11 @@ func (st *connState) handleList(dc frameWriter, h Header) {
 
 func (st *connState) handleRead(dc frameWriter, h Header) {
 	name := path.Clean("/" + h.Path)
+	// 路径沙箱：defense in depth（http.Dir 之上加显式检查）
+	if !st.n.isPathSafe(h.Path) {
+		st.replyErr(dc, h.ReqID, "path escape denied: "+h.Path)
+		return
+	}
 	f, err := st.n.root.Open(name)
 	if err != nil {
 		st.replyErr(dc, h.ReqID, err.Error())

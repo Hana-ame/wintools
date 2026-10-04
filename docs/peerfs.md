@@ -1,7 +1,7 @@
 # peerfs — 纯 WebRTC DataChannel 虚拟文件系统与流媒体系统
 
 **版本**: `v2.4.12`  
-**核心构成**: `pkg/peerfs` + `pkg/peerjs` 扩展 + `cmd/media-node` + `web/` 内嵌控制台
+**核心构成**: `pkg/peerfs` + `pkg/peerjs` 扩展 + `cmd/peerfs-node` + `web/` 内嵌控制台
 
 ---
 
@@ -44,7 +44,7 @@
                             │                               │
                             ▼                               ▼
         ┌───────────────────────────────────────────────────────────────┐
-        │                       Go 节点 (media-node)                    │
+        │                       Go 节点 (peerfs-node)                    │
         │                                                               │
         │   1. 同端口 UDP Mux (出站主动打 STUN Ping 报文穿透防火墙)       │
         │   2. 纯内存储存 / 本地目录挂载 (/tmp/demo-media)              │
@@ -162,7 +162,7 @@
 ### 独立服务端运行
 ```bash
 # 启动媒体节点服务（默认开启内嵌信令与控制台）
-go run ./cmd/media-node -dir /tmp/demo-media -listen 0.0.0.0:8080 -name demo
+go run ./cmd/peerfs-node -dir /tmp/demo-media -listen 0.0.0.0:8080 -name demo
 
 # 恢复演示测试媒体（包含 Faststart MP4 视频、高分辨率测试大图、SVG、JSON）
 bash scripts/restore_demo_media.sh

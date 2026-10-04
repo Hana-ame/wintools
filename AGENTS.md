@@ -17,9 +17,11 @@
   - `cmd/capture-proxy`:zen 家族三重整合单入口(旧 zen-proxy + local-proxy-detected + local-proxy + scripts/capture_proxy.go 合体),只保留 provider 角色(multi 角色已删)。CLI 独立可跑:`--listen` `--mode auto|v4|v6` `--out 抓包目录` `--detect` `--cert/--key` `--ban`;抓包 / /mode 切换 / /status / /stats API / ?stack= / gzip 请求体 / 3 次递进冷却全部保留。从 v1.9.0 tag 恢复,逻辑与 v2.0.0 zen_provider.go 一致(后者只是库化,无新改进)。
   - `cmd/ech-proxy`:zen.l.moonchan.xyz 入口与 zen_provider.go 已删,只做站点反代。ip-proxy 不受影响。
 - **v2.0.0 已完成: zen 家族并入 ech-proxy + ip-proxy**(v2.2.2 回滚,见上)。旧 `cmd/zen-proxy`、`cmd/local-proxy-detected`、`cmd/zen-multi`、`scripts/capture_proxy.go` 已删,内容仍在 v1.9.0 tag 存档(cmd/capture-proxy)。
+- **peerfs 已抽象为 2 binary + 1 web 入口(记住!)**:`cmd/peerfs-server`(standalone 信令服务器)、`cmd/peerfs-node`(peer 节点,`-signal` 标志控制是否内嵌信令)。Web 入口在 `pkg/peerfs/web/`(bridge.js + index.html + sw.js + peerjs.min.js),由 `pkg/peerfs/console.go` 的 `embed.FS` serve。旧入口 `peerfs-chat/server`、`peerfs-chat/goclient`、`peerfs-chat/web`、`cmd/media-node` 已删。信令服务器只有一份代码,在独立仓 `github.com/Hana-ame/go-peerserver`(peerdrive 主仓 `back/signalserver` 的镜像),根 `go.mod` 直接 `require v0.2.0`。**本仓原有的 `peerfs-chat/local/signalserver/` 副本已于 2026-10-04 删除**:两份同源代码已漂移(各自加了 `peerColls`/`peerStats`/dashboard),故改为单一真相源。**必须 >= v0.2.0**:v0.1.0 只 4 个 handler,缺 `HandleLeave`/`HandleStatus`/`HandleDashboard`,而 `/discover/leave`、`/status` 与 dashboard 直接依赖这三者。信令代码改动一律去 `Hana-ame/go-peerserver` 仓提,不要在本仓重新落地一份。
 
 ## 项目结构
 - `cmd/*` 为多个独立可执行程序(ech-proxy / capture-proxy / ip-proxy / kv-store / localdns / webrtc-proxy / opencode-proxy 等),CI 全部 build。
+- `peerfs-chat/` — 仅保留 `local/signalserver/`(信令服务器实现,被 `cmd/peerfs-server` 和 `cmd/peerfs-node` 共用)。旧 `server`/`goclient`/`web` 已删,见关键约定。
 - `pkg/proxyheaders` — 请求/响应头透传工具。
 - `pkg/netdial` — **Termux/Android 环境网络坑的公共修复**(重要):
   - Termux 无 `/etc/resolv.conf`,Go 纯解析器默认走 `[::1]:53` 会失败(`connection refused`),必须固定公共 DNS(8.8.8.8/1.1.1.1/223.5.5.5/114.114.114.114)。

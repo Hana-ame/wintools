@@ -102,6 +102,7 @@ type DataConnection struct {
 
 	mu        sync.Mutex
 	open      bool
+	openCh    chan struct{} // DataChannel 建立完成时关闭一次
 	msgs      chan []byte
 	closeCh   chan struct{}
 	onMsg     func([]byte)
@@ -158,6 +159,7 @@ func (dc *DataConnection) onOffer() {
 		return
 	}
 	dc.pc = pc
+	dc.wireICEWatchdog()
 
 	var firstChannel atomic.Bool
 	firstChannel.Store(true)
@@ -182,6 +184,7 @@ func (dc *DataConnection) onOffer() {
 			isChild:       true,
 			msgs:          make(chan []byte, 64),
 			closeCh:       make(chan struct{}),
+			openCh:        make(chan struct{}),
 		}
 		subDC.wireDataChannel()
 
@@ -214,9 +217,20 @@ func (dc *DataConnection) onOffer() {
 func (dc *DataConnection) wireDataChannel() {
 	dc.rdc.OnOpen(func() {
 		dc.mu.Lock()
+		if dc.open {
+			dc.mu.Unlock()
+			return
+		}
 		dc.open = true
 		cb := dc.onOpen
 		dc.mu.Unlock()
+		// 唤醒 Connect 的握手等待。openCh 每连接只 close 一次：
+		// 上面的 dc.open 守卫 + 这里的 select 双重防 double-close panic。
+		select {
+		case <-dc.openCh:
+		default:
+			close(dc.openCh)
+		}
 		dc.peer.Debugf("datachannel open conn=%s", dc.connectionId)
 		if cb != nil {
 			cb()
@@ -427,10 +441,8 @@ func (dc *DataConnection) SendThrottled(data []byte) error {
 func (dc *DataConnection) Close() {
 	dc.mu.Lock()
 	if !dc.open {
-		if dc.pc != nil {
-			dc.pc.Close()
-		}
 		dc.mu.Unlock()
+		dc.teardown()
 		return
 	}
 	dc.open = false
@@ -440,13 +452,49 @@ func (dc *DataConnection) Close() {
 	if dc.rdc != nil {
 		dc.rdc.Close()
 	}
+	dc.teardown()
+	if cb != nil {
+		cb()
+	}
+}
+
+// teardown 关闭底层 PeerConnection（child 通道共享父 pc，跳过）并从
+// p.conns 摘除自己。两个分支共用 —— 原先 !open 分支只关 pc 就 return，
+// 导致从未完成握手的连接（目标不可达 / LEAVE 到达时还在等 ANSWER）永久
+// 残留在 p.conns，上层也收不到任何 close 通知。
+// 锁顺序：调用方须已释放 dc.mu；本方法不嵌套 dc.mu，只抢 dc.peer.mu。
+func (dc *DataConnection) teardown() {
 	if !dc.isChild && dc.pc != nil {
 		dc.pc.Close()
 	}
 	dc.peer.mu.Lock()
 	delete(dc.peer.conns, dc.connectionId)
 	dc.peer.mu.Unlock()
-	if cb != nil {
-		cb()
+}
+
+// wireICEWatchdog 监听 ICE 连接状态，打洞彻底失败时主动关闭连接。
+//
+// 背景：此前全仓无任何 OnConnectionStateChange 处理（peerfs-chat/goclient
+// 只 log 不动作）。目标不可达（防火墙丢包、对称 NAT 打洞失败、对方进程已
+// 退出）时 dc 永久留在 p.conns、UDP socket 一直占着，Connect() 调用方也
+// 拿不到任何失败信号，只能干等。
+//
+// 只处理确定失败的状态；Disconnected 不处理 —— 弱网抖动会自愈，贸然关会
+// 误杀正在建立或刚建立好的连接，交由上层心跳/读超时兜底。
+// 回调里用 goroutine 关连接：pion 的状态回调在内部 goroutine 上跑，
+// 直接 Close 会与 ICE 状态机重入。
+func (dc *DataConnection) wireICEWatchdog() {
+	pc := dc.pc
+	if pc == nil {
+		return
 	}
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		if s != webrtc.PeerConnectionStateFailed {
+			return
+		}
+		go func() {
+			dc.peer.Debugf("ICE failed remote=%s conn=%s, closing", dc.remote, dc.connectionId)
+			dc.Close()
+		}()
+	})
 }

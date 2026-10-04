@@ -33,21 +33,8 @@ self.addEventListener('fetch', function (event) {
   if (!filePath) return;
 
   event.respondWith((async function () {
-    console.log('[SW-Range] 收到虚拟流媒体请求:', filePath, 'Range:', rangeHeader || '全量');
-    var client = null;
-    if (event.clientId) {
-      client = await self.clients.get(event.clientId);
-    }
-    if (!client) {
-      var all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-      if (all && all.length > 0) client = all[0];
-    }
-    if (!client) {
-      console.warn('[SW-Range] 503: 未找到活跃的 PeerFS 页面客户端');
-      return new Response('No active peerfs page to handle request', { status: 503 });
-    }
-
-    // 解析 Range 请求头
+    // 解析 Range 请求头（必须先于下面的日志：原先声明在日志之后，var 提升使
+    // rangeHeader 恒为 undefined，日志永远打"全量"）。
     var rangeHeader = event.request.headers.get('Range') || '';
     var start = 0;
     var end = -1;
@@ -60,6 +47,20 @@ self.addEventListener('fetch', function (event) {
       } else if (suffixMatch) {
         start = -parseInt(suffixMatch[1], 10) || 0;
       }
+    }
+
+    console.log('[SW-Range] 收到虚拟流媒体请求:', filePath, 'Range:', rangeHeader || '全量');
+    var client = null;
+    if (event.clientId) {
+      client = await self.clients.get(event.clientId);
+    }
+    if (!client) {
+      var all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      if (all && all.length > 0) client = all[0];
+    }
+    if (!client) {
+      console.warn('[SW-Range] 503: 未找到活跃的 PeerFS 页面客户端');
+      return new Response('No active peerfs page to handle request', { status: 503 });
     }
 
     var channel = new MessageChannel();

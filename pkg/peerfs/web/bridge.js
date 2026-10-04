@@ -10,14 +10,17 @@
   'use strict';
 
   var DEFAULTS = {
-    host: '0.peerjs.com',
-    port: 443,
-    secure: true,
-    key: 'peerjs',
-    path: '/',
+    host: 'localhost', // 自建信令服务器地址
+    port: 9000,
+    secure: false,
+    key: 'peerfs-key',
+    path: '/peerjs',
+    signalingUrl: '', // P0: 发现服务地址，例如 http://localhost:9000/discover
     peerId: '',
     token: '',
-    conns: 64, // 默认 64 条并行 WebRTC 数据通道！
+    conns: 64,
+    isServer: false, // P1: 标记该 Web Peer 是否作为文件提供者
+    fileRoot: null,  // P1: 如果是 Server，提供 File 对象映射或索引
   };
 
   function genReqId() {
@@ -136,7 +139,7 @@
 
     this._log('正在连接 PeerJS 信令服务器: ' + this.host + ':' + this.port + (this.secure ? ' (TLS)' : ''), '#7aa2f7');
 
-    this.peer = new Peer(undefined, {
+    this.peer = new Peer(this.peerId, {
       host: this.host,
       port: this.port,
       secure: this.secure,
@@ -152,11 +155,25 @@
     });
 
     return this._wait(this.peer, 'open', 20000, 'signaling open timeout').then(async function () {
-      self._log('信令就绪 (我的ID: ' + self.peer.id + ')，正在向目标节点 ' + self.peerId + ' 发起 WebRTC 连接...', '#7aa2f7');
+      self._log('信令就绪 (我的ID: ' + self.peer.id + ')', '#7aa2f7');
+      
+      // P0: Announce 注册到发现服务
+      if (self.signalingUrl) {
+        self._announceToSignaling();
+      } else if (self.peerId) {
+         // 如果没有指定 signalingUrl 但指定了 peerId，则尝试直连
+         self._log('正在向目标节点 ' + self.peerId + ' 发起 WebRTC 连接...', '#7aa2f7');
+      }
+
       var numConns = Math.max(1, self.conns || 64);
       self.workers = [];
       self.connected = true;
       self._setupServiceWorkerBridge();
+
+      // 监听来自其他 Peer 的连接 (P1: Serve 能力)
+      self.peer.on('connection', function (conn) {
+        self._handleIncomingConnection(conn);
+      });
 
       // 方案 2：底层仅建立 1 个 WebRTC PeerConnection（单次 ICE 打洞 + 单次 DTLS 握手）
       var primary = await self._createPrimaryWorker();
@@ -221,7 +238,70 @@
       }
 
       self._startHeartbeat();
+      
+      // P0: 如果是 Consumer 模式，自动发现并连接骨干节点
+      if (self.signalingUrl && !self.isServer) {
+        setTimeout(function() { self.autoConnectToServers(); }, 1000);
+      }
+      
       return self;
+    });
+  };
+
+  // P0: 向信令服务器广播自己在线
+  PeerFS.prototype._announceToSignaling = function () {
+    var self = this;
+    var url = this.signalingUrl.replace(/\/$/, '') + '/announce';
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        peerId: this.peer.id,
+        token: this.token,
+        isServer: this.isServer,
+        collections: this.fileRoot ? Object.keys(this.fileRoot) : []
+      })
+    }).catch(function(e) { console.warn('Announce failed:', e); });
+    
+    // 每 30 秒续期一次
+    if (this._announceTimer) clearInterval(this._announceTimer);
+    this._announceTimer = setInterval(function() {
+      self._announceToSignaling();
+    }, 30000);
+  };
+
+  // P0: 从信令服务器拉取节点列表
+  PeerFS.prototype.discover = function () {
+    var url = this.signalingUrl.replace(/\/$/, '') + '/nodes';
+    return fetch(url).then(function(r) { return r.json(); });
+  };
+
+  // P0: 自动连接到所有发现的 Server 节点
+  PeerFS.prototype.autoConnectToServers = function () {
+    var self = this;
+    this.discover().then(function(res) {
+      var nodes = res.nodes || [];
+      nodes.forEach(function(node) {
+        // 如果对方是 server 且不是自己，则尝试连接
+        if (node.nodeType === 'go-peer' && node.peerId !== self.peer.id) {
+          self._log('发现骨干节点: ' + node.peerId + ', 正在建立连接...', '#7aa2f7');
+          self._connectToTarget(node.peerId);
+        }
+      });
+    }).catch(function(e) { console.warn('Discover failed:', e); });
+  };
+
+  // 处理传入的连接
+  PeerFS.prototype._handleIncomingConnection = function (conn) {
+    var self = this;
+    conn.on('open', function() {
+      conn.send(JSON.stringify({ type: 'hello', token: self.token || '' }));
+      self._log('收到来自 ' + conn.peer + ' 的入站连接', '#73daca');
+    });
+    conn.on('data', function(d) {
+      // 为入站连接创建一个临时 worker 结构以便复用 _onWorkerData
+      var worker = { id: 'in-' + conn.peer, conn: conn, busy: false, activeStream: null, pending: new Map() };
+      self._onWorkerData(worker, d);
     });
   };
 
@@ -306,6 +386,18 @@
         return;
       }
 
+      // P1: Web Peer Serve 能力 - 处理 list 请求
+      if (h.type === 'list' && this.isServer) {
+        this._handleListRequest(worker, h);
+        return;
+      }
+
+      // P1: Web Peer Serve 能力 - 处理 read 请求
+      if (h.type === 'read' && this.isServer) {
+        this._handleReadRequest(worker, h);
+        return;
+      }
+
       // 1. 如果是 meta 头：通知当前流式读取，并记录总大小
       if (h.type === 'meta') {
         if (worker.activeStream && worker.activeStream.onMeta) {
@@ -347,6 +439,79 @@
     if (worker.activeStream && worker.activeStream.onChunk) {
       worker.activeStream.onChunk(d);
     }
+  };
+
+  // P1: 处理来自其他 Peer 的文件列表请求
+  PeerFS.prototype._handleListRequest = function (worker, req) {
+    var entries = [];
+    if (this.fileRoot) {
+      for (var path in this.fileRoot) {
+        var file = this.fileRoot[path];
+        if (file instanceof File) {
+          entries.push({
+            name: path,
+            size: file.size,
+            type: 'file',
+            modTime: file.lastModified
+          });
+        }
+      }
+    }
+    worker.conn.send(JSON.stringify({
+      type: 'entries',
+      entries: entries,
+      reqId: req.reqId
+    }));
+  };
+
+  // P1: 处理来自其他 Peer 的文件读取请求
+  PeerFS.prototype._handleReadRequest = function (worker, req) {
+    var self = this;
+    var file = this.fileRoot ? this.fileRoot[req.path] : null;
+    
+    if (!file) {
+      worker.conn.send(JSON.stringify({ type: 'err', msg: 'File not found', reqId: req.reqId }));
+      return;
+    }
+
+    // 发送元数据
+    worker.conn.send(JSON.stringify({
+      type: 'meta',
+      total: file.size,
+      fileSize: file.size,
+      reqId: req.reqId
+    }));
+
+    // 分块读取文件并发送
+    var chunkSize = 64 * 1024;
+    var offset = req.offset || 0;
+    var size = req.size === -1 ? file.size : (req.size || file.size);
+    var end = Math.min(offset + size, file.size);
+    
+    var reader = new FileReader();
+    var currentOffset = offset;
+
+    function readNextChunk() {
+      if (currentOffset >= end) {
+        worker.conn.send(JSON.stringify({ type: 'done', reqId: req.reqId }));
+        return;
+      }
+      
+      var slice = file.slice(currentOffset, Math.min(currentOffset + chunkSize, end));
+      reader.readAsArrayBuffer(slice);
+    }
+
+    reader.onload = function(e) {
+      worker.conn.send(e.target.result);
+      currentOffset += e.target.result.byteLength;
+      setTimeout(readNextChunk, 0); // 避免阻塞
+    };
+
+    reader.onerror = function() {
+      worker.conn.send(JSON.stringify({ type: 'err', msg: 'Read error', reqId: req.reqId }));
+    };
+
+    readNextChunk();
   };
 
   // 释放 Worker 并调度队列任务
