@@ -65,7 +65,10 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: 11076708
-          packages: 'platform-tools "platforms;android-34" "build-tools;34.0.0"'
+          # 逗号分隔，不能给含分号的包名加引号——setup-android 会把引号
+          # 当成包名的一部分，报 Failed to find package '"platforms;android-34"'
+          # （2026-10-04 实测）。
+          packages: platform-tools,platforms;android-34,build-tools;34.0.0
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: true
 
