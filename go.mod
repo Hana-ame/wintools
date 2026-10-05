@@ -63,11 +63,16 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 )
 
-// 信令服务器只有一份代码：独立仓 github.com/Hana-ame/go-peerserver
-// （peerdrive 主仓 back/signalserver 的镜像，唯一发版处）。
-// 本仓原有的 peerfs-chat/local/signalserver 副本已删除。
+// 信令服务器只有一份代码：peerdrive 主仓 back/signalserver。
+// 独立仓 github.com/Hana-ame/go-peerserver 曾是它的镜像，但已于
+// 2026-10-05 archive（只读），故本仓改为直接 replace 到主仓目录，
+// 与 peerdrive 自身 back/go.mod 的做法一致。
 //
-// 必须 >= v0.2.0：v0.1.0 只有 4 个 handler，缺 HandleLeave /
-// HandleStatus / HandleDashboard，而 cmd/peerfs-server 与
-// pkg/peerfs.MountSignaling 直接依赖这三者（挂 /discover/leave、
-// /status 与 dashboard）。无 replace 指向本地副本，换机器同样可用。
+// replace 目标是**绝对路径的仓外目录**，故本仓在别的机器/别的
+// checkout 位置克隆后需要改这一行（或删掉 replace 回到版本化依赖）；
+// peerdrive 侧的版本以该目录的 git 提交为准。
+//
+// API 兼容：v0.2.0 与主仓目录都提供 NewServer / Option /
+// WithTokenWhitelist（主仓另有新增的 WithCORSOrigins），故本仓代码
+// 两种情况都能编译。
+replace github.com/Hana-ame/go-peerserver => /home/lumin/Workplace/peerdrive/back/signalserver
