@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -122,6 +123,9 @@ func (cs *clientSession) expectDone(what string) {
 }
 
 func TestIntegrationPeerFSEndToEnd(t *testing.T) {
+	if os.Getenv("PEERDRIVE_SKIP_RTC") == "1" {
+		t.Skip("PEERDRIVE_SKIP_RTC=1: WebRTC/RTC tests disabled in this environment")
+	}
 	dir := fixtureDir(t)
 
 	// 1. 内嵌信令挂 httptest（复用 MountSignaling —— 与 cmd 同一路径）

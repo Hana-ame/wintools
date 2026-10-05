@@ -104,6 +104,23 @@ func (p *Peer) Open() bool {
 	return p.open
 }
 
+// ConnectedPeers 返回当前已建立（open）的 DataConnection 远端 peer id（去重、无序）。
+// 信令服务器 graph 依赖各节点上报这个列表，因此 Peer 需要暴露此查询。
+// 只计 open 连接：握手中的连接尚未真正建立，不应进入 graph。
+func (p *Peer) ConnectedPeers() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen := make(map[string]bool)
+	var out []string
+	for _, c := range p.conns {
+		if r := c.Remote(); r != "" && c.Open() && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // OnConnection registers the callback for inbound DataConnections.
 func (p *Peer) OnConnection(cb func(*DataConnection)) {
 	p.mu.Lock()

@@ -46,6 +46,12 @@ func (f *fakeConn) Close() {
 	f.closed = true
 }
 
+func (f *fakeConn) isClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+
 // headers 返回全部文本帧解析出的控制头。
 func (f *fakeConn) headers() []Header {
 	f.mu.Lock()
@@ -112,7 +118,7 @@ func TestHelloGate(t *testing.T) {
 
 	feed(t, st, fc, Header{Type: "list", Path: "/", ReqID: "r1"})
 	// 未认证非 hello 帧：静默关连接（不回帧，不泄露信息）
-	if !fc.closed {
+	if !fc.isClosed() {
 		t.Fatal("pre-auth request must close connection")
 	}
 	if hs := fc.headers(); len(hs) != 0 {
@@ -124,7 +130,7 @@ func TestHelloGate(t *testing.T) {
 	if len(hs) != 1 || hs[0].Msg != "bad token" {
 		t.Fatalf("wrong token must get err 'bad token', got %+v", hs)
 	}
-	if !fc.closed {
+	if !fc.isClosed() {
 		t.Fatal("wrong token should close connection")
 	}
 

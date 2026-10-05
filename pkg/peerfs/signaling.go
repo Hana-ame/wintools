@@ -35,6 +35,8 @@ func MountSignaling(mux *http.ServeMux, key string, tokens []string) *signalserv
 	mux.HandleFunc("/peerjs", srv.HandleWS)
 	mux.HandleFunc("/peerjs/id", srv.HandleID)
 	mux.HandleFunc("/discover/announce", srv.HandleAnnounce)
+	mux.HandleFunc("/discover/leave", srv.HandleLeave)
 	mux.HandleFunc("/discover/nodes", srv.HandleNodes)
+	mux.HandleFunc("/status", srv.HandleStatus)
 	return srv
 }

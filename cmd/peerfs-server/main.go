@@ -50,6 +50,7 @@ func main() {
 
 	// Discovery endpoints
 	mux.HandleFunc("/discover/announce", srv.HandleAnnounce)
+	mux.HandleFunc("/discover/leave", srv.HandleLeave)
 	mux.HandleFunc("/discover/nodes", srv.HandleNodes)
 
 	// Server status API (dashboard polls this)

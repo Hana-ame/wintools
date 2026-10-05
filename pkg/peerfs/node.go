@@ -256,6 +256,11 @@ func (n *Node) doAnnounce(ctx context.Context, client *http.Client, announceURL,
 		"tokenRequired": n.cfg.Token != "",
 		"signaling":     n.cfg.Signaling,
 		"lastSeen":      time.Now().Unix(),
+		"nodeType":      "go-persistent",
+	}
+	// 上报当前 WebRTC 直连的对端，供信令服务器画 graph。
+	if n.peer != nil {
+		bodyData["peers"] = n.peer.ConnectedPeers()
 	}
 	b, _ := json.Marshal(bodyData)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, announceURL, bytes.NewReader(b))

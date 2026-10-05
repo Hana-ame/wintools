@@ -54,7 +54,26 @@
     this.heartbeatTimer = null;
     this.lastPong = Date.now();
     this.logger = (opts && opts.logger) || null;
+    this.knownPeers = new Set(); // 已建立连接的远端 peer id，announce 时上报给信令服务器画 graph
+    this.peerRefCounts = new Map(); // peerId → 活跃连接数，避免多连接场景提前删边
   }
+
+  PeerFS.prototype._rememberPeer = function (peerId) {
+    if (!peerId) return;
+    this.knownPeers.add(peerId);
+    this.peerRefCounts.set(peerId, (this.peerRefCounts.get(peerId) || 0) + 1);
+  };
+
+  PeerFS.prototype._forgetPeer = function (peerId) {
+    if (!peerId) return;
+    var n = (this.peerRefCounts.get(peerId) || 1) - 1;
+    if (n > 0) {
+      this.peerRefCounts.set(peerId, n);
+      return;
+    }
+    this.peerRefCounts.delete(peerId);
+    this.knownPeers.delete(peerId);
+  };
 
   PeerFS.prototype._log = function (msg, color) {
     console.log('[peerfs] ' + msg);
@@ -136,6 +155,14 @@
   PeerFS.prototype.connect = function () {
     var self = this;
     if (!this.peerId) return Promise.reject(new Error('peerId required'));
+
+    // 清理旧 Peer 与旧连接，避免自动重连/重复 connect 时 ID 冲突和资源泄漏。
+    try { if (this.peer) this.peer.destroy(); } catch (e) {}
+    for (var i = 0; i < this.workers.length; i++) {
+      try { this.workers[i].conn.close(); } catch (e) {}
+    }
+    this.workers = [];
+    this.queue = [];
 
     this._log('正在连接 PeerJS 信令服务器: ' + this.host + ':' + this.port + (this.secure ? ' (TLS)' : ''), '#7aa2f7');
 
@@ -239,11 +266,7 @@
 
       self._startHeartbeat();
       
-      // P0: 如果是 Consumer 模式，自动发现并连接骨干节点
-      if (self.signalingUrl && !self.isServer) {
-        setTimeout(function() { self.autoConnectToServers(); }, 1000);
-      }
-      
+      // 按需连接：Consumer 模式不自动发起，由上层在用户操作时调用 discover/connectToPeer。
       return self;
     });
   };
@@ -259,7 +282,9 @@
         peerId: this.peer.id,
         token: this.token,
         isServer: this.isServer,
-        collections: this.fileRoot ? Object.keys(this.fileRoot) : []
+        nodeType: this.isServer ? 'web-server' : 'web-temp',
+        collections: this.fileRoot ? Object.keys(this.fileRoot) : [],
+        peers: Array.from(this.knownPeers || [])
       })
     }).catch(function(e) { console.warn('Announce failed:', e); });
     
@@ -276,25 +301,11 @@
     return fetch(url).then(function(r) { return r.json(); });
   };
 
-  // P0: 自动连接到所有发现的 Server 节点
-  PeerFS.prototype.autoConnectToServers = function () {
-    var self = this;
-    this.discover().then(function(res) {
-      var nodes = res.nodes || [];
-      nodes.forEach(function(node) {
-        // 如果对方是 server 且不是自己，则尝试连接
-        if (node.nodeType === 'go-peer' && node.peerId !== self.peer.id) {
-          self._log('发现骨干节点: ' + node.peerId + ', 正在建立连接...', '#7aa2f7');
-          self._connectToTarget(node.peerId);
-        }
-      });
-    }).catch(function(e) { console.warn('Discover failed:', e); });
-  };
-
   // 处理传入的连接
   PeerFS.prototype._handleIncomingConnection = function (conn) {
     var self = this;
     conn.on('open', function() {
+      self._rememberPeer(conn.peer);
       conn.send(JSON.stringify({ type: 'hello', token: self.token || '' }));
       self._log('收到来自 ' + conn.peer + ' 的入站连接', '#73daca');
     });
@@ -302,6 +313,9 @@
       // 为入站连接创建一个临时 worker 结构以便复用 _onWorkerData
       var worker = { id: 'in-' + conn.peer, conn: conn, busy: false, activeStream: null, pending: new Map() };
       self._onWorkerData(worker, d);
+    });
+    conn.on('close', function() {
+      self._forgetPeer(conn.peer);
     });
   };
 
@@ -351,6 +365,7 @@
     });
 
     conn.on('close', function () {
+      self._forgetPeer(self.peerId);
       self._stopHeartbeat();
       self.connected = false;
       worker.busy = false;
@@ -363,12 +378,14 @@
       });
       worker.pending.clear();
       if (self.onDisconnect) self.onDisconnect();
-      if (self.autoReconnect) {
+      // 重连流程中 connect() 会主动清理旧连接，避免这里再次调度造成重复重连。
+      if (self.autoReconnect && !self.reconnecting) {
         self._scheduleReconnect();
       }
     });
 
     return this._wait(conn, 'open', 15000, 'datachannel [0] open timeout').then(function () {
+      self._rememberPeer(self.peerId);
       conn.send(JSON.stringify({ type: 'hello', token: self.token || '' }));
       return worker;
     });
