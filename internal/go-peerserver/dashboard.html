@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PeerFS Server Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e17; color: #c9d1d9; min-height: 100vh; padding: 24px; }
+h1 { font-size: 18px; color: #58a6ff; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }
+h1 .dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; display: inline-block; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+.card .label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+.card .value { font-size: 28px; font-weight: 600; color: #f0f6fc; }
+.card .sub { font-size: 12px; color: #8b949e; margin-top: 4px; }
+.card.key .value { font-size: 16px; word-break: break-all; }
+.card.green .value { color: #3fb950; }
+.card.blue .value { color: #58a6ff; }
+.card.yellow .value { color: #d29922; }
+.section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.section h2 { font-size: 14px; color: #8b949e; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #21262d; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: #8b949e; font-weight: 500; padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+td { padding: 10px 12px; border-bottom: 1px solid #21262d; }
+tr:hover td { background: #1c2129; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 500; margin-right: 4px; }
+.tag-go { background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb66; }
+.tag-web { background: #3fb95033; color: #3fb950; border: 1px solid #3fb95066; }
+.tag-unknown { background: #6e768133; color: #8b949e; border: 1px solid #6e768166; }
+.badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; background: #21262d; color: #8b949e; margin-left: 6px; }
+.empty { text-align: center; color: #6e7681; padding: 24px; font-size: 13px; }
+footer { margin-top: 24px; text-align: center; color: #6e7681; font-size: 11px; }
+</style>
+</head>
+<body>
+<h1><span class="dot"></span> PeerFS Server Dashboard</h1>
+
+<div class="grid">
+  <div class="card green">
+    <div class="label">Uptime</div>
+    <div class="value" id="uptime">--</div>
+  </div>
+  <div class="card blue">
+    <div class="label">Connected Peers</div>
+    <div class="value" id="clients">--</div>
+  </div>
+  <div class="card">
+    <div class="label">Discovered Nodes</div>
+    <div class="value" id="discovered">--</div>
+  </div>
+  <div class="card yellow">
+    <div class="label">Queued Messages</div>
+    <div class="value" id="queued">--</div>
+    <div class="sub" id="queueDst">0 destinations</div>
+  </div>
+  <div class="card">
+    <div class="label">Messages Forwarded</div>
+    <div class="value" id="msgCount">--</div>
+  </div>
+  <div class="card key">
+    <div class="label">API Key</div>
+    <div class="value" id="key">--</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Network Graph</h2>
+  <canvas id="graph" width="900" height="420" style="width:100%;height:auto;background:#0d1117;border:1px solid #21262d;border-radius:8px;"></canvas>
+  <p style="font-size:12px;color:#6e7681;margin-top:8px;">节点为发现的 peer，连线表示两者间存在 WebRTC DataChannel 直连。</p>
+</div>
+
+<div class="section">
+  <h2>Discovered Nodes</h2>
+  <table>
+    <thead>
+      <tr><th>Peer ID</th><th>Type</th><th>Collections</th><th>Uptime</th><th>Last Seen</th><th>Load</th></tr>
+    </thead>
+    <tbody id="nodesBody">
+      <tr><td colspan="6" class="empty">Loading...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<footer id="footer">Polling every 2s...</footer>
+
+<script>
+function fmtUptime(sec) {
+  if (sec < 60) return sec.toFixed(0) + 's';
+  if (sec < 3600) return (sec/60).toFixed(1) + 'm';
+  if (sec < 86400) return (sec/3600).toFixed(1) + 'h';
+  return (sec/86400).toFixed(1) + 'd';
+}
+function fmtAgo(ts) {
+  var diff = Math.floor(Date.now()/1000 - ts);
+  if (diff < 0) diff = 0;
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+  return Math.floor(diff/3600) + 'h ago';
+}
+function nodeTag(type) {
+  if (type === 'go' || type === 'node' || type === 'go-persistent') return '<span class="tag tag-go">' + type + '</span>';
+  if (type === 'web' || type === 'web-temp' || type === 'web-server') return '<span class="tag tag-web">' + type + '</span>';
+  return '<span class="tag tag-unknown">' + (type || 'unknown') + '</span>';
+}
+function fmtLoad(load) {
+  if (!load) return '<span class="badge">-</span>';
+  var parts = [];
+  if (load.downloaded) parts.push('↓' + (load.downloaded/1048576).toFixed(1) + 'MB');
+  if (load.uploaded) parts.push('↑' + (load.uploaded/1048576).toFixed(1) + 'MB');
+  if (load.connections) parts.push(load.connections + ' conns');
+  if (parts.length === 0) return '<span class="badge">-</span>';
+  return parts.join(' ');
+}
+
+function drawGraph(nodes, links) {
+  var canvas = document.getElementById('graph');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!nodes || nodes.length === 0) {
+    ctx.fillStyle = '#6e7681';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No peers', W / 2, H / 2);
+    return;
+  }
+  var cx = W / 2, cy = H / 2;
+  var R = Math.min(W, H) / 2 - 70;
+  var pos = {};
+  nodes.forEach(function (n, i) {
+    var a = 2 * Math.PI * i / nodes.length - Math.PI / 2;
+    pos[n.peerId] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
+  });
+  ctx.strokeStyle = '#30363d';
+  ctx.lineWidth = 1;
+  links.forEach(function (l) {
+    var a = pos[l.source], b = pos[l.target];
+    if (!a || !b) return;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  });
+  nodes.forEach(function (n) {
+    var p = pos[n.peerId];
+    if (!p) return;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 8, 0, 2 * Math.PI);
+    ctx.fillStyle = (n.nodeType === 'web' || n.nodeType === 'web-temp' || n.nodeType === 'web-server') ? '#3fb950'
+      : (n.nodeType === 'go' || n.nodeType === 'node' || n.nodeType === 'go-persistent' ? '#58a6ff' : '#8b949e');
+    ctx.fill();
+    ctx.fillStyle = '#f0f6fc';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(n.peerId.length > 16 ? n.peerId.slice(0, 14) + '…' : n.peerId, p.x, p.y - 13);
+  });
+}
+
+function poll() {
+  fetch('/status').then(r => r.json()).then(data => {
+    document.getElementById('uptime').textContent = data.uptimeStr || fmtUptime(data.uptimeSec);
+    document.getElementById('clients').textContent = data.clients;
+    document.getElementById('discovered').textContent = data.discovered;
+    document.getElementById('queued').textContent = data.totalQueued;
+    document.getElementById('queueDst').textContent = data.queues + ' destinations';
+    document.getElementById('msgCount').textContent = data.msgCount;
+    document.getElementById('key').textContent = data.key;
+
+    var nodes = data.nodes || [];
+    drawGraph(nodes, data.links || []);
+    var tbody = document.getElementById('nodesBody');
+    if (nodes.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No discovered nodes</td></tr>';
+    } else {
+      tbody.innerHTML = nodes.map(n => '<tr>' +
+        '<td><code>' + n.peerId + '</code></td>' +
+        '<td>' + nodeTag(n.nodeType) + '</td>' +
+        '<td>' + (n.collections || []).join(', ') + '</td>' +
+        '<td>' + (n.uptime ? fmtUptime(n.uptime) : '<span class="badge">-</span>') + '</td>' +
+        '<td>' + fmtAgo(n.lastSeen) + '</td>' +
+        '<td>' + fmtLoad(n.loadInfo) + '</td>' +
+        '</tr>').join('');
+    }
+    document.getElementById('footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString() + ' · Polling every 2s';
+  }).catch(err => {
+    document.getElementById('footer').textContent = 'Error: ' + err.message;
+  });
+}
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

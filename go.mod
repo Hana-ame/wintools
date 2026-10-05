@@ -64,15 +64,10 @@ require (
 )
 
 // 信令服务器只有一份代码：peerdrive 主仓 back/signalserver。
-// 独立仓 github.com/Hana-ame/go-peerserver 曾是它的镜像，但已于
-// 2026-10-05 archive（只读），故本仓改为直接 replace 到主仓目录，
-// 与 peerdrive 自身 back/go.mod 的做法一致。
+// go-peerserver 独立仓已于 2026-10-05 archive（只读），不再是取码来源；
+// peerdrive 与本仓是兄弟仓，Go module 无法跨仓直接引用其目录，故带一份
+// 仓内副本 internal/go-peerserver（单向同步自 peerdrive），replace 指到它。
 //
-// replace 目标是**绝对路径的仓外目录**，故本仓在别的机器/别的
-// checkout 位置克隆后需要改这一行（或删掉 replace 回到版本化依赖）；
-// peerdrive 侧的版本以该目录的 git 提交为准。
-//
-// API 兼容：v0.2.0 与主仓目录都提供 NewServer / Option /
-// WithTokenWhitelist（主仓另有新增的 WithCORSOrigins），故本仓代码
-// 两种情况都能编译。
-replace github.com/Hana-ame/go-peerserver => /home/lumin/Workplace/peerdrive/back/signalserver
+// 走仓内相对路径而非绝对路径：绝对路径在 CI 上不存在（Go CI 曾因此失败，
+// go mod download 报 no such file or directory）。相对路径换机器也照样有效。
+replace github.com/Hana-ame/go-peerserver => ./internal/go-peerserver
